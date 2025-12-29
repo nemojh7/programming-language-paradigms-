@@ -1,0 +1,2979 @@
+Using .NET CLR in luajit as a moduleI'm writing a C/C++ application which uses a luajit runtime. In this runtime I want to load .NET DLLs and call functions/create objects exposed by it.
+After a lot of research I've found some libraries which can achieve this, luainterface for example. But the problem with all these libraries is that they require a Lua runtime running in .NET itself.
+Is there a library which I can preferably require as a module from which I can use .NET DLLs?eBPF: tail callsI'm playing with tail calls feature of BPF, and it seems the simple code doesn't get loaded:
+struct bpf_map_def SEC("maps") jmp_table = {
+   .type = BPF_MAP_TYPE_PROG_ARRAY,
+   .key_size = sizeof(u32),
+   .value_size = sizeof(u32),
+   .max_entries = 8,
+};
+
+SEC("sockops")
+int bpf1(struct bpf_sock_ops *sk_ops)
+{
+   return 1;
+}
+
+SEC("sockops")
+int bpf2(struct bpf_sock_ops *sk_ops)
+{
+   return 1;
+}
+
+SEC("sockops")
+int bpf3(struct bpf_sock_ops *sk_ops)
+{
+   return 1;
+}
+
+SEC("sockops")
+int bpf_main(struct bpf_sock_ops *sk_ops)
+{
+   __u32 port = bpf_ntohl(sk_ops->remote_port);
+
+   switch (port) {
+      case 5000: 
+         bpf_tail_call(sk_ops, &jmp_table, 1);
+         break;
+      case 6000:
+         bpf_tail_call(sk_ops, &jmp_table, 2);
+         break;
+      case 7000:
+         bpf_tail_call(sk_ops, &jmp_table, 3);
+         break;
+   }     
+
+   sk_ops->reply = 0;
+
+   return 1;
+}  
+
+char _license[] SEC("license") = "GPL";
+u32 _version SEC("version") = LINUX_VERSION_CODE;
+
+So I compiled it with llv-3.8 and loaded with bpftool:
+$ sudo ./bpftool prog load bpf_main.o /sys/fs/bpf/p1
+libbpf: load bpf program failed: Invalid argument
+libbpf: -- BEGIN DUMP LOG ---
+libbpf: 
+unreachable insn 2
+
+libbpf: -- END LOG --
+libbpf: failed to load program 'sockops'
+libbpf: failed to load object 'bpf_main.o'
+Error: failed to load program
+
+So man 2 bpf mentions that:
+EINVAL For BPF_PROG_LOAD, indicates an attempt to load an invalid program. eBPF programs can be deemed  invalid  due  to  unrecognized  instructions, the  use  of reserved  fields, jumps  out of range, infinite loops or calls of unknown functions.
+
+I don't see what is wrong with this tiny simple program, also llvm-objdump fails:
+$ llvm-objdump-3.8 -arch-name=bpf -disassemble ./tcp_metrics_kern.o
+
+./tcp_metrics_kern.o:   file format ELF64-unknown
+
+LLVM ERROR: error: no disassembler for target bpfel-unknown-unknown
+
+UPDATE 1
+Following Qeole's advice I upgraded to clang-5.0, rebuilt my program and now it complains differently:
+$ sudo ./bpftool prog load bpf_main.o /sys/fs/bpf/p1
+libbpf: relocation failed: no 10 section
+Error: failed to load program
+
+Now I can investigate ELF sections:
+$ llvm-objdump-5.0 -disassemble -source ./bpf_main.o
+
+./bpf_main.o:   file format ELF64-BPF
+
+Disassembly of section sockops:
+bpf1:
+       0:       b7 00 00 00 01 00 00 00         r0 = 1
+       1:       95 00 00 00 00 00 00 00         exit
+
+bpf2:
+       2:       b7 00 00 00 01 00 00 00         r0 = 1
+       3:       95 00 00 00 00 00 00 00         exit
+
+bpf3:
+       4:       b7 00 00 00 01 00 00 00         r0 = 1
+       5:       95 00 00 00 00 00 00 00         exit
+
+bpf_main:
+...
+
+Here are available sections:
+    $ llvm-objdump-5.0 -section-headers ./bpf_main.o
+
+    ./bpf_main.o:   file format ELF64-BPF
+
+    Sections:
+    Idx Name          Size      Address          Type
+  0               00000000 0000000000000000 
+  1 .strtab       000000a5 0000000000000000 
+  2 .text         00000000 0000000000000000 TEXT DATA 
+  3 sockops       000001f8 0000000000000000 TEXT DATA 
+  4 .relsockops   00000030 0000000000000000 
+  5 maps          0000001c 0000000000000000 DATA 
+  6 .rodata.str1.16 00000021 0000000000000000 DATA 
+  7 .rodata.str1.1 0000000e 0000000000000000 DATA 
+  8 license       00000004 0000000000000000 DATA 
+  9 version       00000004 0000000000000000 DATA 
+ 10 .eh_frame     00000090 0000000000000000 DATA 
+ 11 .rel.eh_frame 00000040 0000000000000000 
+ 12 .symtab       00000138 0000000000000000
+
+It looks that bpftool can't find section .eh_frame?
+UPDATE 2
+I continue experimenting :-) First of all I updated libbpf with latest commit d77be68955475fc2321e73fe006240248f2f8fef fixing string comparison, then I rebuild the program with -fno-asynchronous-unwind-tables, this does not include .eh_frame section, and also I gave unique section names, e.g. sockops0, sockops1 etc. Now bpftool prog load .. succeeds but bpftool prog show dumps only a single program, the one that goes very first, in my case it is bpf1().
+At the moment I can say that bpf_object__load_progs() reports obj->nr_programs as 4, this makes sense for my example.strcmp ignoring accents, outputs falseI have a couple of strcmp's to get a boolean and all of them work fine except if the string contains an accent.
+if(strcmp(arrayOfStrings[index], "Día de descanso") == 0
+
+Outputs false instead of true. I've been trying to compare using escape sequences but I can't make it work.
+Strings are added to arrayOfStrings with the next function:
+void introducirPlan()
+{
+  for(int i = 1; i <= 10; i++)
+  {
+    printf("Actividad del dia %d? ", i);
+    scanf(" %[^\n]", diasEntrenamiento[i]);
+  }
+  printf("\n");
+}
+
+There another function just to check the strings added using strcmp:
+bool compararDescanso(int idia)
+{
+  if(strcmp(diasEntrenamiento[idia], "Día de descanso") == 0)
+  {
+    return true;
+  }
+  if(strcmp(diasEntrenamiento[idia], "Dia de descanso") == 0)
+  {
+    return true;
+  }
+}
+
+It looks like strcmp outputs false here:
+  while(cntImprEntr <= 10)
+  {
+    if(compararDescanso(cntImprEntr) == true)
+    {
+      printf(" D "); /*"D" never gets printed if string contains accent */
+      columna++;
+      dia++;
+    }
+    else
+    {
+      printf(" C ");
+      columna++;
+      dia++;
+    }
+    if(columna == 5)
+    {
+      printf("|");
+    }
+    printf(" ");
+    cntImprEntr++;
+    if(columna >= 7)
+    {
+      printf("\n");
+      columna = 0;
+    }
+  }
+
+Is there any way I can make strcmp not ignore the accent and give true output? When the string inside the index contains "Dia" instead of "Día" it works fine.
+ThanksYour problem is linked to text encoding.
+Although you don't say it, you are likely working on Windows, and using the terminal for your program.
+The problem is that Windows uses a different character encoding for your terminal than it uses for "windowed" programs, (and therefore your text editor).
+That means the the code for the accented characters is the same.
+First thing is understanding what is unicode and charcater encodings: https://www.joelonsoftware.com/2003/10/08/the-absolute-minimum-every-software-developer-absolutely-positively-must-know-about-unicode-and-character-sets-no-excuses/
+Second thing, simply change the encoding of your text editor to match that of the terminal - I am not sure the encoding used for Windows in Español, but in Portuguese, it is cp-852 for the terminal and latin1 for "windowed" (I'd bet it is "latin1" for Spanish Windows as well).
+NB.> While Microsoft is stuck with these encodings from the 1980's, the rest of the World, including everything Web, uses "utf-8".  So, this encoding workaround is good for your code to work and you learn from it, but you sure should focus on using "utf-8" encoding for any thing that is destined to actually be in production.Using the same variable in different files (using extern) [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+What is the effect of extern "C" in C++?
+
+                                (16 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+I have to modify a C project because I need to use, now, a C++ function.
+Let's assume that I have a file called A.c:
+
+A.c
+
+uchar *const x;
+uchar *const y;
+/.../
+
+and other files that also use these variables, let's call them B.c and C.c:
+
+B.c
+
+extern uchar *const x;
+extern uchar *const y;
+/.../
+foo1(x);
+bar1(y);
+
+
+C.c 
+
+extern uchar *const x;
+extern uchar *const y;
+/.../
+foo1(x);
+bar1(y);
+
+When I compile all the file with a C compiler everything work perfectly.
+Now I need to use some C++ function so I need to recompile everything with a C++ compiler. Here the errors:
+undefined reference to `::x(void)'
+undefined reference to `::y(void)'
+
+Following the advice in the answer here, and using extern "C" around the variable in B.c and C.c generates other errors
+Some idea on how to solve this problem?The extern keyword should be placed in the header file, and the variable definition need only be in one source file, so what you want is this:
+In A.h:
+extern uchar *const x;
+extern uchar *const y;
+
+In A.c
+uchar *const x;
+uchar *const y;
+
+In B.c
+#include "A.h" 
+
+void someFunction() {
+    foo(x);
+    bar(y);
+}
+
+In C.c
+#include "A.h"
+
+void someOtherFunction() {
+    foo(x);
+    bar(y);   
+}Firing events from state machine's onEntry functionI am doing a state machine which is supposed to evaluate some conditions on entrance to a new state and, depending on those conditions, appropriate new event should be triggered. My first thought was to send event from onEntry function but then I have indirect recursion which is, as far as I think (maybe I am wrong), a bit dangerous (because of the possibility of the stack overflow error).
+Here is the sample code (note that it is only an example of state machine pattern I need to use):
+state_machine.h
+typedef enum State
+{
+    STATE_A,
+    STATE_B,
+    STATE_C
+} State;
+
+typedef enum Event
+{
+    EVENT_A,
+    EVENT_B,
+    EVENT_C,
+    EVENT_D,
+    EVENT_E,
+    EVENT_F
+} Event;
+
+void handleEvent(Event event);
+
+state_machine.c
+#include "state_machine.h"
+
+static void switchState(State newState, Event event);
+
+static void onExit(Event event);
+
+static void onEntry();
+
+static State currentState = STATE_A;
+
+void handleEvent(Event event)
+{
+    switch (currentState)
+    {
+    case STATE_A:
+        switchState(STATE_B, event);
+        break;
+    case STATE_B:
+        switchState(STATE_C, event);
+        break;
+    case STATE_C:
+        switchState(STATE_A, event);
+        break;
+    default:
+        break;
+    }
+}
+
+void switchState(State newState, Event event)
+{
+    onExit(event);
+    currentState = newState;
+    onEntry();
+}
+
+void onExit(Event event)
+{
+    // ...
+}
+
+void onEntry()
+{
+    switch (currentState)
+    {
+    case STATE_A:
+        if (condition)
+        {
+            handleEvent(EVENT_C);
+        }
+        else
+        {
+            handleEvent(EVENT_D);
+        }
+        break;
+    case STATE_B:
+        // ...
+        break;
+    case STATE_C:
+        // ...
+        break;
+    default:
+        break;
+    }
+}
+
+My second solution to this problem is having a nextState variable which would be set in onEntry function (instead of handleEvent call). And then on top of handleEvent function I would have sth like this:
+if (nextEvent != EVENT_NULL)
+{
+    event = nextEvent;
+    nextEvent = EVENT_NULL;
+}
+
+Now, my question is this: what is better approach and/or what is usually done in these kind of situations?
+Thanks in advanceError calculating CRC16 for certain characters in CI am trying to use this code to compute CRC16 bypass. For regular characters it works but for a hex sequence like 0xA0 0x00 0x01 0x01 it fails, not returning the correct value. Go easy on me, usually I do not write C code.
+#include <stdio.h>
+#include <string.h>
+
+unsigned short CalculateCRC(unsigned char* a_szBuffuer, short a_sBufferLen){
+    unsigned short usCRC = 0;
+    for (short j = 0; j < a_sBufferLen; j++)
+    {
+    unsigned char* pucPtr = (unsigned char *)&usCRC;
+    *(pucPtr + 1) = *(pucPtr + 1) ^ *a_szBuffuer++;
+    for (short i = 0; i <= 7; i++)
+    {
+    if (usCRC & ((unsigned short) 0x8000))
+    {
+    usCRC = usCRC << 1;
+    usCRC = usCRC ^ ((unsigned short) 0x8005);
+    }
+    else
+    usCRC = usCRC << 1;
+    }
+    }
+    return (usCRC);
+}
+
+void append(char* s, char c)
+{
+        int len = strlen(s);
+        s[len] = c;
+        s[len+1] = '\0';
+}
+
+int main() {
+
+   char d = (char)0xA0;
+   char d1 = (char)0x00;
+   char d2 = (char)0x01;
+   char d3 = (char)0x01;
+   char sss[256]="";
+
+   append(sss, d);
+   append(sss, d1);
+   append(sss, d2);
+   append(sss, d3);
+   unsigned char* uCB1 = (unsigned char*)sss;
+   unsigned short CRC= CalculateCRC(uCB1,4);
+
+   printf("CRC = %i\n", CRC);
+   printf("%s\n", sss);
+   printf("%x\n", CRC);
+}strlen(s); is for finding the length of a string, not for finding the length of a character array that is used,  especially if it that may contain '\0'.  @Eugene Sh.
+Code needs to keep track of the array size used with another variable.
+// void append(char* s, char c) {
+void append(char* s, size_t *sz, char c) {
+  s[*sz] = c;
+  (*sz)++;
+}
+
+...
+size_t size = 0;
+append(sss, &size, d);
+append(sss, &size, d1);
+append(sss, &size, d2);
+append(sss, &size, d3);
+unsigned char* uCB1 = (unsigned char*)sss;
+unsigned short CRC= CalculateCRC(uCB1, size);
+
+// printf("%s\n", sss);
+write a loop to print each `sss[]`.match and search in struct and mark true or false C [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I'm building a system of 2 servers and 1 client for reservations.
+I found an obstacle, now I'll explain:
+-server A
+-server B
+-client  
+Once the client selects from a menu what he wants to book and when,
+server B must look in the struct for the date and check if it is available, if it is send an ok, if it is not send a no as an answer.
+To do it I had thought of the following way, but it does not work:
+bool search(int bet2,  bool flag)
+    {
+     int i=0;
+
+      for(i=0; i < 11; i++){
+        if(strcmp(content[i].date, content[bet2].date) == 0)
+        {
+           if (content[i].mark == true)
+           {
+               printf("Date Busy");
+               return false;
+           } else {
+               content[i].mark = true;  
+               printf("Date booked day: %s",content[i].date);   
+               return true;
+            }}
+      }
+    }
+
+in the prototypes I declare it so:
+bool search (int bet2, bool flag);
+
+in the main I declare it so:
+search (bet2, flag);
+
+the struct is this:
+typedef struct choice {
+    char name [40];
+    char date [40];
+    bool mark;
+} Choice;
+
+Choice content [10];
+
+now I have a doubt, but the type bool exists in C?
+anyway, where am I wrong?
+sorry but I'm writing lines of code this morning and I'm stuck here, probably I do not see it.
+this code return ever that date is good, where am i wrong?content [i] .mark = true
+
+will be
+content [i] .mark == true
+
+To avoid this kind of problem you can use the comparison like this
+true == content [i] .mark
+
+In this case even if you forget the == and use = the compiler will complain. 
+And yes even better is to use simple and easy to read 
+  if( content [i] .mark )
+
+Also there is no keyword called Else in C. It will be else.
+Remove the extra } in the code where you have written }}. The scoping changes for that and it is wrong.
+Also why use return flag = false it's useless here. Just do return false or return true. Because flag's changed value won't be used anywhere.Makefile: automatically compile source for every included headerCan I configure my makefile in a way that it automatically compiles and links foo/bar.cpp if a target includes #include "foo/bar.hpp"?
+Details: I have a makefile for a project structured like this:
+src/
+|-- program1/
+|   |-- main.cpp
+|   |-- makefile
+|-- modules/
+|   |-- module1/
+|   |   |-- foo.cpp
+|   |   |-- foo.hpp
+|   |-- module1/
+|   |   |-- bar.cpp
+|   |   |-- bar.hpp
+
+Currently my makefile for program1 contains a list of all the *.cpp files of all the modules it uses, which is kind of hard and error-prone to maintain and to keep in sync with my includes.
+However, in my code, following the #include commands would provide an exact dependency-tree. For every *.hpp there is a corresponding *.cpp that I need to compile and link.
+Can this process of compilation be automated via the makefile? May auto-dependencies help me out?
+The makefile in question:
+# compiler settings
+CXX = g++
+CXXFLAGS = -std=c++14
+# object file generation path
+tmpDir = .objs
+# modules path
+modPath = ../modules
+
+# Names of modules and files to be compiled
+names := \
+    main.o \
+    module1/foo.o \
+    module2/bar.o
+
+# prepend tmpDir
+names := $(addprefix $(tmpDir)/, $(names))
+
+# Linking
+main: $(names)
+    $(CXX) $(CXXFLAGS) -o main $^
+
+# Rule for main file
+$(tmpDir)/main.o: main.cpp
+    @mkdir -p $(tmpDir)
+    $(CXX) $(CXXFLAGS) -c main.cpp -o $@ -I "$(modPath)"
+
+# rules for module files
+$(tmpDir)/%.o: $(modPath)/%.cpp
+    mkdir -p $(dir $@)
+    $(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+    rm -rf *.o main $(tmpDir)
+
+I'd like to avoid to manually set names.A common way to automate generating the file names is using a $(wildcard ...) or some $(shell ...) command to scan the directories.
+Based on the Makefile you linked I think you can track the dependencies using GCC with the -MMD -MP flags something like this:
+# compiler settings
+CXX = g++
+# use flags to generate dependency files
+CXXFLAGS = -std=c++14 -MMD -MP
+# object file generation path
+tmpDir = .objs
+# modules path
+modPath = ../modules
+
+# Names of modules and files to be compiled
+names := main.o
+names += $(patsubst $(modPath)/%.cpp,%.o,$(shell find $(modPath) -iname "*.cpp"))
+
+# prepend tmpDir
+names := $(addprefix $(tmpDir)/, $(names))
+
+# there should be a dep file for every object file
+deps  := $(patsubst %.o,%.d,$(names))
+
+all: main
+
+# Linking
+main: $(names)
+    $(CXX) $(CXXFLAGS) -o main $^
+
+# Rule for main file
+$(tmpDir)/main.o: main.cpp
+    @mkdir -p $(tmpDir)
+    $(CXX) $(CXXFLAGS) -c main.cpp -o $@ -I "$(modPath)"
+
+# rules for module files
+$(tmpDir)/%.o: $(modPath)/%.cpp
+    mkdir -p $(dir $@)
+    $(CXX) $(CXXFLAGS) -c $< -o $@
+
+# include the dependencies if they exist    
+-include $(deps)
+
+clean:
+    rm -rf *.o main $(tmpDir) $(deps)
+
+Every compile command that uses the -MMD -MP flags will generate a dependency file corresponding to the output file (except with a .d extension).regarding: *Currently my makefile for program1 contains a list of all the *.cpp files of all the modules it uses, which is kind of hard and error-prone to maintain and to keep in sync with my includes.
+However, in my code, following the #include commands would provide an exact dependency-tree. For every *.hpp there is a corresponding *.cpp that I need to compile and link.
+Can this process of compilation be automated via the makefile? May auto-dependencies help me out?*
+In the makefile, you could use the output of a call to the find command to obtain a list of all the (for instance) *.cpp files in the directories below the modules directory rather than hard-coding the list.I refined Galik's answer a bit. Now it behaves much like what I was searching for.
+Instead of defining names manually, I invoke a search for files. The results then filters to match only *.cpp files that have a *.hpp file with the same name. This ignores all files containing the tests:
+# find *.hpp files
+names := $(shell find $(modPath) -iname "*.hpp")
+# replace extension .hpp -> .cpp
+names := $(patsubst %,%.cpp,$(basename $(names)))
+# filter nonexistent *.cpp files
+names := $(wildcard $(names))How to read a sensor in c but then use that input in pythonI have a flow sensor that I have to read with c because python isn't fast enough but the rest of my code is python. What I want to do is have the c code running in the background and just have the python request a value from it every now and then. I know that popen is probably the easiest way to do this but I don't fully understand how to use it. I don't want completed code I just want a way to send text/numbers back and forth between a python and a c code. I am running raspbian on a raspberry pi zero w. Any help would be appreciated.Probably not a full answer, but I expect it gives some hints and it is far too long for a comment. You should think twice about your requirements, because it will probably not be that easy depending on your proficiency in C and what OS you are using. 
+If I have correctly understood, you have a sensor that sends data (which is already weird unless the sensor is an intelligent one). You want to write a C program that will read that data and either buffer it, and retain only last (you did not say...) and at the same time will wait for requests from a Python script to give it back what it has received (and kept) from the sensor. That probably means a dual thread program with quite a bit of synchronization.
+You will also need to specify the communication way between C and Python. You can certainly use the subprocess module, but do not forget to use unbuffered output in C. But you could also imagine an independant program that uses a FIFO or a named piped with a well defined protocol for external requests, in order to completely separate both problems.
+So my opinion is that this is currently too broad for a single SO question...Changing buffer size to copy file in CI have created a function that creates a copy of a file : read --> buffer --> write. I'm trying to increase the buffer size several times and see how if affects the time it takes to copy the file (about 50Mb)
+# include <assert.h>
+# include <stdio.h>
+# include <stdlib.h>
+# include <unistd.h>
+# include <sys/types.h>
+# include <sys/stat.h>
+# include <sys/wait.h>
+# include <string.h>
+# include <fcntl.h>
+# include <time.h>
+// Copy the file referred to by in to out 
+void copy (int in, int out, char *buffer, long long taille) {
+  int t;
+
+  while ((t = read(in, &buffer, sizeof taille))> 0)
+    write (out, &buffer, t);
+
+
+  if (t < 0)
+    perror("read");
+}
+
+int main(){
+
+  clock_t timing;  //to time 
+  int buffer_size = 1;
+  char * buffer = NULL;
+
+  // allocating memory for the buffer
+  buffer = malloc(sizeof(char)*buffer_size);
+  // test mémoire
+  if (!buffer) {
+    perror("malloc ini");
+    exit(1);
+  }
+
+  // temporary buffer to be able to increase the siwe of the buffer 
+  char * temp_buffer = NULL;
+
+  // opening the files
+  int fichier1 = open("grosfichier",O_RDONLY);
+  int fichier2 = open("grosfichier_copy", O_WRONLY|O_CREAT);
+
+  for (int i=0; buffer_size <= 1048576; i++){
+
+    temp_buffer = realloc(buffer, buffer_size * sizeof(char));
+    if(!temp_buffer) {
+      perror("malloc temp_buffer");
+      exit(1);
+    }
+
+    buffer = temp_buffer;
+
+    timing = clock();
+    copy(fichier1,fichier2, buffer, buffer_size); //recopie l'entree std dans la sortie std
+    timing = clock() - timing;
+
+    printf("%d, buffer size = %d, time : %ld\n", i, buffer_size, timing);
+    remove("grosfichier_copie");
+
+    buffer_size *= 2;
+  }
+  // free(temp_buffer);
+  free(buffer);
+  close(fichier1);
+  close(fichier2);
+
+  return 0;
+}
+
+The code runs and copies the file, but the timing thing doesn't thing to work properly
+0, buffer size = 1, time : 6298363
+1, buffer size = 2, time : 1
+2, buffer size = 4, time : 1
+3, buffer size = 8, time : 1
+4, buffer size = 16, time : 1
+5, buffer size = 32, time : 1
+6, buffer size = 64, time : 1
+7, buffer size = 128, time : 1
+8, buffer size = 256, time : 1
+9, buffer size = 512, time : 1
+10, buffer size = 1024, time : 1
+11, buffer size = 2048, time : 1
+12, buffer size = 4096, time : 1
+13, buffer size = 8192, time : 1
+14, buffer size = 16384, time : 1
+15, buffer size = 32768, time : 0
+16, buffer size = 65536, time : 1
+17, buffer size = 131072, time : 4
+18, buffer size = 262144, time : 1
+19, buffer size = 524288, time : 2
+20, buffer size = 1048576, time : 2
+[Finished in 6.5s]
+
+
+Why doesn't it seem to copy after the file run? (according to the timing?)
+Am I using free appropriately? (I tried moving it in the loop, but it doesn't run)
+Am I passing the buffer appropriately to the function copy?
+
+Thanks!
+EDIT1: Thank you for all your comments! I have corrected the major flaws with about opening and closing the files within the loop, using the buffer appropriately, + the types of variables as suggested. I'm getting results that are much more logical:
+0, buffer size = 1, time : 8069679
+1, buffer size = 2, time : 4082421
+2, buffer size = 4, time : 2041673
+3, buffer size = 8, time : 1020645
+4, buffer size = 16, time : 514176
+...
+
+but I'm till struggling with handling write() error appropriately.
+Edit2: is this version of copy fine?
+void copy (int in, int out, char *buffer, size_t taille) {
+  ssize_t t;
+
+  while ((t = read(in, buffer, taille))> 0){
+    if (write (out, buffer, t)<0){
+      perror("error writing");
+    }
+  }
+
+  if (t < 0)
+    perror("read");
+}Here's my modified version of your code, addressing most of the issues that I raised in comments, and most of those that other people raised.
+# include <stdio.h>
+# include <stdlib.h>
+# include <unistd.h>
+# include <fcntl.h>
+# include <time.h>
+
+size_t copy(int in, int out, char *buffer, size_t taille);
+
+size_t copy(int in, int out, char *buffer, size_t taille)
+{
+    ssize_t t;
+    ssize_t bytes = 0;
+
+    while ((t = read(in, buffer, taille)) > 0)
+    {
+        if (write(out, buffer, t) != t)
+            return 0;
+        bytes += t;
+    }
+
+    if (t < 0)
+        perror("read");
+    return bytes;
+}
+
+int main(void)
+{
+    clock_t timing;
+    int buffer_size = 1;
+    char *buffer = malloc(sizeof(char) * buffer_size);
+
+    if (!buffer)
+    {
+        perror("malloc ini");
+        exit(1);
+    }
+
+    int fichier1 = open("grosfichier", O_RDONLY);
+    if (fichier1 < 0)
+    {
+        perror("grosfichier");
+        exit(1);
+    }
+
+    for (int i = 0; buffer_size <= 1048576; i++)
+    {
+        lseek(fichier1, 0L, SEEK_SET);
+        char *temp_buffer = realloc(buffer, buffer_size * sizeof(char));
+        if (!temp_buffer)
+        {
+            perror("malloc temp_buffer");
+            exit(1);
+        }
+        int fichier2 = open("grosfichier_copy", O_WRONLY | O_CREAT, 0644);
+        if (fichier2 < 0)
+        {
+            perror("open copy file");
+            exit(1);
+        }
+
+        buffer = temp_buffer;
+
+        timing = clock();
+        size_t copied = copy(fichier1, fichier2, buffer, buffer_size);
+        timing = clock() - timing;
+
+        printf("%d, buffer size = %9d, time : %8ld (copied %zu bytes)\n",
+               i, buffer_size, timing, copied);
+        close(fichier2);
+        remove("grosfichier_copie");
+
+        buffer_size *= 2;
+    }
+    free(buffer);
+    close(fichier1);
+
+    return 0;
+}
+
+When I ran it (with two timing commands giving times), I got:
+2018-01-15 08:00:27 [PID 43372] copy43
+0, buffer size =         1, time : 278480098 (copied 50000000 bytes)
+1, buffer size =         2, time : 106462932 (copied 50000000 bytes)
+2, buffer size =         4, time : 53933508 (copied 50000000 bytes)
+3, buffer size =         8, time : 27316467 (copied 50000000 bytes)
+4, buffer size =        16, time : 13451731 (copied 50000000 bytes)
+5, buffer size =        32, time :  6697516 (copied 50000000 bytes)
+6, buffer size =        64, time :  3459170 (copied 50000000 bytes)
+7, buffer size =       128, time :  1683163 (copied 50000000 bytes)
+8, buffer size =       256, time :   882365 (copied 50000000 bytes)
+9, buffer size =       512, time :   457335 (copied 50000000 bytes)
+10, buffer size =      1024, time :   240605 (copied 50000000 bytes)
+11, buffer size =      2048, time :   126771 (copied 50000000 bytes)
+12, buffer size =      4096, time :    70834 (copied 50000000 bytes)
+13, buffer size =      8192, time :    46279 (copied 50000000 bytes)
+14, buffer size =     16384, time :    35227 (copied 50000000 bytes)
+15, buffer size =     32768, time :    27996 (copied 50000000 bytes)
+16, buffer size =     65536, time :    28486 (copied 50000000 bytes)
+17, buffer size =    131072, time :    24203 (copied 50000000 bytes)
+18, buffer size =    262144, time :    26015 (copied 50000000 bytes)
+19, buffer size =    524288, time :    19484 (copied 50000000 bytes)
+20, buffer size =   1048576, time :    28851 (copied 50000000 bytes)
+2018-01-15 08:08:47 [PID 43372; status 0x0000]  -  8m 19s
+
+real    8m19.351s
+user    1m21.231s
+sys 6m52.312s
+
+As you can see, the 1-byte copying was dramatically awful and took something like 4 minutes of wall clock time to copy the data.  Using 2 bytes halved that; 4 bytes halved it again, and the improvements kept going until about 32 KiB.  After that, the performance was steady — and fast (the last few lines appeared in what seemed like under a second each, but I wasn't paying close attention).  I'd put in alternative wall-clock timing using clock_gettime() (or gettimeofday() if that's not available) to time each cycle.  I was worried at first with the lack of progress on the single byte copying, but a second terminal window confirmed the copy was growing, but oh so slowly!Why doesn't it seem to copy after the file run? (according to the timing?)
+
+Lots of possibilities. Firstly there are problems with your code. You don't seem to be rewinding or reopening the file to copy. After the first iteration, you are at end of file, so the remaining iterations copy 0 bytes.
+Secondly, there are OS factors to consider. In particular, general purpose operating systems maintain an in memory cache of recently used disk contents. This means that the first time you read a file, it has to be pulled off disk, but on subsequent occasions, it may be already in RAM. 
+
+Am I using free appropriately? (I tried moving it in the loop, but it doesn't run)
+
+Yes. Realloc will either reuse the same memory block if it is big enough or it will malloc a new block, copy the old block and free the old block. So do not ever attempt to realloc a block you have already freed.
+
+Am I passing the buffer appropriately to the function copy?
+
+Yes, but you are not using it appropriately within the function copy() as detailed by the comments you are receiving. Some of the problems within copy() are:
+
+buffer is already a char* so do not take its address to pass to read(). 
+taille is the length of buffer so pass it directly to read. Passingf sizeof taille passes the size of the variable itself, not its content. 
+write need not necessarily write all the bytes in the buffer in one go. In that case, it will return a short count (unlikely to be an issue for a disk file).
+write can also return -1 for an error. You need to handle that error.
+
+In your main program there are also issues.
+
+As stated above: you either need to close and reopen the input file or rewind it to the beginning on each iteration of the loop.
+remove does not do what you think, it merely removes the directory entry and decrements the file's reference count. The file will only physically go away when its reference count reaches zero. It won't reach zero while you still have an open file descriptor to it. So, you also need to close and reopen the output file or you'll just continue appending to an anonymous file that will be automatically deleted when your process exits.
+One I didn't spot before: you should declare taille and buffer_size as size_t because that is the right sized type for the arguments to realloc, read (and write). t should, however, be an ssize_t (signed size) because it can return either -1 or the count of bytes read/written.As noted in the comments, this code is wrong:
+void copy (int in, int out, char *buffer, long long taille) {
+  int t;
+
+  while ((t = read(in, &buffer, sizeof taille))> 0)
+    write (out, &buffer, t);
+
+
+  if (t < 0)
+    perror("read");
+}
+
+First, a minor issue: both read() and write() return ssize_t, not int.
+Second, you're ignoring the return value from write(), so you never really know how much gets written.  This may or may not be a problem in your code, but you won't detect a failed copy from a filled-up filesystem, for example.
+Now, for the real problems.
+read(in, &buffer, sizeof taille)
+
+&buffer is wrong.  buffer is a char * - a variable in memory containing the address of a char buffer.  That's telling read() to put the data it reads from the in file descriptor in the memory occupied by the buffer pointer variable itself, and not the actual memory that the address held in the buffer pointer variable refers to.  You simply need buffer.
+sizeof taille is also wrong.  That's the size of the taille variable itself - as a long long it's likely 8 bytes.
+If you're trying to copy the entirety of a file:
+void copy( int in, int out, char *buffer, size_t bufsize )
+{
+    // why stuff three or four operations into
+    // the conditional part of a while()??
+    for ( ;; )
+    {
+        ssize_t bytes_read = read( in, buffer, bufsize );
+        if ( bytes_read <= 0 )
+        {
+            break;
+        }
+
+        ssize_t bytes_written = write( out, buffer, bytes_read );
+        if ( bytes_written != bytes_read )
+        {
+            // error handling code
+        }
+    }
+ }
+
+It's that simple.  The hard part is the error handling for any possible failure.It's been a while since this thread was active, but I though I'd add to Andrew Henle's post.
+To get a better idea of the real time involved in copying files, one could add an fsync(2) after the forever-loop exits and before copy() returns.  fsync(2) will make sure all the data in the systems buffers has been sent to the underlying storage device.  Note, however, that most disk drives have an onboard cache that can buffer writes, again, masking the actual time it takes to write to the media.
+The vast majority of code that I write is for safety critical systems.  Those are systems that, if they malfunction, can cause serious injury or death, or serious environmental damage.  Such systems can be found in modern aircraft, nuclear power plants, medical devices, and automobile computers, just to name a few.
+One of the rules applying to source code for safety critical systems is that loops must have a clear condition to break out of the loop.  By "clear", the break condition must be expressed in the for, while, or do-while, and not somewhere within the compound statement.
+I understand exactly what Andrew wrote.  The intent is clear.  It's concise.  There's nothing wrong with it.  And it's an excellent suggestion.
+But (here's the "but"), the condition in the for appears at first glance to be infinite:
+
+
+for ( ;; ) {
+...
+}Don't send SIGINT on CTRL+C to child processes but don't ignore the signal itselfI'm trying to write a Task control program, very much like Supervisor.
+I run some programs from a config file and let them run in the background, while in the main process I read and execute other commands.
+Before fork()-ing, in the main process I call:
+sigaction(SIGINT, &the_handler, NULL);
+
+Where the_handler stores the reference of a simple print function.
+When CTRL+C is pressed, the child processes are interrupted as well (which I don't want).
+I could run: signal(SIGINT, SIG_IGN); after fork in child process to ignore it, but I would like to still to be able to run this command in bash: $ kill -n 2 <child_pid>, meaning, I don't want to ignore it, right?
+So, how to ignore SIGINT from CTRL+C to child processes, but still be able to receive the signal in other ways? Or am I missing something?The traditional means of doing this is to fork twice. The grand parent forks its children and then waits for them. Each child then forks and exits straight away. Because their parents have exited, the grand children become parented by pid 1. Thus signals sent to the grand parent do not get propagated to the ex-grand children.
+See this answer for a bit more detail
+https://stackoverflow.com/a/26418006/169346
+ETA: You need to call setsid() between the two forks otherwise the grandchild is still in the same process group as the grand parent and will still receive signals that the grand parent receives.Java JVMTI Agent crashes on GetEnv()I'm at a total loss here. I'm trying to get a JVMTI agent library running but it keeps crashing for some reason.
+I've narrowed it down this line:
+(*jvm)->GetEnv(jvm, (void**)jvmti, JVMTI_VERSION_1_0);
+
+this is the full code of the agent lib (in C):
+#include <jvmti.h>
+#include <stdlib.h>
+
+
+jvmtiEnv* jvmti = NULL;
+
+
+JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved)
+{
+    printf("Agent started.\n");
+    _flushall();
+    jint err = (*jvm)->GetEnv(jvm, (void**)jvmti, JVMTI_VERSION_1_0);
+    if (err != JNI_OK)
+    {
+        printf("Failed to get JVMTI env!\n");
+        _flushall();
+        return err;
+    }
+
+    return JNI_OK;
+}
+
+JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM* vm, char* options, void* reserved)
+{
+    return JNI_OK;
+}
+
+JNIEXPORT void JNICALL Agent_OnUnload(JavaVM *vm)
+{
+}
+
+As I tried to isolate what the issue was I wrote a very simple java app to test
+this with:
+public class Test
+{
+    public static void main(String[] args)
+    {
+        System.out.println("Hello from java!");
+
+    }
+}
+
+If I run this from netbeans with the VM arg -agentpath set to my .dllcontaining the code above, the app seems to crash when it tries to call GetEnv().
+I've made sure of the following things: 
+- The JVM and the dll are both 64bit.
+- The library is most definitely being found and loaded (the printf output is visible before the crash.)
+I don't know what else could probably be causing this, do I have to link against some JVMTI API lib that I don't know about?
+Or could this be an issue with the java installation on my PC?
+ThanksYou should be passing address of jvmti to GetEnv() as in:
+jint err = (*jvm)->GetEnv(jvm, (void**) &jvmti, JVMTI_VERSION_1_0);Embedded Python 3: Redirect stdout, stdin and stderr to C++?Essentially I want to do something similar as described here: redirecting the python output in an application embedding python. The best answer seems to be this one, because it is written only in C / C++ (mixing Python and C / C++ seems not clean to me).
+Still I'm not happy with the answers. First of all when looking at https://docs.python.org/3/c-api/file.html, it seems that I should not use  PyFile_FromFile(..) anymore, and I'm not sure whether PyFile_FromFd(..) is the Python 3 substitute, looking at the warning in red. Second I only want to redirect the output generated by my calls to Python functions, e.g. PyRun_SimpleString(..), not the whole program output. Essentially my application is compiled as a shared library and when loaded should only redirect it's own output.
+An application of library would be a custom Python GUI: A GUI which loads the library, the user can enter a string which will be sent to the library, which gives it to PyRun_SimpleString(..) and returns the output. The GUI will then will then display the output.Unknown Malloc stack overflow cI have written a piece of code that takes several integers (as many as 100 000 int) as input from a file and stores them in a "recursive" struct.
+As long as I run this code on my PC everything is fine.
+Here is the code:
+typedef struct node{
+    int data;
+    struct node* next;
+} node;
+
+...
+
+node* create(void){
+    node* list = (node*)malloc(sizeof(node));
+    return list;
+}
+
+node* insert(node* list, int temp){
+    if(list == NULL){
+        list = create();
+        list->data = temp;
+        list->next = NULL;
+        return list;
+    }
+    list->next = insert(list->next, temp);
+    return list;
+}
+
+int main(void){
+    ...
+    node* list = NULL;
+    while(there is still data to input){
+        list = insert(list, data);
+    }
+}
+
+However, when I try to run this code on my Android phone, I get a
+
+malloc stack overflow error
+
+(I know that the stack space reserved on a phone is less then the one on a PC).
+The problem is that, to my knowledge, this program should use a lot of stack memory.
+This is what I think is happening inside my program (please correct me if I am wrong):
+1). node* list = NULL ==> Space for a pointer (8 byte) is allocated on the stack;
+2). list = insert(list, temp) ==> Goes to the end of data stream.
+3). list = create() ==> The create() function is called;
+4). node* list = (node*)malloc(sizeof(node)) ==> Space for a pointer is allocated on the stack (8 byte) and space for the struct is allocated on the heap (16 byte);
+5). return list ==> create() function is closed, therefore the variable node* list on the stack is "freed" while the space allocated on the heap remains.
+So my program should be using a lot of heap memory, but just 8 byte of stack memory (the ones needed for the first pointer in main ==> node* list = NULL), how is it possible that I get error:
+
+malloc stack overflow
+
+?
+Thank you
+Lorenzo
+P.s. Sorry guys but I was trying to make my code shorter, but what I had written was no sense. I fixed it now (or I hope so).You are overusing the variable list.
+You need to retain a pointer your current node instead of overwriting it with the line:
+list = create();
+
+consider the following or similar:
+int main(void){
+    ...
+    node* list = NULL;
+    node* current = NULL;
+    node* next = NULL;
+    while(...){
+        ...
+        next = create();
+        if(list == NULL)   //list empty case
+        {
+            list = next;
+            current = next;
+        }
+        current->next = next;
+        next->next = NULL;
+        current = next;
+    }
+}
+
+I encourage you to wrap some of this logic in a function separate from main().
+The actual cause of the segmentation fault is not in the code you showed, but in your current code when every you try to use list it is NULL, which is probably your undefined behavior.Wrong values in Array containing Structs in C [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Crash or "segmentation fault" when data is copied/scanned/read to an uninitialized pointer
+
+                                (5 answers)
+                            
+
+
+How can I correctly assign a new string value?
+
+                                (3 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+I have this struct:
+(struct.h)
+#pragma once
+
+#ifndef STRUCT_H
+#define STRUCT_H
+
+typedef struct {
+    unsigned int id;
+    char *name;
+    char *address;
+} Struct;
+
+#endif 
+
+I made a dynamic array containing these structs. I also have a loop that puts some data in those structs:
+(main.c)
+#include <stdio.h>
+#include <stdlib.h>
+#include "struct.h"
+
+int main() {
+
+    int nStructs = 3;
+
+    Struct *structArray = calloc(nStructs, sizeof * structArray);
+
+    char input[30];
+
+    for (int i = 0; i < nStructs; i++) {
+        structArray[i].id = i;
+        sprintf(input, "name_%d", i);
+        structArray[i].name = input;
+        sprintf(input, "addr_%d", i);
+        structArray[i].address = input;
+    }
+
+    for (int i = 0; i < nStructs; i++) {
+        printf("\n[%04d]    ID: %d\n", structArray[i].id, structArray[i].id);
+        printf("[%04d]  NAME:   %s\n", structArray[i].id, structArray[i].name);
+        printf("[%04d]  ADDR:   %s\n", structArray[i].id, structArray[i].address);
+    }
+
+    free(structArray);
+    return 0;
+}
+
+When I try to run this code, the 'int ID' is printed the right way, but the 'char *name' and 'char *address' are all containing the last value from the loop (in this case "addr_3"):
+(output)
+[0000]  ID:     0
+[0000]  NAME:   addr_2
+[0000]  ADDR:   addr_2
+
+[0001]  ID:     1
+[0001]  NAME:   addr_2
+[0001]  ADDR:   addr_2
+
+[0002]  ID:     2
+[0002]  NAME:   addr_2
+[0002]  ADDR:   addr_2
+
+I tried to use the debugger in visual studio and it looks like the values are ok when they are put in the array (first for loop), but that they get overwritten at some point. Since im new to visual studio, I don't know how to see the values of the array at a specific point and not just at the value [i]. 
+What am i doing wrong here? 
+EDIT:
+I copy/pasted this code from my main project so only the part that im testing will be in the question. But I see I forgot to add 'free(structArray);' above 'return 0;'. Its added in the question now so others don't make the same mistake.Almost had an example ready but then I noticed your comment.
+No, calloc allocates space for your structures, but not strings - your structure only stores pointers.
+If you don't want to change the struct, you should allocate memory for each string and then copy it instead of storing the pointer to the same element in all cases (in your case, all pointers point to input). strdup will do it for you:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "struct.h"
+
+int main() {
+
+    int nStructs = 3;
+
+    Struct *structArray = calloc(nStructs, sizeof * structArray);
+
+    char input[30];
+
+    for (int i = 0; i < nStructs; i++) {
+        structArray[i].id = i;
+        sprintf(input, "name_%d", i);
+        structArray[i].name = strdup(input);
+        sprintf(input, "addr_%d", i);
+        structArray[i].address = strdup(input);
+    }
+
+    for (int i = 0; i < nStructs; i++) {
+        printf("\n[%04d]    ID: %d\n", structArray[i].id, structArray[i].id);
+        printf("[%04d]  NAME:   %s\n", structArray[i].id, structArray[i].name);
+        printf("[%04d]  ADDR:   %s\n", structArray[i].id, structArray[i].address);
+
+        // Notice you now have to free those copies strings before your structs
+        // go out of scope, or else you'll be leaking memory
+        free(structArray[i].name);
+        free(structArray[i].address);
+    }
+
+    return 0;
+}
+
+You might want to look up how exactly pointers work in C/C++.You need to allocate memory for all of the strings in your struct with malloc or change the definitions of the struct to:
+typedef struct {
+    unsigned int id;
+    char name[100];
+    char address[100];
+} Struct;
+
+Currently all of the char pointers in your struct point to input, so as input changes the value of all the strings in your struct change.
+To make your code work without changing the struct definitions, do something similar to the following:
+for(int i = 0; i < nStructs; i++)
+{
+    structArray[i].name = malloc(100);
+    structArray[i].address = malloc(100);
+}
+
+You can does this in the same for loop that you have, and allocate only as much memory that you need for each string.  Be sure to check if malloc() returns NULL.A way to emulate named arguments in CIs there a way to use named arguments in C function?
+Something like function with prototype void foo(int a, int b, int c);
+and I want to call it with foo(a=2, c=3, b=1); [replaced the order of b & c and used their names to distinguish]
+Motivation: I want a more Pythonic C, where I can easily manipulate my function arguments without mixing them by mistakeKinda, sorta, with a compound literal and designated initializers:
+typedef struct foo_args {
+  int a;
+  int b;
+  int c;
+} foo_args;
+
+// Later
+
+foo(&(foo_args) {
+  .a = 2,
+  .c = 3,
+  .b = 1
+});
+
+But I honestly wouldn't bother. It requires you to bend the function definition to accept a pointer, and makes calling it cumbersome.Named arguments are not supported in C.
+All arguments must be passed in the correct order.Why can't I link a static object with .rodata section to a shared library in 64-bit systems?I have created a static library (libar.a), which contains a function foo.
+I have a shared object (compiled with -fPIC flag) file that calls foo.
+If the object file containing foo has a .rodata section (e.g. a call to printf or a string literal), trying to compile the shared object with the static library fails with this error:
+relocation R_X86_64_32 against '.rodata' can not be used when making a shared object; recompile with -fPIC
+/path/to/static/lib/libar.a: error adding symbols: Bad value
+collect2: error: ld returned 1 exit status
+I know I can solve it by using -fPIC to compile my static object, but I try to understand the reason I get this error. 
+P.S. While looking for it I found that this happens only on 64-bit platforms. 
+Thanks.Windows socket recv flagsI'm reading socket recv() documentation from msdn, and it is not clear to me what these flags do exactly:
+int recv(
+  _In_  SOCKET s,
+  _Out_ char   *buf,
+  _In_  int    len,
+  _In_  int    flags //these
+);
+
+I peeked into winsock2.h and found the values of some flags  like: MSG_OOB and MSG_PEEK, but MSG_WAITALL is not defined there.
+Can you please explain to me what each flag does and what is the value of it (int) ?
+Edit: It seems that I was not clear in my question, but I did read the documentation section about the flag and I still do not understand the behavior of recv() with each flag, hence I'm asking for an explanation of each flag with an example if possible.Check this MSDN article out on recv():
+https://msdn.microsoft.com/en-us/library/windows/desktop/ms740121(v=vs.85).aspx
+I've honestly not used any of these flags in all the networking work I've done, except for MSG_PEEK - I can't see why it'd come up in most situations these days.
+You can look at the WinSock2.h header file and deduce the values from there:
+#define MSG_OOB         0x1             /* process out-of-band data */
+#define MSG_PEEK        0x2             /* peek at incoming message */
+#define MSG_DONTROUTE   0x4             /* send without using routing tables */ 
+#define MSG_WAITALL     0x8             /* do not complete until packet is */C: pointer references incorrect value [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+How can I correctly assign a new string value?
+
+                                (3 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+I need to send a value saved in a variable. When trying to pass this in my payload it keeps referencing to the initial value of mydata, which is unsuccessful test.
+    static uint8_t *mydatapnt;
+    uint8_t *strdata = "Successfull test";
+    static uint8_t mydata [] = "Incorrect test";   
+
+    void send(){
+      if (LMIC.opmode & OP_TXRXPEND) {
+      Serial.println(F("OP_TXRXPEND, not sending"));
+      } else {
+         // Prepare upstream data transmission at the next possible time.
+         LMIC_setTxData2(1, mydata, sizeof(mydata)-1, 0);
+         Serial.println(F("Packet queued"));
+    /
+    }
+
+    void setup(){
+     *mydata = mydatapnt;
+    }
+
+    void loop(){
+     *mydatapnt = strdata;
+     Serial.println(*mydatapnt + "");
+    }
+
+What exactly am I doing wrong? I should receive "successfull test".
+You can find the full code project hereAbout strings...
+Strings are just pieces of memory where characters are stored (an array of characters). Strings are terminated by a null character.
+To copy a string, you must have sufficient memory in the target string. Then you use strcpy to copy the characters. strcpy appends the terminating null character.
+The size of a string is determined with strlen. It does not count the terminating null charcter.
+In
+char *strptr = "my string";
+
+the pointer points to the literal string. A literal string is read-only. Trying to modify it often leads to a segmentation fault or other terminal error. In:
+char myString[] = "my string";
+
+The characters of "my string" are copied to the array myString and the compiler makes its size of the length of the initializing string, plus a null character.
+To append to a string, you use strcat. Again, the target must have sufficient memory. You either declare a char array with enough memory, like char mystr[100]; or you can allocate memory with malloc, for example:
+char *strptr= malloc(strlen(myString)+1);
+strcpy(strptr, myString);
+
+If you no longer need the memory you got from malloc, you must return it to the memory allocator:
+free(strptr);
+
+Trying to use strptr after having freed the memory will also result in a segmentation fault or in some other undefined behavior.*mydatapnt = "success in loop";
+
+This does not store pointer to "success in loop" string into mydatapnt, but rather store address of that string into first character of mydatapnt. (At this time mydatapnt is not initialized, so it clobbered some random memory location.)
+What you more likely wanted to do is: mydatapnt = "success in loop";
+
+Serial.println(*mydatapnt + "");
+
+You're not concatenating strings, but adding value of first char from mydatapnt to pointer to empty string, which is more like substring operation. This will likely print something, because of the way strings are stored in executable, but definetely not what you wanted it to print.
+You can't concatenate strings in C with simple +. Try just Serial.println(mydatapnt).Memory allocation in C - Acronyms :) [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+
+Please see the code below. The user should enter a sentence and the code should return the acronyms of the sentence.
+However, when I allocate *str and define N as 1.
+"three letter acronym" >> should be >> "t"
+In real time, "three letter acronym" >> is >> "tla"
+This doesn't make sense.
+Please explain why this happens.
+#include <stdio.h>
+#include <stdlib.h>
+
+#define N 1
+#define M 35
+
+char *acronyms (char *st,  char *sentence);
+
+int main()
+{
+
+char *str=(char*)(malloc(N*sizeof(char)));
+char *sen=(char*)(malloc(M*sizeof(char)));
+
+printf("enter... ");
+gets(sen);
+puts(acronyms(str, sen));
+
+free(str);
+free(sen);
+    return 0;
+}
+
+
+char *acronyms (char *st,  char *sentence)
+{
+     char *p = st;
+     char *q = sentence;
+
+     if (*q !=' ') {
+            *p =*q;
+            p++;
+     }
+
+     while (*(q+1)) {
+         if (*q==' '  &&  *(q+1)!= ' ') {
+             *p = *(q+1);
+             p++;
+         }
+
+        q++;
+     }
+     *p='\0';
+     return st;
+}First of all, you should not use gets(). Why?? Check this.
+You are allocating only 1 byte of memory to str:
+char *str=(char*)(malloc(N*sizeof(char)));
+
+and in function acronyms(), you are writing beyond the allocated memory. This is undefined behavior.
+To get the acronym of input sentence, you can do:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define STR_LEN 100
+
+char *acronyms (char *pstr,  char *str_acronym);
+
+int main(void) {
+
+    char input_str[STR_LEN];
+    char *sen = NULL;
+
+    printf ("Enter:\n");
+    fgets (input_str, STR_LEN, stdin);
+
+    sen = malloc (strlen(input_str) + 1);
+    if (sen == NULL) {
+            perror ("Failed to allocate memory");
+            return -1;
+    }
+
+    puts (acronyms(input_str, sen));
+
+    free(sen);
+
+    return 0;
+}
+
+char * acronyms(char *pstr,  char *str_acronym)
+{
+    int count = 0, add = 1;
+
+    for (int i = 0; pstr[i] != '\0'; i++) {
+            if (isspace(pstr[i])) {
+                    add = 1;
+                    continue;
+            }
+            if (add) {
+                    str_acronym[count] = pstr[i];
+                    count++;
+                    add = 0;
+            }
+    }
+    str_acronym[count] = '\0';
+
+    return str_acronym;
+}There are a few problems in the code: 
+1) allocating only one byte for the string str: 
+#define N 1
+char *str=(char*)(malloc(N*sizeof(char)));
+
+2) using gets(sen) instead of    fgets(sen,M+1,stdin);
+3) char *acronyms (char *st,  char *sentence)
+has very problematic logic. The end of string is not recognized, the ' ' may or may not be present: 
+ if (*q !=' ') {
+        *p =*q;
+        p++;
+ }This may not seem very satisfying at first glance, but once you have an understanding of the underlying principles pointed to by these 5 concepts (each with example(s)),this, and other similar tasks will seem much simpler.   
+Necessary steps to do what you are trying:
+1) Understand console user input techniques (Good example here)
+2) Understand definition of string ( Good definition,explanation here. )
+3) Understand usage of [c][m]alloc(...) (Good discussion here... ...)
+3a) ...and when to use it. or not. ( heap vs. stack memory )
+4) Understand string parsing techniques. ( ex 1 , ex 2, ex 3 )
+5) Become aware of legal, but unwise techniques, such as using gets, or in general.
+These are generally applicable techniques, useful for many tasks that include user input and string manipulation, but are not a good replacement for referring to a good C book to provide a necessary foundation in the basics.Wellcome in the world of Undefined Behaviour! When you use an array out of its bonds, anything can happen including expected result. That's what happens here: you allocate 1 single byte for str, and write 5 {'h', 'a, 'n', 'd', '\0'}. [Un]fortunately, at a lower level it looks like you only overwrite unused memory, and actually get your result.
+Simply as it is UB, you cannot rely on that, and same source compiled in a different environement could SEGFAULT or print nothing with the exact same input.
+And as you have been told in comment don't use getsHow to separate character and number from string in c programFor example, I want to separate the string "0013subdivision" into 0013 (as an integer that can do addition, subtraction, etc. not char) and subdivision (as a char itself) in the given string.
+This is my code so far:
+#include <stdio.h>
+#include <stdlib.h>
+
+char location[10]; /* for the input with number and letter */
+char x;
+int house[10]; /* for the integer that will be separated from the string */
+int main()
+{
+    printf("Input: ");
+    scanf ("%s", &location[x]);
+
+    x=0
+    for (x=0; location[x]!='\0'; x++ );
+    return 0;
+}
+
+Based on my research, the code atoi is used to convert the converted value back to int (if I'm not mistaken) but I don't know when to place the function.location is char array, if you are reading as string use only %s with string name only, index not required.
+scanf ("%s", &location[x]); --> scanf ("%s", location);
+After separating only int from char array you need to store one int value into house.
+int house[10] --> int house.
+Here is the code for extracting only int from string :
+char location[10]; /* for the input with number and letter */
+int x;
+int house = 0 ; /* for the integer that will be separated from the string */
+int main()
+{
+        printf("Input: ");
+        //scanf ("%s", &location[x]);
+        scanf ("%s", location);
+
+                for (x=0; location[x]!='\0'; x++ ) {
+                        if(location[x]>='0' && location[x]<='9') {
+                                house =(house * 10) + (location[x]-48);
+                        }
+                }
+                        printf("int part = %d \n",house);
+
+
+        return 0;
+}The main problem in the code is
+   scanf ("%s", &location[x]);
+
+Where you did not impose any limit on the scanning. An input like 0013subdivision will cause out of bound memory access leading to undefined behavior.
+Always limit the input size with the length modifier, like, for an array defined  as
+ char location[10]
+
+use the conversion specification like
+ scanf ("%9s", location);   // (i) one element saved for terminating null
+                            // (ii) the array name decays to the pointer to 1st element
+                            //in case of an argument to a function call.
+
+Then, you don't need an integer array to store the extracted integer. A singular variable would suffice.
+
+However, i'd like to suggest a much robust way:
+
+read the user input using fgets()
+then, scan the input using sscanf() and appropriate conversion specifier, like %4d%9s or alike.The most correct way to do this is to use the strto... family of functions from stdlib.h. For example:
+printf("%ld\n", strtol(str, NULL, 10));
+
+The atoi family of functions should never be used for any purpose, since they have broken error handling and can be 100% replaced by the strto... functions.
+You could use the scanf family of functions but they are needlessly slow and notoriously dangerous, so I don't really see the point of using them here.
+
+If you are interested in implementing the actual copying manually, for learning purposes, it is fairly trivial:
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+
+int main (void)
+{
+  const char str[] = "0013subdivision";
+  char number_part [sizeof(str)];
+  char letter_part [sizeof(str)];
+  size_t i;
+
+  for(i=0; str[i]!='\0' && isdigit(str[i]); i++) // find where the letters start
+  {}
+
+  memcpy(number_part, &str[0], i);             // copy digit part
+  number_part[i] = '\0';                       // append null terminator
+  memcpy(letter_part, &str[i], sizeof(str)-i); // copy letter part + null term
+
+  puts(number_part);
+  puts(letter_part);
+  printf("%ld\n", strtol(str, NULL, 10));
+}
+
+If the string is a run-time variable, you have to use strlen(str)+1 instead of sizeof().strtol converts string to number and also gives you back the character it stopped on, i.e. first character after number.
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+  const char* const input = "0013subdivision";
+  const char* string;
+  const long number = strtol(input, &string, 10);
+
+  printf("Number: %ld String: '%s'\n", number, string);
+  // Number: 13 String: 'subdivision'
+  return 0;
+}
+
+https://repl.it/repls/SphericalImpracticalTinamouI am stuck here while implementing stack data-structure using linked-list in C lang [duplicate]This question already has an answer here:
+                        
+                    
+
+
+
+Dynamic memory access only works inside function
+
+                                (1 answer)
+                            
+
+Closed 3 years ago.
+
+
+
+I am implementing a stack using Linked_list in C lang. I have successfully created first Node. And when I am trying to add further nodes dynamically in the first position as stack follows LIFO principle, I believe I am not correctly linking pointers so that the order of Linked list remains intact. The code is pretty simple as shown below, I just need to understand, when I am trying to print the entire linkedlist, it is only printing the data of very first node. Looks like the entire chain is breaking after the first node. Where am I going wrong ? 
+// Implementation of stack using a linked-list
+#include<stdio.h>
+#include<stdlib.h>
+
+typedef struct sllnode
+{
+int data;
+struct sllnode *next;
+}
+stack;
+
+void create(stack *head, int elem)
+{
+head -> data = elem;
+head -> next = NULL;
+}
+
+void insert(stack *head, int elem)
+{
+stack *newNode = malloc( sizeof(stack) );
+newNode -> data = elem;
+newNode -> next = head;
+head = newNode;
+}
+
+void display(stack *head)
+{
+if( head == NULL )
+{
+    printf(" NULL value returned \n");
+}
+stack *ptr = head;
+while(ptr != NULL)
+{
+    printf("%d \n", ptr -> data);
+    ptr = ptr -> next;
+}
+}
+
+int main(void)
+{
+stack *head = malloc( sizeof(stack) );
+create(head, 10);
+insert(head, 15);
+insert(head, 25);
+insert(head, 26);
+insert(head, 27);
+insert(head, 28);
+display(head);
+}This function:
+void insert(stack *head, int elem) {
+    stack *newNode = malloc( sizeof(stack) );
+    newNode -> data = elem;
+    newNode -> next = head;
+    head = newNode;
+}
+
+Modifies the local copy of head. 
+It should be:
+void insert(stack **head, int elem) {
+    stack *newNode = malloc( sizeof(stack) );
+    newNode -> data = elem;
+    newNode -> next = *head;
+    *head = newNode;
+}
+
+And called as insert(&head,elem);. 
+For greater clarity why not:
+void create(stack **head){
+   *head=NULL;
+}
+
+Rather than allocating space in the body of the code.
+And
+void destroy(stack** head){
+    while(*head!=NULL){
+        stack* next=(*head)->next;
+        free(*head);
+        *head=next;
+    }
+}make GDB expand the arg=... on backtraceWhen I type gdb backtrace, I get:
+(gdb) bt 1
+#0  Handler::send (this=0x2ba2b10, src=..., to=..., newMessage=true) at main.cpp:138
+
+As you can see, gdb displays src=... and to=... and does not show the actual values.
+How do I force gdb to exapnd the stack trace without explicitly printing the variables ?By default gdb prints only scalar values in backtrace. To print all values (arrays, structures, unions) set print frame-arguments to all:
+set print frame-arguments all 
+
+See documentation.Can signal-handling be used to print intermediate results [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I frequently run programs that run for several days, testing successive integers for various criteria. I like to know where a program is up to, so I usually have it print out a message every, say, 100000000 trials, but it would be nice if I could get intermediate results by sending the program a signal. The kind of thing I have in mind is something like this:
+Create signal handler to print out value of n and resume in loop
+
+Register signal handler
+n=1
+while( 1 ) {
+    If n fits some criterion, print n
+    n++
+}
+
+with the idea that I could then use kill -SIGTYPE processid to get the intermediate results. Is it possible to do what I want? And if so, how? The examples I have seen that use signal handling in C all seem to exit immediately after having dealt with the signal, rather than resuming from the point where the signal was caught.No (in principle), you should not call printf or fputs (etc...) from a signal handler, and on Linux this restriction is documented, see signal(7) and signal-safety(7). Take time to understand the notion of async-signal safe functions (the only ones you can call from inside a signal handler -even indirectly- without undefined behavior).
+(I guess you are on Linux, or at least on some POSIX or Unix-like system)
+However, there is a usual way to overcome that: set some volatile sig_atomic_t flag in your signal handler, and test that flag regularly in your program main loop.
+Another possibility could be to set-up (using pipe(2)), at initialization, a pipe(7) to self, and have a signal handler which write(2)-s one or a few bytes into that pipe (notice that write(2) is async-signal-safe, but fprintf or malloc  are not). Your event loop would check (using poll(2))  that pipe for readability and read(2) it when possible. This common trick is often documented, e.g. in Qt.
+Notice that signal handling is practically OS specific (e.g. different on Linux and on Windows), and has some common behaviour in various POSIX / Unix systems.
+For programs running several days, you probably want them to also handle SIGTERM. You might then save some persistent state (e.g. in some database, in a file, perhaps using sqlite or gdbm) and be able to restart from such a saved state. Read about application checkpointing. You probably should think of saving (and be able to restart from) the state of your program early in its design. Perhaps you'll use time(7) facilities to save e.g. every hour the state of your program (look into setitimer(2), alarm(2), SIGALRM etc...).Handling plug ins in cI am making a small game engine that uses dynamic code reloading. The update function is provided by a dll. Whenever a new dll is found, it is loaded along with the new update function. The issue is that memory errors can still happen so a segfault takes down the entire engine. I'm asking if there's a way I can handle such cases and close the dll etc to recover from it. I know that plug ins solve this issue by running in a separate process but I'd rather not do that if possible.In general, no.
+Assuming you're using the traditional LoadLibrary method of run-time DLL importing or equivalent, the DLL is explicitly imported into the address space of the calling process. The DLL code has as much access to the host application's memory as the host application itself does, so even before it crashes it can destroy the state of the host application. The only thing you can do is crash and take out the whole process.
+To protect the host application, you'll have to bite the bullet and load the library in a subprocess or sandbox. Otherwise you're implicitly trusting the DLL to do the right thing.
+Incidentally, this is pretty well answered already here.How can i create makefile for gcc on a server-client program? [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+There are 3 files : "client.c" , "server.c" and "util.h"
+I need to compile this with gcc on linux and have 2 executables, 1 for client and another for server .
+But it can be possible to have more than 1 client running and ONLY 1 server.
+Im not sure how to do this , create 1 makefile only for client and another for server or just 1 and it can work ?There is only one Makefile to create:
+TARGET=client server 
+normal: $(TARGET)
+client: client.c
+    gcc -Wall client.c -o client
+server: server.c
+    gcc -Wall server.c -o server
+clean:
+    $(RM) $(TARGET) 
+
+It will create 2 executables (server and client) to run. Execute the server once simultanously with one/multiple client(s).
+[Edit]
+I was advised an improved solution:
+TARGET=client server 
+CC=gcc
+CFLAGS= -Wall -Wextra -g
+normal: $(TARGET)
+client: client.c
+    $(CC) $(CFLAGS) client.c -o client
+server: server.c
+    $(CC) $(CFLAGS) server.c -o server
+clean:
+    $(RM) $(TARGET)How to pass argument from Makefile to a program? [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I want to pass directory of Makefile to a function.
+For example:
+Makefile
+$(DIR) = makefile directory
+program
+int main(int argc,char argv[])
+char directory = argv[1]
+How can I do that?
+EDIT
+Clarificaion. I want my app to work outside of the directory that i compiled it in.In case the directory you need to pass is static (i.e. always the same) you can use the -D C compiler option:
+cc -DDIRECTORY=/home/user/...
+
+In your C source code you can then use DIRECTORY.Passing a symbol at compile time is done with the -D option
+(example is C++ but you can transpose to C easily). You can either only define the symbol, or give it a value (which is what you want here).
+DIR=$(shell pwd)
+mytarget: 
+    @echo "DIRECTORY=$(DIR)"
+    $(CXX) mysource.cpp -D"DIRECTORY=$(DIR)" -o mysource
+
+Then, in your source file, the symbol DIRECTORY will hold the path. To check this, you need an additional trick (known as "double expansion"):
+#define STR1(x)  #x
+#define STR(x)  STR1(x)
+#include <iostream>
+int main()
+{
+    std::cout << "directory is " << STR(DIRECTORY) << "\n";
+}
+
+You can check this similar question, and see here about the D flag.Program.exe has stopped working when trying to open file [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+void formFile(FILE** f, char** name)
+{
+    printf("Enter name: ");
+    scanf("%s", name);
+
+    if (1 == doesFileExist(*name, f))
+    {
+        printf("Already exists.");
+        return;
+    }
+}
+
+Here's doesFileExist(char*, FILE**):
+int doesFileExist(char *name, FILE ** f)
+{
+    if(NULL == (*f = fopen(name, "wb")))
+    {
+        return 0;
+    }
+    return 1;
+
+}
+
+In formFile(), when I comment out the if, the code runs without any errors. Any feedback is greatly appreciated!it should be either W+ or W 
+correct:
+ *f = fopen(name, "r"); 
+      if(f){
+        return 1;//fike exist
+       }
+   return 0;In doesFileExist() you return 1 if fopen() succeeds and 0 if it fails. But in formFile() you print an error message if doesFileExist() returns 1, in other words, if everything is OK. 
+Another problem is. that you call scanf( "%s", name ); with char **name but %s expects a char * as argument (pointing to a sufficient array) so you should do something like 
+int size = /* large enough */;
+*name = malloc( size );
+scanf( "%s", *name );  
+
+or better use fgets( *name, size, stdin ); instead of scanf() as it automatically reads at most size-1 characters.Redirecting stdout to stdin in POSIX CI am trying to write a program that redirects stdout into stdin, mostly to better understand how dup2() works. I tried writing a simple program that would make it so that if you printf() something, you can later scanf() it back, but didn't manage to get it to work. First I tried just using dup2(0, 1), thinking it would redirect stdout (1) to stdin (0). This didn't work. I thought that since one is used for input and the other for output they might not be compatible, so I tried using a pipe to do this, like so:
+#include <stdio.h>
+#include <unistd.h>
+int main() {
+    int pipe_desc[2];
+    pipe(pipe_desc);
+    dup2(pipe_desc[0], 0);
+    dup2(pipe_desc[1], 1);
+    printf("foo");
+    char bar[20];
+    scanf("%s", bar);
+    fprintf(stderr, "%s", bar);
+}
+
+However, now even though printf, as I understand it, was supposed to put "foo" into the pipe, when I call scanf, the program just hangs there, and reads neither from stdin, nor from the pipe. What is wrong? What exactly happens in this code? Can such redirection be done without pipes (or any other helper structures for that matter)?How your works, explanation is there in the code.
+#include <stdio.h>
+#include <unistd.h>
+int main() {
+        int pipe_desc[2];
+        pipe(pipe_desc);
+        printf("pid = %d \n",getpid());
+        /* above statement creates 2 descriptors 3 & 4. 3 is for read and 4 is for write**/
+        dup2(pipe_desc[0], 0);
+        /** 3 is duplicates with 0(stdin) i.e if you try to do scanf, it won't scan from keyboard, it will scan from pipe(read end, for that make sure something should be there in pipe  **/
+        dup2(pipe_desc[1], 1);
+        /** 4 is duplicates with 1 (stdout) i.e if you try to write onto screen, it won't. It will try into pipe write end **/
+        /** SO TILL NOW FD DETAILS
+                0,3 --> PIPE_DESC[0]
+                1,4 --> PIPE_DESC[1] 
+        **/
+        #if 1
+        fflush(stdout);
+        printf("foo\n");//it won't print 
+        char bar[20];
+        scanf("%s", bar);//it won't scan bcz 0 is poiting to pipe_desc[0]
+        #endif
+        /** YOU CAN CHECK USING OTHER TERMINAL "ls -l /proc/pid/fd/" **/
+
+        fprintf(stderr, "%s", bar);// fd 2 is still available.So foo gets printed on screen
+}
+
+open another terminal while above program is running, view the fd details using
+root@xyz-PC:/home/achal/s_flow/cpp# ls -l /proc/4503/fd
+total 0
+lr-x------ 1 root root 64 Jan 15 16:45 0 -> pipe:[782489]
+l-wx------ 1 root root 64 Jan 15 16:45 1 -> pipe:[782489]
+lrwx------ 1 root root 64 Jan 15 16:45 2 -> /dev/pts/9
+lr-x------ 1 root root 64 Jan 15 16:45 3 -> pipe:[782489]
+l-wx------ 1 root root 64 Jan 15 16:45 4 -> pipe:[782489]Redirect output from C to MatlabI'm using Linux & Matlab R2017.
+I have a C program, which have an infinite output via printf(), which I want to direct to matlab.
+I'm able to run this program like this unix('./prog'), 
+after that I have output, but I dont know how to save it to matlab array.
+Actually, I want to make it like FIFO, but no idea how..
+As I know in matlab no pipes like in bash.It is only loosely related with C language. IMHO, the only C point is that you need to make sure whether stdout can be buffered in your C program. It it should not be, you will have to either explicitely set it unbuffered (setbuff(stdout, NULL);) or fflush is when you need to output to be immediately available.
+For the rest, I would use a fifo file at the file system level. Such a fifo can be created with mkfifo fifo_path. Then you ask your matlab program to read its input from the fifo and redirect the output of your C program there: unix('./prog > /path/to/fifo')Is it possible to check condition coverage with gcov?By condition coverage, I mean like in the definition here. I didn't find such option in the documentation here. An option that gives me relevant statistics which I can parse easily condition coverage is also fine - but I can't find one.C : redefinition of typedef in different inmodifiable modulesI'm using external modules in my code, and I have 2 differents typedef in two modules, and, obviously the 2 definitions are differents. One is typedef int BOOLEAN the other one is typedef unsigned char BOOLEAN.
+So, when I try to compile, I got the "redefinition" error...
+The simple solution is to "kill" one of these typedef.
+But... that's why I ask here, I should not modify these two modules as standard modules used in many other systems...
+So I was asking if it is possible to "dynamically" kill one of these typedef, let say during precompilation?
+for example,is there a solution like for #define, you can use #undef (which does not work here as it is not a #define action...)Physical address varies when initializing variableFor some reason, I need to know the physical address of a certain variable. Nonetheless, the physical address changes after initializing the variable. To get the physical address I use this function (virt_to_phys(..., uint64_t virtaddr)), which seems to work properly. Some examples of the behavior:
+Before initialization: virtual 0x5632692a3780 physical 0x32b2c7c780
+After initialization: virtual 0x5632692a3780 physical 0x342147a780
+Using these formatters:
+printf("virtual 0x%llx physical 0x%llx\n", &p, virt_to_phys((uint64_t) &p));
+
+I am compiling with -O2, but I also used -O0 and nothing changed, so I guess this behavior is not an optimization. I am also executing this code in Arch Linux with kernel 4.13.4-1.
+This could be a dumb question but I can not understand the reason behind this behavior.The physical address can change over time unless you lock the memory (mlock(2)). 
+If your variable is uninitialized, it will reside in BSS, and the BSS pages would originally point to a shared page filled with zeroes. As soon as you write to that page, the entire page would probably have to be copied to another page frame (physical page), therefore the different physical address.
+Notice that the relative offset within the page remains the same after copying: 0x780, as would be expected from correct code.The first thing I'd say, for printing a pointer (address) is to 
+
+make use of %p format specifier.
+cast the corresponding argument to (void *).
+
+Without that, you're causing undefined behavior and the output cannot be justified anyway.
+That said, as mentioned in the other answer by @Anti, the physical memory here, which "backs up" the virtual memory need not be fixed. Based on the type (behavior) of the type for which the memory is allocated can cause the physical memory to be altered in background, based on the implementation. That is why, we use the virtual memory in application code and let the OS/MMU handle the mapping and transformation under the hood.Using GNU Readline; how can I add ncurses in the same program?The title is a bit more specific than my actual goal:
+I have a command-line program which uses GNU Readline, primarily for command history (i.e. retrieving previous commands using up-arrow) and some other niceties.  Right now the program's output appears interspersed with the user's input, which sometimes is OK but the output is asynchronous (it comes via a network connection in response to the input commands), and that gets annoying sometimes (e.g. if lines are output when the user is typing new input).
+I'd like to add a feature to this program: a separate "window" for the output.  I thought about using ncurses for this.  But it appears from the ncurses FAQ that the two libraries are not easy to use together.
+I might consider using Editline or tecla instead of Readline, but it's not clear to me if either of those will solve my problem.  I'd also consider using something other than ncurses, including a library which provides both kinds of functionality (text-mode windows and command history), but I don't know what might be best.
+Oh, and support for colored text might get bonus points.  I suspect I may be able to do that with Readline, so maybe it's a separate concern, but if a solution to my problem also makes it easy to add a bit of color to the output, so much the better.
+I'm using Ubuntu Hardy (Linux 2.6).I've now put together a simple example program on GitHub: https://github.com/ulfalizer/readline-and-ncurses.
+It supports seamless and efficient terminal resizing and multibyte/combining/wide characters. The code has helpful comments.
+Screenshot below:I have done some searching, and it seems like you are out of luck.
+For ncurses alternatives there are SLang, Newt and Turbo
+Vision. Slang is much more than just screen handling and thus more
+complex, but maybe it can be used for your purpose?. Newt uses the screen
+handling and is much simpler, but too simple and single-threaded-mode
+for your purpose I think.
+Turbo vision is the text mode graphics library from Borland, used by
+all their tools in the late 80s/early 90s. Borland released the source
+code when the market for that kind of thing diminished, and there is
+now a port for linux (side note, this project seems to have written
+its own turbo vision implementation). That port is not dead (there have
+been some cvs updates this year which compiled fine (the older releases
+did not)), but none of the TV examples I found were up to date and I
+did only got a few of them to compile before giving up on the rest.
+This is a bit of a shame, because TV was a lovely environment to use.
+TV is btw C++ (and I assume you are using C?).
+For an alternative to readline, there is libkinput, which maybe works
+together with ncurses (it says it can use ncurses' terminfo. but I am
+not sure if that means that it can co-exists together with ncurses usage)?
+Maybe one option is to run readline "externally" to your ncurses program
+using rlwrap?This had me banging my head for a few hours, so just to save people Googling some pain:
+If you're using ncurses' builtin SIGWINCH handler with KEY_RESIZE, be aware that readline sets the LINES and COLUMNS environment variables by default. These override any dynamic size calculation (usually with ioctl() TIOCGWINSZ) that ncurses would otherwise do, meaning you'll keep getting the initial terminal size even after resizing the terminal.
+This can be prevented by setting rl_change_environment to 0 before initializing readline.
+Update:
+Here's some additional information I gleaned from the readline sources:
+readline's SIGWINCH handling code (which is used if rl_catch_sigwinch is 1) does update LINES and COLUMNS, which seems like it should be sufficient for ncurses. However, when using the alternate readline interface (which makes most sense when combining readline with ncurses), the signal handlers (including the one for SIGWINCH) will only be installed for the duration of each rl_callback_read_char() call, meaning any terminal resize between two calls to rl_callback_read_char() will not be seen by readline.So it turns out that gdb uses both readline and ncurses.  If you're interested in doing this, I recommend that you check out their implementation: http://sourceware.org/git/?p=gdb.git;a=blob;f=gdb/tui/tui-io.cI've achieved what you've described in a program of mine:
+http://dpc.ucore.info/lab:xmppconsole
+The following is the file handling io:
+http://github.com/dpc/xmppconsole/blob/master/src/io.cI'm not sure which version you tried. As of today(2012.09.14) It is very simple, We just need to hook our custom function to following function pointers.
+
+rl_getch_function
+rl_redisplay_function
+rl_completion_display_matches_hook
+
+I did something reasonable here.Understanding a C program about memory alignmentI am going through the following link to understand memory alignment: https://www.ibm.com/developerworks/library/pa-dalign/#N10159. However I am not able to understand the code snippet given below.
+void Munge8( void *data, uint32_t size ) {
+    uint8_t *data8 = (uint8_t*) data;
+    uint8_t *data8End = data8 + size;
+
+    while( data8 != data8End ) {
+        *data8++ = -*data8;
+    }
+}
+
+Here the intent is to increment the pointer and that could have been done by "data8 = data8 + 1" but the code in question uses "*data8++ = -*data8". Both of them work fine i.e. increment the pointer but I am unable to understand the logic behind the later. Is it better than "data8 = data8+1"?
+During compilation I get an error "alignment_test1.c:44: warning: operation on ‘data8’ may be undefined".
+The second part of the question is regarding the code snippet below (from the same link mentioned earlier).
+Listing 2. Munging data two bytes at a time
+void Munge16( void *data, uint32_t size ) {
+    uint16_t *data16 = (uint16_t*) data;
+    uint16_t *data16End = data16 + (size >> 1); /* Divide size by 2. */
+    uint8_t *data8 = (uint8_t*) data16End;
+    uint8_t *data8End = data8 + (size & 0x00000001); /* Strip upper 31 bits. */
+
+    while( data16 != data16End ) {
+        *data16++ = -*data16;
+    }
+    while( data8 != data8End ) {
+        *data8++ = -*data8;
+    }
+}
+
+What could be the reason behind the second 'while' loop? Because data8 and data8End are always going to be same in this case.The code from that article is a buggy mess. Do not read or study it. Stop reading the article immediately.
+*data8++ = -*data8; invokes undefined behavior, since it contains unsequenced access to data8. See the most common C FAQ of all time: Why are these constructs (using ++) undefined behavior?
+Depending on the original type of the data, the second part is very likely to contain various forms of strict aliasing behavior, another form of undefined behavior. You cannot convert pointer-to-something to pointer-to-uint16_t and then access the content as if it was a uint16_t, unless that was the original type of the object (effective type). This leads us to another common C FAQ, What is the strict aliasing rule?
+You can direct the author of that article to those links and tell them to go study basic C programming, before attempting to publish technical articles on the internet.BGLIB SiliconLabs code bug?I'm using the SiliconLabs's BGLIB static library for comunicate via SerialPort, with BLED112.
+For use this library it's necessary to define two function: one for send and another for receive bytes to and from SerialPort. All data received from serial can be divided in two part: header and data.
+Following the "main.c" code of "thermometer-demo" example the function that receive data from serial, receive first of all header and than data. When the header and data has been received, the code parse the header by follow code and initialize a *msg variable:
+unsigned char data[256];
+struct ble_header hdr;
+int r;
+
+r = uart_rx(sizeof(hdr), (unsigned char *)&hdr, UART_TIMEOUT);
+.
+.
+.
+if (hdr.lolen) {
+    r = uart_rx(hdr.lolen, data, UART_TIMEOUT);
+.
+.
+.
+
+}
+
+const struct ble_msg *msg = ble_get_msg_hdr(hdr);
+
+The *msg variable is a ble_msg struct pointer and this struct is so defined:
+struct ble_msg
+{
+    struct ble_header    hdr;
+    uint32               params;
+    ble_cmd_handler       handler;
+};
+
+handler is a function pointer that is initialized when *msg is inizialized. After parse header the code call this function pointer:
+The functions used to initialize this function pointer are defined empty from the library and if you want to use one of this, it's necessary to delete it and rewrite.
+In the "thermometer-demo" example is used void ble_evt_gap_scan_response(const struct ble_msg_gap_scan_response_evt_t *msg) function to receive all visibled devices and the ble_msg_gap_scan_response_evt_t are so defined:
+PACKSTRUCT(struct ble_msg_gap_scan_response_evt_t
+{
+    int8    rssi;
+    uint8   packet_type;
+    bd_addr sender;
+    uint8   address_type;
+    uint8   bond;
+    uint8array  data;
+});
+
+with uint8array so defined:
+typedef struct
+{
+    uint8 len;
+    uint8 *data;
+}uint8array;
+
+Here for me there is the problem: when the msg->handler(data) code is executed and than the ble_evt_gap_scan_response function is called, a cast is executed between data buffer and ble_msg_gap_scan_response_evt_t struct and the content of uint8 *data (in uint8array struct) is initialized with data received from SerialPort and than, will point to a non correct RAM location.
+I think the intention is to provide a way to have a directly access to the data but for me is not the correct way.
+It's my wrong evaluation or is a bglib bug?I have contacted SiliconLabs support and that the original libraries are correct and it seem I have a incorrect version of the libraries.
+Like the SiliconLabs support suggest me (and like explained very good in this link: http://www.drdobbs.com/questions-answers-creating-variable-siz/184403480), there are 3 possible kind of declarations:
+1° declaration:
+typedef struct
+{
+    uint8 len;
+    uint8 data[0];
+}uint8array;
+
+and I access to data with:
+msg->data->data[0]
+msg->data->data[1]
+msg->data->data[2]
+...
+msg->data->data[n]
+
+In this case could happen compiler warns that the buffer index exceeds the limits.
+2° declaration:
+typedef struct
+{
+    uint8 len;
+    uint8 data[1000];
+}uint8array;
+
+In this case it's possible to access to data in the same way as previous one but or more space has been allocaded than necessary (in embedded sometime it's important optimize because the resources are limited) or, like previous, you could exceed the buffer limits.
+3° declaration:
+typedef struct
+{
+    uint8 len;
+    uint8 data[];
+}uint8array;
+
+The name of this declaration is Flexible array member (https://en.wikipedia.org/wiki/Flexible_array_member) and are introduced in the C99 standard. In this case it's possible to access to data in the same way as previouses one but the compiler can warns that isn't a standard declaration.
+This declaration is the same adopted by SiliconLabs for the library.
+In my case I'm using VisualStudio and I have adopted the third solution but compiler return me the warning C4200 (non standard declaration). I tried the first solution and compiler doesn't return me no warns but for me, the clarity of code is missing and could be a problem for future uses.passing struct pointer to function doesn't modifiy the referencesMotive: Passing struct to functions such as we can reference it and modify its original pointer.
+typedef struct thing{
+    char x;
+}thing_t;
+
+#include <stdio.h>
+#include <stdlib.h>
+
+void f1(thing_t *bob, thing_t *boby) {
+    bob->x = 'y';
+    boby = bob;
+    printf("f1 boby after: %c\n", boby->x);
+}
+
+int main(void) {
+    thing_t *foo, *foofy;
+    foo=(struct thing_t*)malloc(sizeof(struct thing));
+    foo->x = 'x';
+    printf("foo before: %c\n", foo->x);
+    f1(foo,foofy);
+    printf("foo after: %c\n", foo->x);
+    printf("foofy after: %c\n", foofy->x);
+    return 0;
+}
+
+the output are:
+foo before: x
+f1 boby after: y
+foo after: y
+Segmentation fault (core dumped)
+
+as you can see:
+boby = bob;
+
+these wont modify pointer foofy, so it wont get any reference. I want foofy->x valued as y. Any help appreciated.foofy is pointing to nowhere in main(). The value it contains is indeterminate (some garbage value).  That's why when you tried to access it - it resulted in segmentation fault. Accessing memory that you were not allowed to access.
+If you want to make changes to foofy pass &foofy or address of foofy and then make changes to it.
+void f1(thing_t *bob, thing_t **boby) {
+    bob->x = 'y';
+    (*boby) = bob;
+    printf("f1 boby after: %c\n", (*boby)->x);
+}
+
+You will call it like this
+f1(foo,&foofy);
+
+The output will be when these changes are made is 
+foo before: x
+f1 boby after: y
+foo after: y
+foofy after: y
+
+Also you won't see the changed value of x for the struct bob same way. 
+C is pass by value. That's why in earlier case a copy of the passed argument is the object on which we made changes in the called function. Changes in copy won't make it happen to reflect those changes in the object in main().
+Few things that you need to do is - 1) Casting the return value of malloc is not needed. 2) Check the value returned by malloc in case it returns NULL handle it separately.foofy is structure pointer and it's not initialized , where it's pointing ? that's why below statements is giving seg.fault.
+printf("foofy after: %c\n", foofy->x);
+
+Assign valid address to foofy first then you can perform foofy->x
+Note : when you are calling f1 function , you may thought by catching with thing_t *boby,  foofy also get initialized, it's not. boby is local struct pointer and its valid in f1 function only.Is it good to check pointer with 0xDD or 0xCC or 0xFD, or 0xCD?Is it good to check pointer with 0xDD or 0xCC or 0xFD, or 0xCD IF its not NULL?
+I am writing plugin for Unity3D, which supports C with some features of C++. So new is not allowed in here.
+char** m_strArry;
+
+void FreeChar(char* a_data)
+{
+    free(a_data);
+    a_data = NULL;
+}
+
+void Test_PointerReference2()
+{
+    m_strArry = (char**)malloc(3);
+
+    char* l_str1 = (char*)malloc(5);
+    strcpy_s(l_str1, 5, "Test");
+
+    char* l_str2 = (char*)malloc(7);
+    strcpy_s(l_str2, 7, "String");
+
+    char* l_str3 = (char*)malloc(5);
+    strcpy_s(l_str3, 5, "Here");
+
+    m_strArry[0] = l_str1;
+    m_strArry[1] = l_str2;
+    m_strArry[2] = l_str3;
+
+    FreeChar(l_str2);
+
+    for (int l_index = 0; l_index < 3; l_index++)
+    {
+        char* l_data = m_strArry[l_index];    //ISSUE: FOR l_index=1(OR l_str2) l_data is a valid address with garbage data.
+        if(l_data == NULL)
+            printf_s("\nIndex %d is NULL", l_index);
+        else
+            printf_s("\nIndex %d = '%s'", l_index, l_data);
+    }
+}
+
+So i fixed the above issue by sending pointer-reference to FreeChar(). i.e.,
+void FreeChar(char*& a_data)
+{
+    free(a_data);
+    a_data = NULL;
+}
+
+with above code, i am getting pointer value of m_strArry[1] OR l_str2 as NULL.
+But in some of my cases, i am getting poitner value as 0xDD (i.e., The memory locations filled are Released heap memory). I read on this link that 
+0xDD, 0xCC, 0xFD, and 0xCD are reserved address. 
+So, Is it good (or good practice) to check pointer with 0xDD or 0xCC or 0xFD, or 0xCD besides checking for NULL? If i shouldn't check for any reason, then what is the solution to this issue?No, it's not a good practice at all. Those values are undocumented unofficial and unreliable. They might change in the future. In the release build they might not show up at all.
+If you get a problem like this, that means you have a bug. And in this case, it's here:
+m_strArry = (char**)malloc(3);
+
+3 bytes is far too little to hold 3 pointers. You need:
+m_strArry = (char**)malloc(3 * sizeof(char*));
+
+
+As noted in the comments, that's only half the problem. The other half is the fact that FreeChar(l_str2); doesn't reset m_strArry[1] to null.
+Yes, that is legit. C/C++ doesn't keep track what is copied where. It's your responsibility as a developer to make sure that all the pointers to a block of memory are properly disposed of after the memory is released. Failing to do so is called a "dangling pointer" and it's a VERY common mistake to make in C/C++. This can wreak all sorts of havoc on your program, from crashes to corrupted data. In fact, it's probably one of the most widespread causes of program crashes out there.Converting while loop from C to MIPSI just started to learn the basics of MIPS. While reading a book about MIPS I thought about the next question: 
+I have the following code:
+while (x) {...}
+
+What's between brackets isn't important (just put dots on the right place on the code). It is know that x contains a Boolean statement. Let reg $t0 contain x. I am trying to convert this C while loop into a MIPS code. How to do so?You can do it with a branch and a label. For example, the statement
+while (n>0) { .... }
+can be translated to MIPS using a branch and a label:
+    .data
+
+    n: .word 100
+
+    .text
+
+    main:
+
+    la $t0, n   
+    lw $t1, 0($t0)
+    li $s0, 0
+
+    Loop:
+       bgt $t1, $zero, EXIT
+       add $t1, $s0, $t1
+       addi $t1, $t1, -1
+
+       j Loop
+
+   EXIT:Why does my free() function does not working(Code was given below) [closed]Closed. This question is not reproducible or was caused by typos. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+Please go to line 29 and read the comment.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main()
+{
+    char* messenges[5];
+    char* allstrings;
+    register int i;
+    int total = 0;
+
+    for (i = 0; i < 5; i++)
+    {
+        printf("Enter a string: ");
+        messenges[i] = (char*)malloc(5 * sizeof(char));
+        scanf("%s", messenges[i]);
+        total += strlen(messenges[i]);
+    }
+
+    allstrings = (char*)malloc(total);
+    strcpy(allstrings, messenges[0]);
+
+    for (i = 1; i < 5; i++)
+    {
+        strcat(allstrings, " ");
+        strcat(allstrings, messenges[i]);
+    }
+    printf("%s", allstrings);
+    free(allstrings); // This does not work..WHY?(Visual Studio 2015)
+    for (i = 0; i < 5; i++)
+    {
+        free(messenges[i]);// This works fine.
+    }
+    getch();
+    return 0;
+}
+
+Above code doesn't free allstrings but it can free messenges[i]. Why doesn't it work for allstrings as well?It probably fails because you seem to have forgotten that char strings in C are really called null-terminated byte stringsFirst of all strings in c are null terminated char array. You didn't allocate enough space to store them. Also you didn't allocate enough space for those blanks you have concatenated. Long story short by writing to memory that is not allocated by you has invoked undefined behavior.
+Also it is not clear how you can say that free() call failed. What is your idea of not freeing the memory?  
+In this case for example, you can consider two things which will help you allocate enough memory. strcat and strcpy both take into account the \0 and also strcat overwrites the \0 in the source string.  
+Also there are many many problems in your code - starting from not allocating enough memory - casting the return value of malloc, not chekcing the return value of malloc and using scanf without length modifier.IOS development how to solve the capture signal handler by covering problemsI want to make both the existing singal handler in the project and my own singal handler co-exist so that both can properly capture singal.
+
+typedef void (*signalHandler)(int signo, siginfo_t *info, void *context);
+static signalHandler previousSignalHandler = NULL;
+void signalExceptionHandler(int signal, siginfo_t* info, void* context)
+{
+    NSMutableString *mstr = [[NSMutableString alloc] init];
+    [mstr appendString:@"Stack:\n"];
+    void* callstack[128];
+    int i, frames = backtrace(callstack, 128);
+    char** strs = backtrace_symbols(callstack, frames);
+    for (i = 0; i <frames; ++i) {
+        [mstr appendFormat:@"%s\n", strs[i]];
+    }
+    BYLOGI(@"%@",mstr);
+    [BYCrashCacheHelper saveAppCrashDataWithCrashInfo:mstr];
+    if (previousSignalHandler) {
+        previousSignalHandler(signal, info, context);
+    }
+}
+void signalRegister(int signal)
+{
+    struct sigaction action;
+    action.sa_sigaction = signalExceptionHandler;
+    action.sa_flags = SA_NODEFER | SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(signal, &action, 0);
+}
+void judgePreviousSignalHandlerAndSignalRegister(int signal)
+{
+    struct sigaction old_action;
+    sigaction(signal, NULL, &old_action);
+    if (old_action.sa_flags & SA_SIGINFO) {
+        previousSignalHandler = old_action.sa_sigaction;
+    }
+    signalRegister(signal);
+}
+void installSignalHandler(void)
+{
+    judgePreviousSignalHandlerAndSignalRegister(SIGHUP);
+    judgePreviousSignalHandlerAndSignalRegister(SIGINT);
+    judgePreviousSignalHandlerAndSignalRegister(SIGQUIT);
+
+    judgePreviousSignalHandlerAndSignalRegister(SIGABRT);
+    judgePreviousSignalHandlerAndSignalRegister(SIGILL);
+    judgePreviousSignalHandlerAndSignalRegister(SIGSEGV);
+    judgePreviousSignalHandlerAndSignalRegister(SIGFPE);
+    judgePreviousSignalHandlerAndSignalRegister(SIGBUS);
+    judgePreviousSignalHandlerAndSignalRegister(SIGPIPE);
+}Bash permission denied on Linux [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Ubuntu says "bash: ./program Permission denied" [closed]
+
+                                (3 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+I was doing the "bof" problem on http://pwnable.kr/play.php
+I downloaded the "bof" file. But when I use gdb, it says as follows:
+Starting program: /home/henry/Downloads/bof 
+/bin/bash: /home/henry/Downloads/bof: Permission denied
+/bin/bash: line 0: exec: /home/henry/Downloads/bof: cannot execute: Permission denied
+During startup program exited with code 126.
+
+bof.c:
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+void func(int key){
+    char overflowme[32];
+    printf("overflow me : ");
+    gets(overflowme);   // smash me!
+    if(key == 0xcafebabe){
+        system("/bin/sh");
+    }
+    else{
+        printf("Nah..\n");
+    }
+}
+int main(int argc, char* argv[]){
+    func(0xdeadbeef);
+    return 0;
+}It's the issue with your permissions. You currently don't have the permissions to execute the bof file.
+To fix this, open the terminal and use the chmod command.
+chmod +x /home/henry/Downloads/bof
+
+This will give you the permission to execute the file. You can also use something like chmod 744 /path/to/file as an alternative. This will give you the permission to read, write, and execute on your account.
+Check out linode documentation to know about file permissions.PJSIP ndk configuration issue in centosI am trying to use pjSip for my android application and following pjsip instructions. My system configurations are centos 7.4 64 bit .
+    I have downloaded latest ndk and pjsip code.
+    But when I am running the commands I am getting below error.
+One more thing I noticed, confige.log aslo showing 
+cc1: warning: command line option '-frtti' is valid for C++/ObjC++ but not for C
+[root@localhost pjproject-2.7.1]# ./configure-android
+
+configure-android: APP_PLATFORM not specified, using android-27
+configure-android: TARGET_ABI not specified, using armeabi
+configure-android: calling ./configure with env vars:
+ CC = /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc
+ CXX = /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-g++
+ CFLAGS =  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/include -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/libs/armeabi/include
+ CXXFLAGS =  -shared --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -fexceptions -frtti
+ LDFLAGS =  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -L/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/libs/armeabi/
+ LIBS = -lgnustl_static  -lc -lgcc
+ AR = /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-ar
+ RANLIB = /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-ranlib
+ TARGET_HOST = arm-linux-androideabi
+ TARGET_ABI = armeabi
+checking build system type... x86_64-unknown-linux-gnu
+checking host system type... arm-unknown-linux-androideabi
+checking target system type... arm-unknown-linux-androideabi
+checking for arm-linux-androideabi-gcc... /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc
+checking whether the C compiler works... yes
+checking for C compiler default output file name... a.out
+checking for suffix of executables... 
+checking whether we are cross compiling... yes
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc accepts -g... yes
+checking for /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc option to accept ISO C89... unsupported
+checking whether we are using the GNU C++ compiler... yes
+checking whether /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-g++ accepts -g... yes
+checking for arm-linux-androideabi-ranlib... /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-ranlib
+checking for arm-linux-androideabi-ar... /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-ar
+checking for pthread_create in -lpthread... no
+checking for puts in -lwsock32... no
+checking for puts in -lws2_32... no
+checking for puts in -lole32... no
+checking for puts in -lwinmm... no
+checking for puts in -lsocket... no
+checking for puts in -lrt... no
+checking for sin in -lm... yes
+checking for uuid_generate in -luuid... no
+checking for uuid_generate in -luuid... (cached) no
+checking for library containing gethostbyname... none required
+Setting PJ_M_NAME to arm
+checking memory alignment... 4 bytes (default)
+checking how to run the C preprocessor... /lib/cpp
+aconfigure: error: in `/root/ROOTSIPFOLDER/pjproject-2.7.1':
+aconfigure: error: C preprocessor "/lib/cpp" fails sanity check
+See `config.log' for more details
+
+Below is my configue.log result.
+
+
+
+    aconfigure:2916: /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc -v >&5
+Using built-in specs.
+COLLECT_GCC=/root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc
+COLLECT_LTO_WRAPPER=/root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/../libexec/gcc/arm-linux-androideabi/4.9.x/lto-wrapper
+Target: arm-linux-androideabi
+.......................................
+aconfigure:3269: /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc -c -g  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -fexceptions -frtti conftest.c >&5
+cc1: warning: command line option '-frtti' is valid for C++/ObjC++ but not for C
+aconfigure:3269: $? = 0
+aconfigure:3279: result: yes
+aconfigure:3296: checking for /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc option to accept ISO C89
+aconfigure:3359: /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc  -c  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/include -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/libs/armeabi/include  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -fexceptions -frtti conftest.c >&5
+cc1: warning: command line option '-frtti' is valid for C++/ObjC++ but not for C
+conftest.c:10:19: fatal error: stdio.h: No such file or directory
+ #include <stdio.h>
+                   ^
+compilation terminated.
+aconfigure:3359: $? = 1
+aconfigure: failed program was:
+ /* confdefs.h */
+ #define PACKAGE_NAME "pjproject"
+ #define PACKAGE_TARNAME "pjproject"
+ #define PACKAGE_VERSION "2.x"
+ #define PACKAGE_STRING "pjproject 2.x"
+ #define PACKAGE_BUGREPORT ""
+ #define PACKAGE_URL ""
+ /* end confdefs.h.  */
+ #include <stdarg.h>
+ #include <stdio.h>
+ struct stat;
+ /* Most of the following tests are stolen from RCS 5.7's src/conf.sh.  */
+ struct buf { int x; };
+ FILE * (*rcsopen) (struct buf *, struct stat *, int);
+ static char *e (p, i)
+      char **p;
+      int i;
+ {
+  return p[i];
+ }
+ static char *f (char * (*g) (char **, int), char **p, ...)
+ {
+  char *s;
+   va_list v;
+   va_start (v,p);
+   s = g (p, va_arg (v,int));
+   va_end (v);
+  return s;
+ }
+
+arm-linux-androideabi-gcc: error: unrecognized command line option '-std'
+aconfigure:3359: $? = 1
+aconfigure: failed program was:
+ /* confdefs.h */
+ #define PACKAGE_NAME "pjproject"
+ #define PACKAGE_TARNAME "pjproject"
+ #define PACKAGE_VERSION "2.x"
+ #define PACKAGE_STRING "pjproject 2.x"
+ #define PACKAGE_BUGREPORT ""
+ #define PACKAGE_URL ""
+/* end confdefs.h.  */
+ #include <stdarg.h>
+ #include <stdio.h>
+ struct stat;
+ /* Most of the following tests are stolen from RCS 5.7's src/conf.sh.  */
+ struct buf { int x; };
+ FILE * (*rcsopen) (struct buf *, struct stat *, int);
+ static char *e (p, i)
+      char **p;
+      int i;
+{
+   return p[i];
+ }Satic char *f (char * (*g) (char **, int), char **p, ...)
+ {
+   char *s;
+   va_list v;
+   va_start (v,p);
+   s = g (p, va_arg (v,int));
+   va_end (v);
+   return s;
+ }
+* OSF 4.0 Compaq cc is some sort of almost-ANSI by default.  It has
+    function prototypes and stuff, but not '\xHH' hex character constants.
+    These don't provoke an error unfortunately, instead are silently treated
+    as 'x'.  The following induces an error, until -std is added to get
+    proper ANSI mode.  Curiously '\x00'!='x' always comes out true, for an
+    array size at least.  It's necessary to write '\x00'==0 to get something
+    that's true only with -std.  */
+ int osf4_cc_array ['\x00' == 0 ? 1 : -1];
+
+ /* IBM C 6 for AIX is almost-ANSI by default, but it replaces macro parameters
+    inside strings and character constants.  */
+ #define FOO(x) 'x'
+ int xlc6_cc_array[FOO(a) == 'x' ? 1 : -1];
+
+ int test (int i, double x);
+ struct s1 {int (*f) (int a);};
+ struct s2 {int (*f) (double a);};
+ int pairnames (int, char **, FILE *(*)(struct buf *, struct stat *, int), int, int);
+ int argc;
+ char **argv;
+ int
+ main ()
+ {
+ return f (e, argv, 0) != argv[0]  ||  f (e, argv, 1) != argv[1];
+   ;
+   return 0;
+ }
+aconfigure:3359: /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc -Ae -c  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/include -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/libs/armeabi/include  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -fexceptions -frtti conftest.c >&5
+cc1: warning: command line option '-frtti' is valid for C++/ObjC++ but not for C
+<command-line>:0:1: error: missing '(' after predicate
+conftest.c:10:19: fatal error: stdio.h: No such file or directory
+ #include <stdio.h>
+                   ^
+compilation terminated.
+aconfigure:3359: $? = 1
+aconfigure: failed program was:
+ /* confdefs.h */
+ #define PACKAGE_NAME "pjproject"
+ #define PACKAGE_TARNAME "pjproject"
+ #define PACKAGE_VERSION "2.x"
+ #define PACKAGE_STRING "pjproject 2.x"
+ #define PACKAGE_BUGREPORT ""
+ #define PACKAGE_URL ""
+ /* end confdefs.h.  */
+ #include <stdarg.h>
+ #include <stdio.h>
+ struct stat;
+ /* Most of the following tests are stolen from RCS 5.7's src/conf.sh.  */
+ struct buf { int x; };
+ FILE * (*rcsopen) (struct buf *, struct stat *, int);
+ static char *e (p, i)
+      char **p;
+      int i;
+ {
+   return p[i];
+ }
+| static char *f (char * (*g) (char **, int), char **p, ...)
+ {
+   char *s;
+   va_list v;
+   va_start (v,p);
+   s = g (p, va_arg (v,int));
+   va_end (v);
+   return s;
+ }
+
+/* OSF 4.0 Compaq cc is some sort of almost-ANSI by default.  It has
+    function prototypes and stuff, but not '\xHH' hex character constants.
+    These don't provoke an error unfortunately, instead are silently treated
+    as 'x'.  The following induces an error, until -std is added to get
+    proper ANSI mode.  Curiously '\x00'!='x' always comes out true, for an
+    array size at least.  It's necessary to write '\x00'==0 to get something
+    that's true only with -std.  */
+ int osf4_cc_array ['\x00' == 0 ? 1 : -1];
+
+ /* IBM C 6 for AIX is almost-ANSI by default, but it replaces macro parameters
+    inside strings and character constants.  */
+ #define FOO(x) 'x'
+ int xlc6_cc_array[FOO(a) == 'x' ? 1 : -1];
+
+ int test (int i, double x);
+ struct s1 {int (*f) (int a);};
+ struct s2 {int (*f) (double a);};
+ int pairnames (int, char **, FILE *(*)(struct buf *, struct stat *, int), int, int);
+ int argc;
+ char **argv;
+ int
+ main ()
+ {
+ return f (e, argv, 0) != argv[0]  ||  f (e, argv, 1) != argv[1];
+   ;
+   return 0;
+ }
+aconfigure:3359: /root/ROOTSIPFOLDER/android-ndk-r16b/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc -Aa -D_HPUX_SOURCE -c  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/include -I/root/ROOTSIPFOLDER/android-ndk-r16b/sources/cxx-stl/gnu-libstdc++/4.9/libs/armeabi/include  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -fexceptions -frtti conftest.c >&5
+cc1: warning: command line option '-frtti' is valid for C++/ObjC++ but not for C
+<command-line>:0:1: error: missing '(' after predicate
+conftest.c:10:19: fatal error: stdio.h: No such file or directory
+ #include <stdio.h>
+                   ^
+compilation terminated.
+aconfigure:3359: $? = 1
+aconfigure: failed program was:
+ /* confdefs.h */
+ #define PACKAGE_NAME "pjproject"
+ #define PACKAGE_TARNAME "pjproject"
+ #define PACKAGE_VERSION "2.x"
+#define PACKAGE_BUGREPORT ""
+ #define PACKAGE_URL ""
+ /* end confdefs.h.  */
+ #include <stdarg.h>
+ #include <stdio.h>
+ struct stat;
+ /* Most of the following tests are stolen from RCS 5.7's src/conf.sh.  */
+ struct buf { int x; };
+ FILE * (*rcsopen) (struct buf *, struct stat *, int);
+ static char *e (p, i)
+      char **p;
+      int i;
+ {
+   return p[i];
+ }
+ static char *f (char * (*g) (char **, int), char **p, ...)
+ {
+   char *s;
+   va_list v;
+   va_start (v,p);
+   s = g (p, va_arg (v,int));
+   va_end (v);
+   return s;
+ }
+|              Syntax error
+aconfigure:4534: /lib/cpp  --sysroot=/root/ROOTSIPFOLDER/android-ndk-r16b/platforms/android-27/arch-arm -fexceptions -frtti conftest.c
+cc1: warning: command line option '-frtti' is valid for C++/ObjC++ but not for C [enabled by default]
+In file included from /usr/lib/gcc/x86_64-redhat-linux/4.8.5/include/syslimits.h:7:0,
+                 from /usr/lib/gcc/x86_64-redhat-linux/4.8.5/include/limits.h:34,
+                 from conftest.c:13:
+/usr/lib/gcc/x86_64-redhat-linux/4.8.5/include/limits.h:168:61: error: no include path in which to search for limits.h
+ #include_next <limits.h>  /* recurse down to the real one */
+                                                             ^
+aconfigure:4534: $? = 1
+aconfigure: failed program was:
+ /* confdefs.h */
+  #define PACKAGE_NAME "pjproject"
+ #define PACKAGE_TARNAME "pjproject"
+#define PACKAGE_VERSION "2.x"
+ #define PACKAGE_STRING "pjproject 2.x"
+ #define PACKAGE_BUGREPORT ""
+ #define PACKAGE_URL ""
+#define HAVE_LIBM 1
+ #define PJ_M_NAME "arm"
+ #define PJ_POOL_ALIGNMENT 4
+ /* end confdefs.h.  */
+ #ifdef __STDC__
+ # include <limits.h>
+ #else
+ # include <assert.h>
+ #endif
+           Syntax error
+aconfigure:4564: error: in `/root/ROOTSIPFOLDER/pjproject-2.7.1':
+aconfigure:4566: error: C preprocessor "/lib/cpp" fails sanity check
+See `config.log' for more details
+
+Above error are not addressed any where and I have tried every thing they
+have suggested.
+ I have followed every step very carefully and now dont know where I am doing   wrong. I have tried the same on centos 6.9 but with no success. Initially I tried same on windows with sygwin what there also I was not able to run in. 
+I  wonder I there is some issue with my machine or I am doing some thing wrong 
+       Sorry I am not able to format the log. Hope I can get some help over here.Looks like the project's build script is a few revisions out of date: https://github.com/pjsip/pjproject/blob/master/configure-android#L180. The headers moved to a merged tree (rather than per-API and per-arch) in r14 and the deprecated headers were removed in r16.
+You might want to try using a standalone toolchain to build. You might want to try using one of these with the non-android configure script first (standalone toolchains are designed to be dropped into arbitrary autoconf systems that don't support Android themselves), but if that doesn't work then try it with configure-android.How to implement the Unix comand "dirname"?I have no idea how to make the code for this command.
+I had something but is not working. I think is a problem at the exec.
+Can someone make it work?
+i'm a newbie in this field.
+#include<sys/stat.h>
+#include<libgen.h>
+#include<stdlib.h>
+#include<unistd.h>
+#include<sys/types.h>
+#include<dirent.h>
+#include<stdio.h>
+
+void showArgs(int argc, char *argv[]){
+    int i;
+    for (i=0;i<argc;i++) {
+        printf("Argument is %s ",argv[i]);
+    }
+}
+
+int main(int argc, char*argv[])
+{
+int isdir(const char *path) {
+   struct stat statbuf;
+   if (stat(path, &statbuf) != 0)
+       return 0;
+   return S_ISDIR(statbuf.st_mode);
+}
+printf("Program started... \n");
+showArgs(argc, argv);
+if(argc == 2)
+{
+    if(isdir(argv[1]))
+    {
+        printf("Calling dir with parameter\n");
+        execl("dirname",argv[1],NULL);
+    }else{
+        printf("invalid dir name\n");
+}
+}
+return 0;
+}you're missing an argument to execl(). It should be:
+execl("/usr/bin/dirname", "dirname", argv[1], (char*)NULL);
+
+The first argument is the path to the command to execute, then the remaining arguments are the elements of the argv array. And argv[0] is the name of the command.
+You can also use execlp(), which searches for the command using the PATH environment variable. Then the first argument can just be "dirname". But you still need to repeat it in argv[0].
+Also, functions should not be defined inside other functions in C. The isdir() definition should be before main(), not inside it.How does a variable declared in switch statement out of case work? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Variable definition inside switch statement
+
+                                (5 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+Code :
+#include <stdio.h>
+
+int main (void)
+{
+    int a = 1;
+
+    switch(a) {
+        int t= 4;
+    case 1:
+        printf("%d", t);
+        break;
+    default: //Does not mean anything just for clarity
+        break;
+    }
+}
+
+Result in C11 gcc:
+1
+Question: Why is this working? Isn't the compiler supposed to give an error?
+if a is 1, shouldn't it just jump to case 1? Why is it printing 1?t has been declared in the current scope, so there is no reason to have an error.
+Now, but you never go through its initialisation which is made before any label, so it can have any value. What puzzles me, is if there any reason why it coincidentally equals 1.iconv library improperly converts UTF-8 to KOI8-RI am trying to use the GNU iconv library to convert a UTF-8 encoded string to KOI8-R. My minimal example is
+#include <iconv.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    /* The letter П in UTF-8. */
+    char* buffer = "\xd0\x9f";
+    size_t len = 2;
+    /* Note: since KOI8-R is an 8-bit encoding, the buffer should only need a length of 1, but
+     * iconv returns -1 if the buffer is any smaller than 4 bytes,
+     */
+    size_t len_in_koi = 4;
+    char* buffer_in_koi = malloc(len_in_koi+1);
+    /* A throwaway copy to give to iconv. */
+    char* buffer_in_koi_copy = buffer_in_koi;
+    iconv_t cd = iconv_open("UTF-8", "KOI8-R");
+    if (cd == (iconv_t) -1) {
+        fputs("Error while initializing iconv_t handle.\n", stderr);
+        return 2;
+    }
+    if (iconv(cd, &buffer, &len, &buffer_in_koi_copy, &len_in_koi) != (size_t) -1) {
+        /* Expecting f0 but get d0. */
+        printf("Conversion successful! The byte is %x.\n", (unsigned char)(*buffer_in_koi));
+    } else {
+        fputs("Error while converting buffer to KOI8-R.\n", stderr);
+        return 3;
+    }
+    iconv_close(cd);
+    free(buffer_in_koi);
+    return 0;
+}
+
+which (besides not working when my KOI8-R buffer is smaller than four bytes, although it should only need a single byte) incorrectly prints d0 (the correct encoding of 'П' in KOI8-R is f0).
+iconv gives me the correct answer from the command line (e.g., echo П | iconv -t KOI8-R | hexdump), so what am I doing wrong in using its C interface?You mixed up the "to" and "from" character set arguments to iconv_open. It just so happens that the character in slot D0 in KOI8-R has D0 as the first byte of its UTF-8 encoding.how to free an allocated array in a function in cIf we were to use malloc() in main(), we could free() that dynamic memory allocation in main().
+However, if we use malloc() in a different function
+and  we use that function in main(), where should we call free() to release the memory allocated in that function?
+I.e., in the following source code:
+#include <stdio.h>
+#include <stdlib.h>
+
+int * memory_allocate_function(int);
+
+int main(void) {
+    int n=5; //length of array, 5 for example.
+    int *my_array;
+    my_array = memory_allocate_function(n);
+    return 0;
+}
+
+int * memory_allocate_function(int n) {
+    int i;
+    int *array;
+    array=(int *)malloc(n * sizeof(int));
+    if(array == NULL) {
+        printf("can not allocate memory.");
+        return NULL;
+    }
+    // I think i can't use "free(array);" in here.
+    // Because I need that array in main().
+    return array;
+}
+
+Is this the best way to do this?Memory should be freed when it's no longer needed.
+Since the array would no longer be accessible after memory_allocate_function exits (since the array isn't returned or otherwise made accessible to the outside), it should be freed before memory_allocate_function exits.
+void memory_allocate_function(int n){
+    int i;
+    int *array;
+    array = malloc(n*sizeof(int));
+    if (array == NULL) {
+        fprintf(stderr, "Out of memory.");
+        exit(1);
+    }
+
+    // ... use the array ...
+
+    free(array);
+}Well after you are done working with it - free the dynamically allocated memory. But design wise - you can call the free in other function also to manage it properly. It really depends. There is no hard rule for that. 
+For example here you should return that pointer to allocated memory and then after using it in main you can free it in main().
+So the structure would be something like
+int* memory_allocate_function(int n)
+{
+    int i;
+    int *array;
+    array = malloc(n*sizeof(int));
+    if(array == NULL)
+    {
+        printf("can not allocate memory.");
+        exit(0);
+    }
+     return array;
+}
+
+Then in main()
+int main(void)
+{
+    int n=5;    //length of array, 5 for example.
+    int *arr = memory_allocate_function(n);
+    // work with arr
+    free(arr);
+    return 0;
+}
+
+But yes name the function properly - if you are going to use the name memory_allocate_function function then do that only - not any other major logic should be there. This helps create a good readable code.
+
+Note one thing - here when you called the function and then you exited the function the only local variable that contains address of it, it's storage duration ended and you can never then access the memory you allocated. This is a case of memory leak. If you are determined that you won't return the  pointer to memory from the function - then work with it (in the same function or different) and then free it (Before the scope of the function ends - notice not mentioning about where you would free it, you can do it in the same function and other function also).
+I can't help mentioning few things:- 1) Dont cast the return value of malloc. 2) Check the return value of malloc - in case it is NULL you would like to handle it separately. 3) The recommended signature of main() is int main(void)If you need to malloc memory in one function and free in another, you have to somehow carefully pass the pointer to that malloced memory from the point of malloc to the point where you want to free it. 
+This is your responsibility to preserve the pointer value and hand it from one function to another until it reaches the point of free. If you lose that value along the way, you'll have a memory leak. A memory leak is what you have now, since you are not passing that local array pointer anywhere.
+There's no "one true way" to do it, since it depends on your specific intent. For example, you can return that pointer from memory_allocate_function, receive it main and eventually free it there
+int *memory_allocate_function(int);
+
+int main()
+{
+  int n = 5;
+  int *arr = memory_allocate_function(n);
+  ...
+  free(arr);
+  return 0;
+}
+
+int *memory_allocate_function(int n)
+{
+  int *array = malloc(n * sizeof *array);
+  ...
+  return array;
+}C code for finding 1(factorial)2(fac)+2(fac)3(fac)+...9(fac)10(fac) [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I am new to programming and have just started with array. This was my code for the problem 
+#include <stdio.h>
+int main(){
+    int i=1,f=1,num,fac[10],sum=0;
+    for (num=1; num<=10; num++) {
+        for (i; i<=num; i++) {
+            f = f * i;
+        }
+        fac[num-1]=f;
+    }
+
+    for(i;i<=9;i++)
+        sum = sum + fac[i] * fac[i+1];
+
+    printf("The sum is %d",sum );
+    return 0;
+}
+
+Output it is giving is-The sum is 0
+So what are the corrections to be made or any other code for the problem?You need to reinitialize the variable i more often.
+Instead of having a for loop that looks like for (i; i<=N; i++), initialize i and do for (i=0; i<=N; i++)GCC: compiling an application without linking any libraryI know how to compile a C application without linking any library using GCC in bare metal embedded application just setting up the startup function(s) and eventually the assembly startup.s file.
+Instead, I am not able to do the same thing in Windows (I am using MINGW32 GCC). Seems that linking with -nostdlib removes also everything needed to be executed before main, so I should write a specific startup but I did not find any doc about that.
+The reason because I need to compile without C std lib is that I am writing a rduced C std lib for little 32 bits microcontrollers and I would like to test and unit test this library using GCC under Windows. So, if there is an alternative simplest way it is OK for me.
+Thanks.I found the solution adding -nostdlib and -lgcc together to ld (or gcc used as linker). In this way the C standard lib is not automatically linked to the application but everything needed to startup the application is linked.
+I found also that the order of these switches matters, it may not work at all, signal missing at_exit() function or work without any error/warning depending by the order and position of the options. 
+I discovered another little complication using Eclipse based IDEs because there are some different approaches in the Settings menu so to write the options in the right order I needed to set them in different places.
+After that I had a new problem: I did not think that unit test libraries require at least a function able to write to stdout or to a file.
+I found that using "" and <> forces the compiler and linker to use the library modules I want by my library and the C standard library.
+So, for instance:
+#include "string.h" // points to my library include
+#include <stdio.h>  // points to C stdlib include
+
+permits me to test all my library string functions using the C stdlib stdout functions. 
+It works both using GCC and GCC Cross Compilers.Where is the heap manager's free list stored in a process' address space?In C, for example, the heap is managed by malloc(), free(), and friends. The heap manager generally works by keeping a list of free blocks in the heap with a linked list . Each free block of memory in the heap can contain a header with information about how much free memory it contains and a pointer to the next free block of memory...this all makes sense in terms of the linked-list implementation of a heap manager.
+My question is, the linked list data structure requires a head pointer, pointing to the first free memory block in the heap. In the context of glibc, for example, Where is the this pointer stored? Is it in the heap or stack? Its persistence suggest that it would be in the heap, but I don't see it explicitly mentioned anywhere.Looking through glibc's implementation of malloc, and as outlined in this post, the header-information (malloc_state) for the main arena (heap region created by main()) is a static variable kept in libc.so's data segment. The header-information includes information such as top-chunk, last free-chunk, etc, where chunks are analogous to linked-list nodes.
