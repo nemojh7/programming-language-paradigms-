@@ -1,0 +1,3884 @@
+C's open overwriting file to be opened and fdopen returning NULLI'm trying to write a secure version of fopen that prevents the opening of symbolically linked files. Below is my code taken from here.
+/* 
+    Secure fopen 
+*/
+enum { FILE_MODE = 0600 };
+
+FILE *secure_fopen(char *filename, char* mode)
+{
+    int fd;
+    FILE *f;
+
+    unlink(filename);
+
+    if (strncmp(mode, "w", 1) == 0) {
+        fd = open(filename, O_WRONLY|O_CREAT|O_EXCL, FILE_MODE);
+    }
+    else if (strncmp(mode, "r", 1) == 0) {
+        fd = open(filename, O_RDONLY|O_CREAT|O_EXCL);
+    }
+    else {
+        fd = open(filename, O_RDWR|O_CREAT|O_EXCL, FILE_MODE);
+    }
+
+    if (fd == -1) {
+        perror("Failed to open the file");
+        return NULL; 
+    }
+    /* Get a FILE*, as they are easier and more efficient than file descriptors */
+    f = fdopen(fd, mode);
+    if (f == NULL) {
+        perror("Failed to associate file descriptor with a stream");
+        return NULL; 
+    }
+    return f;
+}
+
+There are two issues with this code: one - it's overwriting the file pointed to by filename and two - it's returning NULL, but the NULL file pointer doesn't get caught in the final check: 
+if (f == NULL) {
+    perror("Failed to associate file descriptor with a stream");
+    return NULL; 
+}
+
+Does anybody have any insight into way these two things are happening?First, O_CREAT creates a file if it does not exist, and O_CREAT|O_EXCL creates the file and fails if it already exists.
+Second, (strncmp(mode, "w", 1) == 0) is equivalent to (mode[0] == 'w'), which is probably not what you intended. You probably meant (strchr(mode, "w")) instead.
+Consider the following implementation (a full example program):
+#define _POSIX_C_SOURCE 200809L
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+
+/* Internal flags used by custom_fopen(): */
+#define  FM_R        (1<<0)  /* r, w+: For reading */
+#define  FM_W        (1<<1)  /* w, r+: For writing */
+#define  FM_TRUNC    (1<<2)  /* w, w+: Truncate */
+#define  FM_CREAT    (1<<3)  /* w, r+: Create if necessary */
+#define  FM_EXCL     (1<<4)  /* x: Fail if already exists */
+#define  FM_APPEND   (1<<5)  /* a: Append */
+#define  FM_CLOEXEC  (1<<6)  /* e: Close-on-exec() */
+#define  FM_SYMLINK  (1<<7)  /* s: Fail if last path component is a symlink */
+#define  FM_RW       (FM_R | FM_W) /* r+, w+ */
+
+FILE *custom_fopen(const char *path, const char *mode)
+{
+    const char *fdmode;
+    int         fm, flags, fd, saved_errno;
+    FILE       *ret;
+
+    if (!path || !*path || !mode) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    switch ((strchr(mode, 'r') ? 1 : 0) +
+            (strchr(mode, 'w') ? 2 : 0) +
+            (strchr(mode, 'a') ? 4 : 0) +
+            (strchr(mode, '+') ? 8 : 0)) {
+    case 1:  fdmode = "r";  fm = FM_R;                         break;
+    case 2:  fdmode = "w";  fm = FM_W  | FM_CREAT | FM_TRUNC;  break;
+    case 4:  fdmode = "a";  fm = FM_W  | FM_CREAT | FM_APPEND; break;
+    case 9:  fdmode = "r+"; fm = FM_RW | FM_CREAT;             break;
+    case 10: fdmode = "w+"; fm = FM_RW | FM_CREAT | FM_TRUNC;  break;
+    case 12: fdmode = "a+"; fm = FM_RW | FM_CREAT | FM_APPEND; break;
+    default:
+        /* Invalid combination of 'r', 'w', 'a', and '+'. */
+        errno = EINVAL;
+        return NULL;
+    }
+
+    if (strchr(mode, 'x')) {
+        if (fm & FM_CREAT)
+            fm |= FM_EXCL;
+        else {
+            /* 'rx' does not make sense, and would not work anyway. */
+            errno = EINVAL;
+            return NULL;
+        }
+    }
+
+    if (strchr(mode, 'e'))
+        fm |= FM_CLOEXEC;
+
+    if (strchr(mode, 's'))
+        fm |= FM_SYMLINK;
+
+    /* Verify 'mode' consists of supported characters only. */
+    if (strlen(mode) != strspn(mode, "rwa+xesb")) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    /* Map 'fm' to 'flags' for open(). */
+    switch (fm & FM_RW) {
+    case FM_R:  flags = O_RDONLY; break;
+    case FM_W:  flags = O_WRONLY; break;
+    case FM_RW: flags = O_RDWR;   break;
+    default:
+        errno = EINVAL;
+        return NULL;
+    }
+    if (fm & FM_TRUNC)   flags |= O_TRUNC;
+    if (fm & FM_CREAT)   flags |= O_CREAT;
+    if (fm & FM_EXCL)    flags |= O_EXCL;
+    if (fm & FM_APPEND)  flags |= O_APPEND;
+    if (fm & FM_CLOEXEC) flags |= O_CLOEXEC;
+    if (fm & FM_SYMLINK) flags |= O_NOFOLLOW;
+
+    /* Open the file. If we might create it, use mode 0666 like fopen() does. */
+    if (fm & FM_CREAT)
+        fd = open(path, flags, 0666);
+    else
+        fd = open(path, flags);
+
+    /* Failed? */
+    if (fd == -1)
+        return NULL; /* errno set by open() */
+
+    /* Convert the file descriptor to a file handle. */
+    ret = fdopen(fd, fdmode);
+    if (ret)
+        return ret;
+
+    /* Failed. Remember the reason for the failure. */
+    saved_errno = errno;
+
+    /* If we created or truncated the file, unlink it. */
+    if (fm & (FM_EXCL | FM_TRUNC))
+        unlink(path);
+
+    /* Close the file descriptor. */
+    close(fd);
+
+    /* Return, recalling the reason for the failure. */
+    errno = saved_errno;
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    FILE *handle;
+
+    if (argc != 3 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+        fprintf(stderr, "\n");
+        fprintf(stderr, "Usage: %s [ -h | --help ]\n", argv[0]);
+        fprintf(stderr, "       %s PATH MODE\n", argv[0]);
+        fprintf(stderr, "\n");
+        return EXIT_FAILURE;
+    }
+
+    handle = custom_fopen(argv[1], argv[2]);
+    if (!handle) {
+        const int err = errno;
+        fprintf(stderr, "custom_fopen(\"%s\", \"%s\") == NULL, errno = %d: %s.\n",
+                        argv[1], argv[2], err, strerror(err));
+        return EXIT_FAILURE;
+    }
+
+    if (fclose(handle)) {
+        const int err = errno;
+        fprintf(stderr, "fclose(custom_fopen(\"%s\", \"%s\")) failed, errno = %d: %s.\n",
+                        argv[1], argv[2], err, strerror(err));
+        return EXIT_FAILURE;
+    }
+
+    printf("custom_fopen(\"%s\", \"%s\"): Success.\n", argv[1], argv[2]);
+    return EXIT_SUCCESS;
+}
+
+The #define _POSIX_C_SOURCE 200809L tells your C library (at least those compatible to GNU C) to expose POSIX.1-2008 features (like open()).
+The behaviour of r, w, a, r+, w+, and a+ modes are as described in man 3 fopen. At least one of these must be in mode. (The + does not need to immediately follow the letter, though.)
+The above implementation additionally supports b (does nothing, per POSIX), x (fail if creating a new file but it already exists), s (fail if the filename part of the path is a symlink), and e (close the descriptor at exec, not leaking it to child processes).
+The first switch statement handles the primary mode, ignoring the order of the characters. It essentially checks which of the four characters rwa+ exist in mode, and only accepts the sane combinations. The strchr(mode, 'c') calls return a nonzero pointer (logical true) if and only if mode contains 'c'.
+The if clause following it detects x in the mode. The combination of x and r is not allowed, because it makes no sense. (POSIX.1 says the behaviour with open() with O_RDONLY | O_EXCL is undefined.)
+The (strlen(mode) == strspn(mode, "rwa+xesb")) verifies that mode consists only of letters r, w, a, +, x, e, s, and b; they can be repeated, or in any order.  This check rejects unsupported characters.
+The second switch statement and if clauses map fm to flags. We do this, because the O_ constants may not be single bits, which means tests like (flags & O_RDONLY), (flags & O_WRONLY), and (flags & O_RDWR) are not reliable, and in fact will not work the way one might expect.  Instead, we use fm and our own single-bit FM_ constants that we can treat as masks, and just map them to corresponding values of flags later on.  (Simply put, fm tracks the features we want, and we only assign the corresponding set of flags to flags, and never examine flags.)
+If we might create the file, we use mode 0666 (rw-rw-rw-), as modified by user's umask. (Typically, normal users have an umask of 002, 007, 022, or 077, which result in new files getting modes 0664 (rw-rw-r--), 0660 (rw-rw----), 0644 (rw-r--r--), or 0600 (rw-------), respectively.)
+This is exactly what fopen() does, too.
+When we have the open file descriptor, we must still associate it with a stream handle. We do that using fdopen(). Note that we decided on the correct mode for this call in the first switch statement.  If this call succeeds, the stream will "own" the file descriptor, and all we need to do is to return the stream handle fdopen() returned.
+If fdopen() fails, we need to close the file descriptor. We may also decide to remove/unlink the file. The above code removes the file if we are sure it did not exist previously (e), or if we truncated it (w, w+) as then the data it might have contained would be lost anyway.
+The test program takes two command-line parameters: a path or a file name, and the mode string. The program does a custom_fopen(pathorfilename, modestring) call, and reports the results. (If the custom_fopen() call succeeds, it also checks that the corresponding fclose() call succeeds, because sometimes issues related to the file descriptor (or incompatible mode flags for the open()/fdopen() calls) may only be observed at the first operation done, or at stream close fime. 
+I've only lightly tested the above function and program, and bugs are always a possibility.  If you find a bug or have an issue with the code, let me know in a comment, so I can verify and fix if necessary.c macro - how to set a macro name as the output of another macroI want to do create a macro whose name is a concatenation of two things i.e.
+#define name ## _body(a) \
+    a
+
+but gcc -E gives the error
+
+macros.c:9:18: error: '##' cannot appear at either end of a macro expansion
+   #define typename ## _body(body) \
+
+QUESTION
+Is it possible to do this using only C preprocessor?In a macro definition, the name part is always a single preprocessor token. However, you can use function-like macros, with parameters, that expand to a single token.
+Consider the following macros:
+#define  JOIN(a,b)       a ## b
+
+#define  FOO(suffix)     JOIN(FOO_, suffix)
+#define  FOOBAZ          JOIN(FOO_, BAZ)
+#define  FOOBAAZ         JOIN(foo_, baaz)
+
+#define  FOO_BAR         first
+#define  FOO_BAZ         second
+
+With the above definitions, declaring
+int FOO(BAR) = 1;
+int FOOBAZ = 2;
+int FOOBAAZ = 3;
+
+is equivalent to (i.e., gets preprocessed to)
+int first = 1;
+int second = 2;
+int foo_baaz = 3;
+
+
+There are cases (especially when exploring various algorithms) when templates or polymorphic code is useful. Consider for example the following ops.h:
+#if defined(TYPE) && defined(PREFIX)
+#undef   JOIN2
+#define  JOIN2_(a,b)  a ## b
+#define  JOIN2(a,b)   JOIN2_(a, b)
+#define  NAME(end)    JOIN2(PREFIX, end)
+
+static inline TYPE NAME(_add)(const TYPE val1, const TYPE val2)
+{
+    return val1 + val2;
+}
+
+static inline TYPE NAME(_sub)(const TYPE val1, const TYPE val2)
+{
+    return val1 - val2;
+}
+
+static inline TYPE NAME(_neg)(const TYPE val)
+{
+    return -val;
+}
+
+static inline TYPE NAME(_mul)(const TYPE val1, const TYPE val2)
+{
+    return val1 * val2;
+}
+
+static inline TYPE NAME(_div)(const TYPE val1, const TYPE val2)
+{
+    return val1 / val2;
+}
+
+#endif
+
+#undef   NAME
+#undef   JOIN2
+#undef   PREFIX
+#undef   TYPE
+
+The macro NAME(suffix) expands to a single token consisting of the expansion of PREFIX immediately followed by the expansion of suffix. (If they are not preprocessor macros, they are used as-is.)  This allows the same header file to be included multiple times, assuming PREFIX is defined to a new value each time.
+Note that it is common to have a space between e.g. NAME(_add) and the following (const TYPE val1, const TYPE val2).  I omitted it, in the hopes that it makes the function definitions more familiar-looking.
+Let's look at an example program using such a header file:
+#include <stdlib.h>
+#include <inttypes.h>
+#include <stdio.h>
+
+#define  TYPE    uint32_t
+#define  PREFIX  u32
+#include "ops.h"
+
+#define  TYPE    float
+#define  PREFIX  float
+#include "ops.h"
+
+#define  TYPE    double
+#define  PREFIX  dbl
+#include "ops.h"
+
+int main(void)
+{
+    printf("dbl_div(217.0, 31.0) = %.1f\n", dbl_div(217.0, 31.0));
+    printf("u32_sub(4, 2) = %" PRIu32 "\n", u32_sub(4, 2));
+    printf("float_mul(1.25f, 72.00f) = %.2ff\n", float_mul(1.25f, 72.00f));
+    return EXIT_SUCCESS;
+}
+
+The first #include "ops.h" defines functions u32_add(), u32_sub(), u32_neg(), u32_mul(), and u32_div().  The second defines functions float_add() and so on, and the third dbl_add() and so on.
+The above files are valid C99, and when compiled and run, it outputs
+dbl_div(217.0, 31.0) = 7.0
+u32_sub(4, 2) = 2
+float_mul(1.25f, 72.00f) = 90.00f
+
+If you combine the above with suitable macros using C11 _Generic, you can make "functions" that call different implementations based on the type of their argument.Why do C compilers not warn when assigning integer value too high for signed type?(assuming 64bit machine)
+e.g.
+int n = 0xFFFFFFFF; //max 32bit unsigned number
+printf("%u\n", n);
+
+The maximum positive number that a regular signed integer (32bit) can store is 0x7FFFFFFF. 
+In the above example I'm assigning the maximum unsigned integer value to a regular signed integer, I'm receiving no warnings or error from GCC, and the result is printed without problems (with -Wall -Wextra). 
+Appending U or L to the hex constant changes nothing.
+Why is that?0xFFFFFFFF, on a platform where unsigned has a maximum value of 232-1, will have the type unsigned according to "6.4.4.1 Integer Constants" of the Standard.
+And then we get to the conversion:
+
+6.3.1.3 Signed and unsigned integers
+1 When a value with integer type is converted to another integer type other than _Bool, if the value can be represented by the new type, it is unchanged.
+  2 Otherwise, if the new type is unsigned, the value is converted by repeatedly adding or subtracting one more than the maximum value that can be represented in the new type until the value is in the range of the new type.60)
+  3 Otherwise, the new type is signed and the value cannot be represented in it; either the result is implementation-deﬁned or an implementation-deﬁned signal is raised.
+
+So, the result is implementation-defined or raises an implementation-defined signal.
+Now, you print your int with the format %u, which is just plain mismatched. And while that is strictly speaking UB, you will likely get the original constant, assuming you have 2s-complement and the original assignment used wrap-around.The C standard doesn't specify the behaviour but requires that the implementation specifies it. GCC always uses 2's complement representation and converts via truncation, therefore int32_t i = 0xFFFFFFFF; will result in i being set to -1 when compiled with GCC. On other compilers YMMV.
+
+To get the warning from GCC you need to give the -Wsign-conversion flag:
+% gcc 0xfffffff.c -c -Wsign-conversion                         
+0xfffffff.c:1:9: warning: conversion of unsigned constant value to negative integer
+        [-Wsign-conversion]
+ int i = 0xFFFFFFFF;
+         ^~t ~~~~~~~~
+
+In general C compilers by default produce warnings only about very blatant errors and of constraint violations. The -Wsign-conversion would make many compilations very noisy - even those that are well-defined, like:
+unsigned char c = '\x80';
+
+which produces
+unsignedchar.c:1:19: warning: negative integer implicitly converted to unsigned type
+         [-Wsign-conversion]
+ unsigned char c = '\x80';
+                   ^~~~~~
+
+on implementations where char is signed.Assume that int and unsigned int are 32 bits, which is the case on most platforms you're likely to be using (both 32-bit and 64-bit systems). Then the constant 0xFFFFFFFF is of type unsigned int, and has the value 4294967295.
+This:
+int n = 0xFFFFFFFF;
+
+implicitly converts that value from unsigned int to int. The result of the conversion is implementation-defined; there is no undefined behavior. (In principle, it can also cause an implementation-defined signal to be raised, but I know of no implementations that do that).
+Most likely the value stored in n will be -1.
+printf("%u\n", n);
+
+Here you use a %u format specifier, which requires an argument of type unsigned int, but you pass it an argument of type int. The standard says that values of corresponding signed and unsigned type are interchangeable as function arguments, but only for values that are within the range of both types, which is not the case here.
+This call does not perform a conversion from int to unsigned int. Rather, an int value is passed to printf, which assumes that the value it received is of type unsigned int. The behavior is undefined. (Again, this would be a reasonable thing to warn about.)
+The most likely result is that the int value of -1, which (assuming 2's-complement) has the same representation as 0xFFFFFFFF, will be treated as if it were an unsigned int value of 0xFFFFFFFF, which is printed in decimal as 4294967295.
+You can get a warning on int n = 0xFFFFFFFF; by using the -Wconversion or -Wsign-conversion option. These option are not included in -Wextra or -Wall. (You'd have to ask the gcc maintainers why.)
+I don't know of an option that will cause a warning on the printf call.
+(Of course the fix is to define n as an unsigned int, which makes everything correct and consistent.)Storage layout of C objectsThe storage layout of C objects is mostly not defined. As far as I know only for struct members and array elements, the layout is defined.
+Interestingly for function parameters the C11 standard explicitly mentions that the layout is not defined:
+
+The layout of the storage for parameters is unspecified. (C11 § 6.9.1 P 9)
+
+I was wondering if the standard also explicitly defines that for other objects, e.g., objects with automatic storage duration, the layout is undefined. Is someone aware of this? I couldn't find anything about this in the standard.
+What about objects with internal or external linkage?No, I don't think that there is an explicit mention of the fact that we can't know anything about relative object layout. In fact, the C standard is even more radical than that, you are not even allowed to do comparison with the < operator on two variables that are not elements of the same array, nor may you do arithmetic between pointers to objects that are not part of the same array.
+So the whole question of "layout" cannot even be formulate with the terminology that the C standard provides.Learning C, ran into issue with program to count characters and create a histogramI've been starting to go through the process of learning C using the K&R book, and I ran into a exercise that has me attempt to take a character integer/counting program and get it to print out a histogram of the data, however while I was setting up the initial border for the histogram, I ran into a few issues.
+#include <stdio.h>
+
+int main() {
+    int c, i, nwhite, nother, chartlen,
+        chartline;  /* create variables for getchar, index number, whitespace
+                       count, other char count, and establish variables for use
+                       creating histogram*/
+    int ndigit[10]; /* create list */
+    nwhite = nother = 0;
+    chartlen = 10;
+    for (i = 0; i < 10; ++i) /* iterate through each item */
+        ndigit[i] = 0;       /* Set each item to its initial count, 0 */
+
+    while ((c = getchar()) != EOF)
+        if (c >= '0' && c <= '9')
+            ++ndigit[c - '0']; /* ASCII hex code subtraction to result in
+                                  appropriate decimal interpretation */
+        else if (c == ' ' || c == '\n' || c == '\t')
+            ++nwhite; /*checks for white space chars and then adds one to the
+                         count */
+        else
+            ++nother; /* if neither a number or white space is found, add to
+                         other count */
+    printf("digits =");
+    for (i = 0; i < 10; ++i) printf(" %d", ndigit[i]);
+    printf(", white space = %d, other = %d", nwhite, nother);
+
+    for (i = 0; i < 10; ++i)
+        if (ndigit[i] >
+            chartlen) /*iterated through items from ndigit and check to see if
+                         they're greater than the val of chartlen, if they are,
+                         set chartlen to new value*/
+            chartlen = ndigit[i];
+        else
+            continue;
+    chartline = '-' * chartlen; /*create a line with the length of chartlen and
+                                   then print it*/
+    printf("%d\n", chartline);
+}
+
+The issue I've been running into starts right when I first use chartlen. With the section from
+for (i=0; i<10; ++i) 
+    if (ndigit[i] > chartlen )
+
+and on, if it's commented out, the program runs fine. However, if the new section is left in "nother" seems to no longer count properly and prints values that seem arbitrary to me, and for some reason I can't figure out how to get the line for the histogram to print. What did I do wrong?That else continue; is only confusing and chartline = '-' * chartlen; is just chartline = 45 * chartlen; is way more confusing. printf("%d\n", chartline); will just print a number: count of the most frequent number in the input multiplied by 45.
+Find the height of the histogram and save it in chartlen, that's ok. Then for each column for each number print the char for histogram or space.  
+#include <stdio.h>
+
+int main() {
+    int c;
+    int i;
+    int nwhite;
+    int nother;
+    int chartlen;
+    int ndigit[10];
+
+    nwhite = 0;
+    nother = 0;
+    for (i = 0; i < 10; ++i) {
+        ndigit[i] = 0; 
+    }
+
+    while ((c = getchar()) != EOF) {
+        if (c >= '0' && c <= '9') {
+            ++ndigit[c - '0'];
+        } else if (c == ' ' || c == '\n' || c == '\t') {
+            ++nwhite;
+        } else {
+            ++nother;
+        }
+    }
+
+    printf("digits =");
+    for (i = 0; i < 10; ++i) {
+        printf(" %d", ndigit[i]);
+    }
+    printf(", white space = %d, other = %d\n", nwhite, nother);
+
+    printf("\n");
+    printf("Histogram horizontally:\n");
+    for (i = 0; i < 10; ++i) {
+        int j;
+        printf("%2d ", i);
+        for (j = 0; j < ndigit[i]; ++j) {
+            printf("*");
+        }
+        printf("\n");
+    }
+    printf("\n");
+    printf("Histogram vertically:\n");
+    for (chartlen = 0, i = 0; i < 10; ++i) {
+        if (chartlen < ndigit[i])
+            chartlen = ndigit[i];
+    }
+    for (i = 0; i < chartlen; ++i) {
+        int j;
+        printf(" ");
+        for (j = 0; j < 10; ++j) {
+            if (ndigit[j] >= chartlen - i) {
+                printf("*");
+            } else {
+                printf(" ");
+            }
+            printf(" ");
+            /* or shorter: printf("%c ", ndigit[j] >= chartlen - i ? '*' : ' '); */
+        }
+        printf("\n");
+    }
+    printf(" 0 1 2 3 4 5 6 7 8 9");
+}
+
+This program for the stdin:
+1234567899876352681543681254169234659237856427895653848467567846545438555463480000000329190328cfasvfhd adk af
+will print:
+digits = 8 5 8 10 12 14 12 6 12 7, white space = 2, other = 1
+
+Histogram horizontally:
+ 0 ********
+ 1 *****
+ 2 ********
+ 3 **********
+ 4 ************
+ 5 **************
+ 6 ************
+ 7 ******
+ 8 ************
+ 9 *******
+
+Histogram vertically:
+           *         
+           *         
+         * * *   *   
+         * * *   *   
+       * * * *   *   
+       * * * *   *   
+ *   * * * * *   *   
+ *   * * * * *   * * 
+ *   * * * * * * * * 
+ * * * * * * * * * * 
+ * * * * * * * * * * 
+ * * * * * * * * * * 
+ * * * * * * * * * * 
+ * * * * * * * * * * 
+ 0 1 2 3 4 5 6 7 8 9How to compile .c file and .f (fortran) file into .pydI have an old c and fortran application i need to convert to a python library that we could use on windows.
+i could use gcc and gfortran to compile the .c and .f files to .o files and then compile all of them to a .so file which works as a charm.
+gcc -c -fPIC 1.c $PYTHON_INCLUDE
+gfortran -Wall -Wsurprising -W -c -fPIC 2.f 3.f 4.f
+gfortran -shared 1.o 2.o 3.o 4.o -lc -o mylib
+
+But i now to need to convert them to a .pyd file.
+I tried to use the f2py from numpy.
+But f2py -c 1.c 2.f 3.f 4.f -m mylib
+could not compile them correctly.
+There are a lot of "undeclared" errors.
+Any recommends?Why does the while loop not work for this link-list program?Can you please help me to understand why the while loop does not work in the following code:
+     #include<stdio.h>
+     #include<stdlib.h>
+     typedef struct node_type{
+                int data;
+                struct node_type *next;
+    }node;
+
+    typedef node *list;
+    list head;
+
+    void main()
+    {
+            list temp,new;
+            head=NULL;
+            int n;
+            char ch;
+            temp=(list) malloc(sizeof(node));
+            printf("\nGive data: ");
+            scanf("%d",&temp->data);
+            head=temp;
+            printf("\n");
+            printf("Enter Data? (y/n): ");
+            scanf("%c",&ch);while(getchar()!='\n');
+            while(ch=='y'||ch=='Y')
+            {
+                    new=(list) malloc(sizeof(node));
+                    printf("Give data: ");
+                    scanf("%d",&new->data);while(getchar()!='\n');
+                    temp->next=new;
+                    temp=new;
+                    printf("\nEnter more data(y/n): ");
+                    scanf("%c",&ch);while(getchar()!='\n');
+            }
+            temp->next=NULL;
+            traverse(head);
+}
+
+Output is as follows:
+Give data: 2
+Enter more data(y/n): y
+2
+and the program terminates here.You Don't Need to use while(getchar()!='\n'); everywhere before scanf(). This has lead to termination of your program. You could use scanf("\n%c", &ch); instead.Also it is recommended to write new->next = NULL; after new = (list)malloc(sizeof(node));.
+Additionally you miss traverse() function.
+Try this modified code :-
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct node_type
+{
+        int data;
+        struct node_type *next;
+} node;
+
+typedef node *list;
+list head;
+
+void traverse(node *head) // This is simple traverse function just to demonstrate code.
+{
+        while (head != NULL)
+        {
+                printf("%d  ", head->data);
+                head = head->next;
+        }
+}
+void main()
+{
+        list temp, new;
+        head = NULL;
+        int n;
+        char ch;
+        temp = (list)malloc(sizeof(node));
+        temp->next = NULL;
+        printf("\nGive data: ");
+        scanf("%d", &temp->data);
+        head = temp;
+        printf("\n");
+        printf("Enter Data? (y/n): ");
+        scanf("\n%c", &ch);
+        while (ch == 'y' || ch == 'Y')
+        {
+                new = (list)malloc(sizeof(node));
+                new->next = NULL;
+                printf("Give data: ");
+                scanf("%d", &new->data);
+                new->next = NULL;
+                temp->next = new;
+                temp = new;
+                printf("\nEnter more data(y/n): ");
+                scanf("\n%c", &ch);
+        }
+        temp->next = NULL;
+        traverse(head);
+}
+
+Output :-
+Give data: 2
+
+Enter Data? (y/n): y
+Give data: 22
+
+Enter more data(y/n): y
+Give data: 32
+
+Enter more data(y/n): n
+
+ List is :  2  22  32Determine the expansion of a C macroIs there a way to determine the "final value" of a expanded C macro by inspecting the compiled object or by running some form of gcc -E on the .c or .h file?
+test.h
+#define AAA 1
+#define BBB 10
+#define CCC (AAA+BBB)
+
+test.c
+#include <stdio.h>
+#include "test.h"
+
+int main(){
+   printf("%d\n", CCC);
+   return 0;
+}
+
+Thus is there someway to get the expanded value either:
+#define CCC 11
+
+or
+#define CCC (1+10)
+
+If compiled with
+gcc -dM -E test.c | grep CCC 
+
+or 
+gcc -dD -E test.c | grep CCC
+
+outputs
+#define CCC (AAA+BBB)
+
+which requires me to still know what AAA and BBB are.
+Compiled with:
+gcc -E test.c
+
+Gives (skipping the boilerplate):
+# 4 "test.c"
+int main(){
+printf("%d\n", (1+10));
+return 0;
+}   
+
+While its expanded CCC I've now lost the mapping back to CCC. 
+Edit:
+As it was unclear, what i'd like is someway to determine what CCC is (either 11 or 1+10 (as the gcc -E example showed it only inserted (1+10) not 11), preferably without altering the code itself. Printf was a bad idea to use in the MRE, what i actually had in mind was code like:
+struct my_struct {
+    int my_array[CCC]
+    ... other stuff ...
+}
+
+The question is how big is my_array, so i can make a struct in another language (python via ctypes) and know how much space i need. I know for structs i can use pahole but was hoping to do this with only gcc and in the more general case (say a global array not in a struct).At no point will the preprocessor ever create
+#define CCC (1+10)
+
+The expansion of CCC is always (AAA+BBB); it's just that the result of macro expansion is rescanned for more macros to expand, at which point AAA and BBB turn into 1 and 10, respectively.
+Perhaps a clearer example of this is
+#define AAA 1
+#define CCC AAA
+#define AAA "hello"
+
+size_t x = sizeof CCC;
+
+This code will expand to "hello", not 1. CCC always has a value of AAA; it's just that by the time size_t x = sizeof CCC; is processed, AAA itself will turn into "hello".
+This example also demonstrates that macros can be redefined, so there may not even be a single answer to "what is the value of CCC?".
+That's why there's no simple compiler invocation or switch; what you want simply doesn't exist.
+That said, if you can use custom code, you can just run e.g.
+#define AAA 1
+#define BBB 10
+#define CCC (AAA+BBB)
+CCC
+
+through gcc -P -E and the result will be just (1+10).#include <stdio.h>
+
+#define AAA 1
+#define BBB 2
+#define CCC (AAA+BBB)
+
+#define STRINGIFY(x) #x
+#define PASTE(x) STRINGIFY(x)
+
+
+int main(void)
+{
+  printf("CCC = '%s'\n", PASTE(CCC));
+}
+
+prints
+CCC = '(1+10)'
+
+An alternative version printing the same:
+#include <stdio.h>
+
+#define AAA 1
+#define BBB 2
+#define CCC (AAA+BBB)
+
+#define STRINGIFY(x) #x
+#define INTERMEDIATE(x) #x " = '" STRINGIFY(x) "'"
+
+int main(void)
+{
+  printf("%s\n", INTERMEDIATE(CCC));
+}Complex castingAfter learn C and theorical stuffs of operatives systems, i decided to analyze one kernel rootkit for linux, but i can't understand one line of code, i don't know how to read that line:
+*(void **)&((char *)h->original_function)[ASM_HOOK_CODE_OFFSET] = h->modified_function;
+
+Full context:
+#if defined __i386__
+    // push 0x00000000, ret
+    #define ASM_HOOK_CODE "\x68\x00\x00\x00\x00\xc3"
+    #define ASM_HOOK_CODE_OFFSET 1
+    // alternativly we could do `mov eax 0x00000000, jmp eax`, but it's a byte longer
+    //#define ASM_HOOK_CODE "\xb8\x00\x00\x00\x00\xff\xe0"
+#elif defined __x86_64__
+    // there is no push that pushes a 64-bit immidiate in x86_64,
+    // so we do things a bit differently:
+    // mov rax 0x0000000000000000, jmp rax
+    #define ASM_HOOK_CODE "\x48\xb8\x00\x00\x00\x00\x00\x00\x00\x00\xff\xe0"
+    #define ASM_HOOK_CODE_OFFSET 2
+#else
+    #error ARCH_ERROR_MESSAGE
+#endif
+
+struct asm_hook {
+    void *original_function;
+    void *modified_function;
+    char original_asm[sizeof(ASM_HOOK_CODE)-1];
+    struct list_head list;
+};
+
+
+/**
+ * Patches machine code of the original function to call another function.
+ * This function should not be called directly.
+ */
+void _asm_hook_patch(struct asm_hook *h)
+{
+    DISABLE_W_PROTECTED_MEMORY
+    memcpy(h->original_function, ASM_HOOK_CODE, sizeof(ASM_HOOK_CODE)-1);
+    *(void **)&((char *)h->original_function)[ASM_HOOK_CODE_OFFSET] = h->modified_function;
+    ENABLE_W_PROTECTED_MEMORY
+}
+
+Rootkit link:
+https://github.com/nurupo/rootkit/blob/master/rootkit.c
+(line 314 of rootkit.c)
+I don't want to be explained how the rootkit, only want to understand how to read that line of code, the first part of the line makes me dizzy.If I am not mistaken: you start at the innermost part, which is 
+h->original_function
+
+Then we see a brace at the right so now we scan left for the matching brace. But wait a second, we see a cast to (char *) so it is a pointer to a char and now the brace closes.
+On the right we now see an array indexing to take element [ASM_HOOK_CODE_OFFSET] and on the left we now see & to take its address. So we now have the address of a char.
+Now we can only go the the left and see *(void **), which casts this address to be a pointer-to-a-pointer-to-void and then dereference it and assign the right part to the address.C, Segmentation Fault in linked listI have a problem with the function below, when (*ptr) is NULL instead of ending the while loop the function crashes. I've tried to use if((*ptr)->next==NULL) break; but it fails anyway. 
+boolean search_times(struct list ** ptr, float *V, int n, struct list_times ** new ){
+
+    struct list * tmp_ptr=NULL;
+
+    if( V!=NULL && n>=0 ) {
+        while((*ptr)!=NULL) {
+
+            int times=0;
+
+            for (int i = 0; i < n; i++) {
+                if (isequal((*ptr)->value, V[i]))
+                    times++;
+            }
+
+            if((suf_insert_times(new, (*ptr)->value, times))==FALSE)
+                return FALSE;
+
+            tmp_ptr=*ptr;
+            ptr=&(*ptr)->next;
+            free(tmp_ptr);
+        }
+        return TRUE;
+    }
+    else
+        return FALSE;
+}ptr=&(*ptr)->next; saves a pointer to the member next of an object, which is freed in the next line. Trying to dereference ptr in the next iteration will lead to undefined behaviour.
+*ptr = (*ptr)->next; should be correct. This will advance the list to the next item, while the previous one will be freed in the next line.C - Infinite loop when reading a file [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Why is “while ( !feof (file) )” always wrong?
+
+                                (5 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+I know this is an easy problem but i can't figure out how to solve this. I was learning about file and when i tried to read a file, it went on in an infinite loop. Here is my code:
+int main()
+{
+
+    FILE *p;
+
+    p = fopen("123.txt", "r");
+
+    char ar[150];   
+
+    while(!feof(p))
+    { 
+        fgets(ar, 150, p); 
+        puts(ar);
+    }
+
+    fclose(p);
+
+    return 0;
+}You need this:
+#include <stdio.h>
+
+int main()
+{
+  FILE *p = fopen("data.txt11", "r");
+  if (p == NULL)
+  {
+    printf("File could not be opened.\n");
+    return 1;
+  }
+
+  char ar[150];
+
+  while (fgets(ar, 150, p) != NULL)
+  {
+    puts(ar);
+  }
+
+  fclose(p);
+  return 0;
+}Don't use feof(), see Why is “while ( !feof (file) )” always wrong? .
+Check the return value of fopen() whether fopen() was success or failed, if fopen() returns NULL then don't proceed further or don't do any operation with p. for e.g
+FILE *p = fopen("data.txt11", "r");
+if (p == NULL) {
+    fprintf(stderr,"file doesn't exist\n");
+    return 0;
+}
+
+And check the return value of fgets(). From the manual page of fgets()
+
+RETURN VALUE
+fgets() return s on success, and NULL on error or when end
+         of file occurs while no characters have been read.
+
+for e.g
+char *ptr = NULL;
+while( (ptr = fgets(ar,sizeof(ar), p)) != NULL) {  
+   printf("%s",ptr);
+   /* fgets() copies \n t the end of buffer, if you don't want remove it by some logic */ 
+}
+
+About what fgets() will read, from the manual page
+
+fgets() reads in at most one less than size characters from stream
+  and
+         stores  them  into  the buffer pointed to by s.  Reading stops after an
+         EOF or a newline.  If a newline is read, it is stored into the  buffer.Pclose seems to make process failThis question is a follow up of this question : Controlling a C daemon from another program
+My goal is to control daemon process execution from another program. The daemon's code is really simple.
+int main()
+{
+  printf("Daemon starting ...\n");
+  openlog("daemon-test", LOG_PID, LOG_DAEMON);
+
+  syslog(LOG_INFO, "Daemon started !\n");
+
+  while(1)
+  {
+    syslog(LOG_INFO, "Daemon alive - pid=%d, pgid=%d\n", getpid(), getpgrp());
+    sleep(1);
+  }
+
+  return EXIT_SUCCESS;
+}
+
+I have implemented a SystemV init script for this daemon as follow
+#!/bin/sh
+
+NAME=daemon-test
+DAEMON=/usr/bin/${NAME}
+SCRIPTNAME=/etc/init.d/${NAME}
+USER=root
+RUN_LEVEL=99
+PID_FILE=/var/run/${NAME}.pid
+RETRY=3
+
+start_daemon()
+{
+    start-stop-daemon --start --background --name ${NAME} --chuid ${USER} --nicelevel ${RUN_LEVEL} --make-pidfile --pidfile ${PID_FILE} --exec ${DAEMON}
+    ret=$?
+
+    if [ "$ret" -eq 0 ]; then
+        echo "'${NAME}' started"
+    elif [ "$ret" -eq 1 ]; then
+        echo "'${NAME}' is already running"
+    else
+        echo "An error occured starting '${NAME}'"
+    fi
+    return ${ret}
+}
+
+stop_daemon()
+{
+    start-stop-daemon --stop --retry ${RETRY} --remove-pidfile --pidfile ${PID_FILE} --name ${NAME} --signal 9
+    ret=$?
+
+    if [ "$ret" -eq 0 ]; then
+        echo "'${NAME}' stopped"
+    elif [ "$ret" -eq 1 ]; then
+        echo "'${NAME}' is already stopped"
+    elif [ "$ret" -eq 2 ]; then
+        echo "'${NAME}' not stopped after ${RETRY} tries"
+    else
+        echo "An error occured stopping '${NAME}'"
+    fi
+    return ${ret}
+}
+
+status_daemon()
+{
+    start-stop-daemon --status --pidfile ${PID_FILE} --name ${NAME}
+    ret=$?
+
+    if [ "$ret" -eq 0 ]; then
+        echo "'${NAME}' is running"
+    elif [ "$ret" -eq 1 ]; then
+        echo "'${NAME}' stopped but pid file exits"
+    elif [ "$ret" -eq 3 ]; then
+        echo "'${NAME}' stopped"
+    elif [ "$ret" -eq 4 ]; then
+        echo "Unable to get '${NAME}' status"
+    else
+        echo "Unknown status : ${ret}"
+    fi
+    return ${ret}
+}
+
+case "$1" in
+  start)
+    echo "Starting '${NAME}' deamon :"
+    start_daemon
+    ;;
+  stop)
+    echo "Stopping '${NAME}' deamon :"
+    stop_daemon
+    ;;
+  status)
+    echo "Getting '${NAME}' deamon status :"
+    status_daemon
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|status|restart}"
+    exit 1
+esac
+
+exit $?
+
+Using this script from command line to control the daemon execution works well. 
+
+So the aim now is to use this script from another c program to launch the daemon and to control its execution from this program.
+I have implemented a simple C program which:
+
+Launch the script with 'start' argument
+Wait for pid file creation
+Read daemon's pid from pid file
+Periodically check that daemon is alive by checking existence of file /proc/<daemon_pid>/exec
+If daemon is killed, relaunch it
+
+And here is the issue I'm facing. The program works well only if I don't call pclose.
+Here is the code of the program
+#define DAEMON_NAME       "daemon-test"
+#define DAEMON_START_CMD  "/etc/init.d/" DAEMON_NAME " start"
+#define DAEMON_STOP_CMD   "/etc/init.d/" DAEMON_NAME " stop"
+#define DAEMON_PID_FILE   "/var/run/" DAEMON_NAME ".pid"
+
+int main()
+{
+    char daemon_proc_path[256];
+    FILE* daemon_pipe = NULL;
+    int daemon_pid = 0;
+    FILE* fp = NULL;
+    int ret = 0;
+    int i = 0;
+
+    printf("Launching '%s' program\n", DAEMON_NAME);
+    if(NULL == (daemon_pipe = popen(DAEMON_START_CMD, "r")))
+    {
+        printf("An error occured launching '%s': %m\n", DAEMON_START_CMD);
+        return EXIT_FAILURE;
+    }
+    #ifdef USE_PCLOSE
+    else if(-1 == (ret = pclose(daemon_pipe)))
+    {
+        printf("An error occured waiting for '%s': %m\n", DAEMON_START_CMD);
+        return EXIT_FAILURE;
+    }
+    #endif
+    else
+    {
+        printf("Script exit status : %d\n", ret);
+
+        while(0 != access(DAEMON_PID_FILE, F_OK))
+        {
+            printf("Waiting for pid file creation\n");
+            sleep(1);
+        }
+        if(NULL == (fp = fopen(DAEMON_PID_FILE, "r")))
+        {
+            printf("Unable to open '%s'\n", DAEMON_PID_FILE);
+            return EXIT_FAILURE;
+        }
+        fscanf(fp, "%d", &daemon_pid);
+        fclose(fp);
+        printf("Daemon has pid=%d\n", daemon_pid);
+        sprintf(daemon_proc_path, "/proc/%d/exe", daemon_pid);
+    }
+
+    while(1)
+    {
+        if(0 != access(daemon_proc_path, F_OK))
+        {
+            printf("\n--- Daemon (pid=%d) has been killed ---\n", daemon_pid);
+            printf("Relaunching new daemon instance...\n");
+            if(NULL == (daemon_pipe = popen(DAEMON_START_CMD, "r")))
+            {
+                printf("An error occured launching '%s': %m\n", DAEMON_START_CMD);
+                return EXIT_FAILURE;
+            }
+            #ifdef USE_PCLOSE
+            else if(-1 == (ret = pclose(daemon_pipe)))
+            {
+                printf("An error occured waiting for '%s': %m\n", DAEMON_START_CMD);
+                return EXIT_FAILURE;
+            }
+            #endif
+            else
+            {
+                printf("Script exit status : %d\n", ret);
+
+                while(0 != access(DAEMON_PID_FILE, F_OK))
+                {
+                    printf("Waiting for pid file creation\n");
+                    sleep(1);
+                }
+                if(NULL == (fp = fopen(DAEMON_PID_FILE, "r")))
+                {
+                    printf("Unable to open '%s'\n", DAEMON_PID_FILE);
+                    return EXIT_FAILURE;
+                }
+                fscanf(fp, "%d", &daemon_pid);
+                fclose(fp);
+                printf("Daemon has pid=%d\n", daemon_pid);
+                sprintf(daemon_proc_path, "/proc/%d/exe", daemon_pid);
+            }
+        }
+        else
+        {
+            printf("Daemon alive (pid=%d)\n", daemon_pid);
+        }
+        sleep(1);
+    }
+
+    return EXIT_SUCCESS;
+}
+
+From what I understood pclose is supposed to wait for child process termination and only when the child process has returned, it closes the pipe.
+So I don't understand why my implementation with pclose doesn't work when it works without calling it.
+Here are the logs with and without the pclose block commented
+Without pclose calling:
+# ./popenTest 
+Launching 'daemon-test' program
+Script exit status : 0
+Waiting for pid file creation
+Daemon has pid=435
+Daemon alive (pid=435)
+Daemon alive (pid=435)
+Daemon alive (pid=435)
+Daemon alive (pid=435)
+
+With pclose calling:
+# ./popenTest 
+Launching 'daemon-test' program
+Script exit status : 36096
+Waiting for pid file creation
+Waiting for pid file creation
+Waiting for pid file creation
+Waiting for pid file creation
+
+As you can see, the daemon is never launched and the pid file is never created neither.
+Even if my program works without pclose I would like to understand the underlying issue with the call to pclose.
+Why using pclose makes the program fail when the behaviour is good without calling it ?
+
+EDIT:
+Here are some more information for the error case
+errno is Success
+WIFEXITED macro returns true
+WEXITSTATUS macro returns 141
+By going further into debugging, I have remarqued that modifying the init script to log output to a file makes it work... why ?You use popen(DAEMON_START_CMD, "r").  That means your 'daemon watcher' is reading the standard output of your 'daemon starter' script.  If you pclose() that pipe, the script writes to standard output and gets a SIGPIPE because the read end of the pipe is closed.  Whether that happens before the actual daemon is started or not is open to debate — and timing issues.
+Don't pclose() the pipe until you know the daemon starter has exited, by some means or other.  Personally, I'd use pipe(), fork() and execv() (or some other variant of the exec family of functions directly.  I don't think popen() is the right tool for the job. But if you're going to use popen(), then read the input until you get no more (EOF), then use pclose() safely.  You don't have to print what you read, though it would be conventional and sensible to do so — the 'daemon starter' script is telling you useful information.
+The classic way to check whether a process ID is still running is to use kill(daemon_pid, 0).  If the process executing that is appropriately privileged (same UID as the process, or root privileges), this works.  It won't help if you can't send an active signal to the PID.
+(I assume start-stop-daemon is a program, probably a C program rather than a shell script, that launches another program as a daemon.  I have a similar program that I call daemonize — and it too is intended for convert programs not specifically designed as daemons into a program running as a daemon.  Many programs don't work well as daemons — consider what daemonizing ls, grep, ps, or sort would mean.  Other programs can more sensibly be run as daemons.)Is memcpy() / mktime() thread-safe on iOS & Android?I have a C library which I'm cross-compiling to use in Android & iOS apps.
+It makes use of memcpy() and mktime() so I want to know if these functions are implicitly thread-safe when used in multi-threaded environments. 
+iOS apps compiled with modern Xcode and Android libraries compiled with modern Android NDK use a clang compiler which is LLVM-based.
+I've reviewed the following questions, but have been unable to find a definitive answer:
+
+Is memcpy process-safe?
+Are functions in the C standard library thread safe?POSIX requires of conforming implementations that all functions it standardizes be thread safe, with the exception of a relatively short list of functions.  memcpy() and mktime() are both covered by POSIX, and neither is on the list of exceptions, so POSIX requires them to be thread safe (but read on).
+Note well, however, that this is not a matter of the compiler used, but rather of the C library that supports your application.  I recall Apple's C libraries being non-conforming in some areas.  Nevertheless, there's nothing in particular about memcpy() and mktime() that makes them inherently risky from a thread safety perspective.  That is, there's no reason to expect that they access any shared data, except any provided to them via their arguments.
+And there's the rub.  You can rely on memcpy() and mktime() not to, say, rely internally on static data, but POSIX's requirement for thread safety does not extend to working as documented in the face of data races you create through choice of arguments.  Thus, for example, if two different threads call memcpy(), and the target region of one call overlaps either the source or target region of the other, then you need some flavor of synchronization between the threads.The question if memcpy() is thread-safe might be discussible.
+I would say that memcpy() is indeed thread-safe. It doesn't rely on a (global) state, which could be mangled up by multiple instances of memcpy() running. This, however, doesn't mean, that there is some magic preventing a memory area, which is concurrently the copy destination of multiple threads doing memcpy() gets badly mangled up, i.e. the copy process as a whole is not atomic. You would have to care yourself using mutexes to ensure atomicity.
+mktime() is trivially threadsafe, since it doesn't use static buffers, use a global state or similar. The manpage mentions a few functions from that family being not threadsafe (those have corresponding *_r functions), but mktime() is not amongst those.Compiling and linking Python module in Mac OsI am working on a Python module. I have C source file and a compiled library. I was having problems when linking in Mac Os, so I followed the instructions provided at Python runtime_library_dirs doesn't work on Mac.
+This post says that add extra link arguments should be added when linking in Mac Os. It also says that install_name_tool should be used to change the install name of the library.
+However, I am getting this error message when using install_name_tool:
+string table not at the end of the file (can't be processed) in file:
+
+The library is compiled from Go source.OK. This is what I previously had:
+ext_modules = [Extension("_mypymod", ["mymod.c"],
+                         extra_link_args=[],
+                         depends=[],
+                         libraries = [':mylib.a'],
+                         library_dirs = [
+                             lib_path
+                         ],
+                   )],
+
+That didn't work in MacOS. This is how it should be:
+ext_modules = [Extension("_mypymod", ["mymod.c"],
+                             extra_link_args=[lib_path + '/mylib.a'], #full path to the library
+                             depends=[],
+                       )],
+
+That works in linux and Mac.List vector print does not workI'm doing a hash table, where I have a one vector with a list inside each node of it. But when I go to print it does not appear the items that are within the list, and if I try to put more than one element in the list, it gives segmentation failure in the second. Below is the code and the result:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <locale.h>
+enum erro {
+     semErro = 0, posInv = 1, listaCheia = 2, listaVazia = 3, existe         = 4, naoExiste = 5
+};
+
+typedef struct no{       
+    char nome[100];
+    char telefone[20];
+    struct no *prox;
+} nodo;
+
+typedef struct{
+    int tamanho;
+    nodo *inicio;
+} lista;
+
+typedef struct { 
+    int tamanhoTabelaHash;
+    int colisoes;
+    lista* vetor;
+} tabela;
+
+///////////////////Chamada de Funções///////////////////
+lista *novaLista();
+tabela *criaTabela(int tam);
+int insereTabela(tabela *tabela, char *entraNome, char *entraTelefone);
+int insereNoInicioI(lista *lista,char *entraNome, char *entraTelefone);
+int hash1(char *entraNome, int tam);
+void imprime(lista *lista);
+void imprimeTabela(tabela *tabela);
+///////////////////Funções Lista///////////////////
+
+void imprime(lista *lista){        
+     int i;
+     nodo *no; //<<<<<Possível local do erro>>>>>
+     puts("Lista: \n");
+     for (i = 0; i < lista->tamanho; i++) {  
+          printf("Nome: %s Telefone: %s\n",no->nome,no->telefone);
+          no=no->prox;
+     }
+}
+
+lista *novaLista(){ 
+
+     lista *l = (lista*)malloc(sizeof(lista));
+     l->tamanho=0;
+     l->inicio=NULL;
+     return l;
+}
+
+int insereNoInicioI(lista *lista,char *entraNome, char *entraTelefone){ 
+
+     nodo *novo=(nodo *)malloc(sizeof(nodo));    
+     strcpy(novo->nome,entraNome);
+     strcpy(novo->telefone,entraTelefone);
+     novo->prox = lista->inicio;
+     lista->inicio = novo;        
+     lista->tamanho++;
+     return semErro;
+}
+
+tabela *criaTabela(int tam) {
+
+    if( tam < 1 ) return NULL;
+    tabela *table = (tabela *)malloc(sizeof(tabela));
+    table->tamanhoTabelaHash = tam;
+    table->colisoes = 0;
+    for (int i = 0; i < 10; i++) {   
+        table[i].vetor = NULL;
+    }
+    return table;   
+}
+
+void imprimeTabela(tabela *tabela) {
+
+    int i;
+    printf("\nTabela: \n");
+    for (i = 0; i < tabela->tamanhoTabelaHash ; i++) {
+        printf("\nindice[%d]:", i);
+            if(tabela[i].vetor!=NULL){
+               imprime(tabela[i].vetor);
+            }  
+    }
+}
+
+int insereTabela(tabela *tabela, char *entraNome, char *entraTelefone){
+
+    int pos = 0;
+        pos = hash1(entraNome,10000);//Função que retorna uma posição( no caso 8 para o primeiro nome e 6 para o segundo e terceiro
+    }
+    if(tabela[pos].vetor==NULL){
+        lista *list = novaLista();
+        tabela[pos].vetor = list;
+    }
+    nodo *novo=(nodo *)malloc(sizeof(nodo));
+    insereNoInicioI(tabela[pos].vetor, entraNome, entraTelefone);
+    return semErro;
+} 
+
+int main(){
+   setlocale(LC_ALL, "Portuguese");
+   tabela *table = criaTabela(10);
+
+   char nome[100] = "Maria Cláudia Feliz";
+   char telefone[20] = "(53)98401-8583";
+   char nome1[100] = "Everton Almeida";
+   char telefone1[20] = "(53)90000-8583";
+   char nome2[100] = "Everton Almeida";
+   char telefone2[20] = "(53)90000-8583";
+
+   insereTabela(table,nome,telefone);
+   insereTabela(table,nome1,telefone1);
+   insereTabela(table,nome2,telefone2);
+   imprimeTabela(table);
+return semErro;
+} 
+Resultado:
+Tabela: 
+indice[0]: 
+indice[1]:
+indice[2]: 
+indice[3]: 
+indice[4]: 
+indice[5]: 
+indice[6]:Lista: 
+Nome:  Telefone:  //<<<<Deveria imprimir o nome e telefone>>>>
+Nome:  Telefone:  //<<<<Deveria imprimir o nome e telefone>>>>
+indice[7]: 
+indice[8]:Lista:
+                  //<<<<Deveria imprimir o nome e telefone>>>>
+Falha de segmentação(imagem do núcleo gravada)
+
+If you can help, thank you.You have at least one serious problem here:
+tabela *criaTabela(int tam) {
+  if (tam < 1) return NULL;
+
+  // you allocate space for 1 tabela
+  tabela *table = (tabela *)malloc(sizeof(tabela));
+  table->tamanhoTabelaHash = tam;
+  table->colisoes = 0;
+
+  // but here you write to 10 tabelas ....
+  for (int i = 0; i < 10; i++) {
+    table[i].vetor = NULL;
+  }
+  return table;
+}
+
+You if you write to 10 tabelas, you should allocate space for 10 tabelas:
+  tabela *table = (tabela *)malloc(sizeof(tabela) * 10);
+
+The code in your answer yields in undefined bahaviour. In other works it may appear to work. Google "undefined bahaviour".
+There may be more problems elsewhere in your code.#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <locale.h>
+enum erro {
+     semErro = 0, posInv = 1, listaCheia = 2, listaVazia = 3, existe         = 4, naoExiste = 5
+};
+
+typedef struct no{       
+    char nome[100];
+    char telefone[20];
+    struct no *prox;
+} nodo;
+
+typedef struct{
+    int tamanho;
+    nodo *inicio;
+} lista;
+
+typedef struct { 
+    int tamanhoTabelaHash;
+    int colisoes;
+    lista* vetor;
+} tabela;
+
+///////////////////Chamada de Funções///////////////////
+lista *novaLista();
+tabela *criaTabela(int tam);
+int insereTabela(tabela *tabela, char *entraNome, char *entraTelefone);
+int insereNoInicioI(lista *lista,char *entraNome, char *entraTelefone);
+int hash1(char *entraNome, int tam);
+void imprime(lista *lista);
+void imprimeTabela(tabela *tabela);
+///////////////////Funções Lista///////////////////
+
+void imprime(lista *lista){        
+     int i;
+     nodo *no = lista-> inicio; 
+     puts("Lista: \n");
+     for (i = 0; i < lista->tamanho; i++) {  
+          printf("Nome: %s Telefone: %s\n",no->nome,no->telefone);
+          no=no->prox;
+     }
+}
+
+lista *novaLista(){ 
+
+     lista *l = (lista*)malloc(sizeof(lista));
+     l->tamanho=0;
+     l->inicio=NULL;
+     return l;
+}
+
+int insereNoInicioI(lista *lista,char *entraNome, char *entraTelefone){ 
+
+     nodo *novo=(nodo *)malloc(sizeof(nodo));    
+     strcpy(novo->nome,entraNome);
+     strcpy(novo->telefone,entraTelefone);
+     novo->prox = lista->inicio;
+     lista->inicio = novo;        
+     lista->tamanho++;
+     return semErro;
+}
+
+tabela *criaTabela(int tam) {
+
+    if( tam < 1 ) return NULL;
+    tabela *table = (tabela *)malloc(sizeof(tabela)*10);
+    table->tamanhoTabelaHash = tam;
+    table->colisoes = 0;
+    for (int i = 0; i < 10; i++) {   
+        table[i].vetor = NULL;
+    }
+    return table;   
+}
+
+void imprimeTabela(tabela *tabela) {
+
+    int i;
+    printf("\nTabela: \n");
+    for (i = 0; i < tabela->tamanhoTabelaHash ; i++) {
+        printf("\nindice[%d]:", i);
+            if(tabela[i].vetor!=NULL){
+               imprime(tabela[i].vetor);
+            }  
+    }
+}
+int hash1(char *string, int tam) {
+
+    int tamanho = strlen(string);
+    unsigned soma = 0;
+    for (int i = 0; i < tamanho; i++) {
+        soma = soma * 251 + string[i];
+    }
+    return soma % tam;
+}
+
+int insereTabela(tabela *tabela, char *entraNome, char *entraTelefone){
+
+    int pos = 0;
+        pos = hash1(entraNome,10);
+    if(tabela[pos].vetor==NULL){
+        lista *list = novaLista();
+        tabela[pos].vetor = list;
+    }
+    nodo *novo=(nodo *)malloc(sizeof(nodo));
+    insereNoInicioI(tabela[pos].vetor, entraNome, entraTelefone);
+    return semErro;
+} 
+
+int main(){
+   setlocale(LC_ALL, "Portuguese");
+   tabela *table = criaTabela(10);
+
+   char nome[100] = "Maria Cláudia Feliz";
+   char telefone[20] = "(53)98401-8583";
+   char nome1[100] = "Everton Almeida";
+   char telefone1[20] = "(53)90000-8583";
+   char nome2[100] = "Everton Almeida";
+   char telefone2[20] = "(53)90000-8583";
+
+   insereTabela(table,nome,telefone);
+   insereTabela(table,nome1,telefone1);
+   insereTabela(table,nome2,telefone2);
+   imprimeTabela(table);
+return semErro;
+} 
+Resultado:
+indice[0]:
+indice[1]:
+indice[2]:Lista: 
+Nome: Everton Almeida Telefone: (53)90000-8583
+indice[3]:
+indice[4]:
+indice[5]:Lista: 
+Nome: Everton Telefone: (53)90000-8583
+indice[6]:
+indice[7]:
+indice[8]:Lista: 
+Nome: Maria ClÃ¡udia Feliz Telefone: (53)98401-8583
+indice[9]:
+
+Thanks to all comments THIS IS THE CODE WORKING, but I have one more doubt, because the name clause goes wrong if the setlocale (LC_ALL, "Portuguese");creating a serial loopback under VxWorksI'm fairly new to VxWorks OS and hence wouldn't mind explanations in case I differ in my understanding of things under the hood when they differ from more traditional OSes like Linux and the likes. With that out of the way, let me begin  my actual question.
+I am trying to create a loop-back test for testing changes I made to the serial UART driver on the board. Since I do not want to use a cross cable to actually short two UART ports externally, I've connected both of those ports to my dev machine. One configured as an output port from the dev machine's perspective (and consequently as an Input port on the board) and the other an input port (an output port on the board). I am actually doing the loopback using a shared memory buffer which I am protecting using a mutex. So there are two threads on the board, one of which reads from the input port, copies data to the shared memory and the other reads from the memory and sends it over the output port.
+And I am using regular open, read and write calls in my VxWorks application (by the way I think it is part of the application code as I call the functions from usrAppInit.c not withstanding the fact that I can even call driver routines from here! (Is it because of a flat memory model vis-a-vis Linux?? Anyhow).
+Now I these ports on VxWorks have been opened in a non blocking mode and here's the code snippet which configures one of the ports:
+if( (fdIn = open(portstrIn, O_RDONLY | O_NOCTTY, 0) ) == ERROR) {
+    return 1;
+}
+
+if(((status = ioctl(fdIn, FIOSETOPTIONS, OPT_RAW))) == ERROR)
+{
+    return 1;
+}
+
+/* set the baud rate to 115200
+ */
+
+if((status = ioctl(fdIn, FIOBAUDRATE, 115200)) == ERROR)
+{
+   return 1;
+}
+
+/* set the HW options
+ */
+
+if((status = ioctl(fdIn, SIO_HW_OPTS_SET, (CS8 | 0 | 0))) == ERROR)
+{
+    return 1;
+}
+
+And similarly the output port is also configured. These two are part of two separate tasks spawned using taskSpawn and have the same priority of 100. However what I am annoyed by, is that when I write to the in port from my dev machine (using a python script), the read call on the board get's sort of staggered (I wonder if that's the right way to refer to it). It is most likely due to the short availability of hardware buffer space on the UART input buffer (or some such). This is usually not much of a problem if that is all I am doing. 
+However, as explained earlier, I am trying to copy the whole received character stream into a common memory buffer (guarded by a mutex of course) which is then read by another task and then re-transmitted over another serial port (sort of an in memory loopback if you will)
+In lieu of that aforementioned staggering of the read calls, I thought of holding the mutex as long as there are characters to be read from the Inport and once there are no chars to be read, release the mutex and since this is VxWorks, do an explicit taskDelay(0) to schedule the next ready task (my other task). However since this is a blocking read, I am (as expected) stuck on the read call due to which my other thread never gets a chance to execute.
+I did think of checking if the buffer was full and then doing the explicit task switch however if any of you have a better idea, I'm all ears.
+Also just to see how this staggered read thing works from the perspective of the kernel, I timed it using a time(NULL) call just before and right after the read. So surprisingly, the very first chunk shows up a number, every other chunk after that (if it's a part of the same data block coming from the outside) shows 0. Could anyone explain that as well?
+Keen to hearI don't have 50 rep points for commenting, but without a loopback cable attached, the only way you can arrive at testing serial loopback behavior is to switch the uart into loopback mode.  This often means making changes to the  specific hardware part driver.Switch vs if ... else if ... elseI have a question. I'm studying for my exam and I don't know how to do answer this. Basically I have to change the instructions if...else if... else, to a instruction switch in order that the output of the program stays the same.
+void main()
+{
+    int x;
+    x = 1;
+    for (int i = 1; i < 10; ++i) {
+        if (i <= 3)
+            do {
+                x += i;
+                if (x >= 4)
+                    break;
+            } while (i % 2 == 0);
+        else if ((i > 3) && (i < 5))
+            x += 2;
+        else
+            continue;
+    }
+    while (x > 0) {
+        printf(" x=%d ", x);
+        x -= 1;
+    }
+    system("pause");
+}
+
+Am I allowed to do a switch inside of the for loop?Of course you can. A for loop controls the execution of a statement and a switch block is a statement.
+Given that i is in the inclusive range of 1 to 9, you can replace the if block with
+switch (i){
+case 1: case 2: case 3:
+    // that replaces 'if (i <= 3)'
+    // ToDo - the code here
+    break; // to obviate follow-through.
+case 4:
+    // that replaces 'if ((i > 3) && (i < 5))'
+    // ToDo - the code here
+    break;
+default:
+    // that replaces 'else'
+    continue; // note that this is for the for loop, not the switch
+}
+
+Note that the behaviour of if (x >= 4) break; is not changed by this refactoring.
+I'm not convinced however that replacing the if block with a switch is the right thing to do here: the boundaries i <= 3 and i >= 5 are less naturally handled with a switch; perhaps changing the type of i to unsigned and handling case 0: explicitly would alleviate this somewhat.Something like this should work
+void main()
+{
+    int x;
+    x = 1;
+    for (int i = 1; i < 10; ++i) {
+        switch (i) {
+            case 1:
+            case 2:
+            case 3:
+                 do {
+                     x += i;
+                     if (x >= 4)
+                         break;
+                 } while (i % 2 == 0);
+                 break;
+            case 4:
+                 x += 2;
+                 break;
+            default:
+                continue;
+                break;
+         }
+    }
+    while (x > 0) {
+        printf(" x=%d ", x);
+        x -= 1;
+    }
+    system("pause");
+}You can have the switch statement inside the loops.
+IMO the switch is more readable than the long if else sequences. Performance is almost the same.
+Some compilers (gcc for example) have switch extensions making the range checks in the switch statements shorter.
+switch(age)
+{
+    case 0 ... 12:
+    printf("Child\n");
+    break;
+    case 13 ... 19:
+    printf("Teenager\n");
+    break;
+    case 20 ... 200:
+    printf("Adult\n");
+    break;
+    default:
+    printf("Immortal\n");
+    break;
+} 
+
+It is not portable of course.Use of pointers to store character stringsI started learning pointers in C. I understood it fine untill I came across the topic "Using Pointers to store character arrays".
+A sample program to highlight my doubt is as follows
+#include <stdio.h>
+main()
+{
+  char *string;
+  string = "good"; 
+  printf ("%s", string);
+}
+
+This prints the character string, i.e, good.
+Pointers are supposed to store memory addresses, or in other words, we assign the adress of a variable (using the address operator) to a pointer variable.
+What I don't understand is how are we able to assign a character string directly to the pointer? That too without address operator?
+Also, how are we able to print the string without the indirection operator (*) ?A literal string like "good" is really stored as a (read-only) array of characters. Also, all strings in C must be terminated with a special "null" character '\0'.
+When you do the assingment
+string = "good";
+
+what is really happening is that you make string point to the first character in that array.
+Functions handling strings knows how to deal with pointers like that, and know how to loop over such arrays using the pointer to find all the characters in the string until it finds the terminator.
+
+Looking at it a little differently, the compile creates its array
+char internal_array[] = { 'g', 'o', 'o', 'd', '\0' };
+
+then you make string point to the first element in the array
+string = &internal_array[0];
+
+Note that &internal_array[0] is actually equal to internal_array, since arrays naturally decays to pointers to their first element."cccccc" is a string literal which is actually the char array stored in the ReadOnly memory. You assign the pointer to the address of the first character of this literal.
+if you want to copy string literal to the RAM you need to:
+char string[] = "fgdfdfgdfgf";
+
+Bare in mind that the array initialization (when you declare it) is the only place where you can use the = to copy the string literal to the char array (string).
+In any other circumstances you need to use the appropriate library function for example.
+ strcpy(string, "asdf");
+
+(the string has to have enough space to accommodate the new string)What I don't understand is how are we able to assign a character string directly to the pointer? That too without address operator?
+
+When an array is assigned to something, the array is converted to a pointer.
+"good" is a string literal.  It has a array 5 of char which includes a trailing null character.  It exists in memory where write attempts should not be attempted.  Attempting to write is undefined behavior  (UB).  It might "work", it might not.  Code may die, etc.
+char *string; declare string as pointer to char.
+string = "good"; causes an assignment.  The operation takes "good" and converts that array to the address and type (char*) of its first element 'g'.   Then assigns that char * to string.
+
+Also, how are we able to print the string without the indirection operator (*) ?
+
+printf() expects a char * - which matches the type of string.
+printf ("%s", string); passes string to printf() as a char * - no conversion is made.  printf ("%s",... expects to see a  "... the argument shall be a pointer to the initial element of an array of character type."  then "Characters from the array are written up to (but not including) the terminating null character."  C11 §7.21.6.1 8.Your first question:
+What I don't understand is how are we able to assign a character string directly to the pointer? That too without address operator?
+A character string literal is a sequence of zero or more multibyte characters enclosed in double-quotes, for e.g. "good".
+From C Standard#6.4.5 [String literals]:
+
+...The multibyte character sequence is then used to initialize an array of static storage duration and length just sufficient to contain the sequence. For character string literals, the array elements have type char, and are initialized with the individual bytes of the multibyte character sequence.....
+
+In C, an expression that has type array of type is converted to an expression with type pointer to type that points to the initial element of the array object [there are few exceptions]. Hence, the string literal which is an array decays into pointer which can be assigned to the type char *.
+In the statement:
+string = "good";
+
+string will point to the initial character in the array where "good" is stored.
+Your second question:
+Also, how are we able to print the string without the indirection operator (*) ?
+From printf():
+
+s
+  writes a character string
+  The argument must be a pointer to the initial element of an array of characters... 
+
+So, format specifier %s expect pointer to initial element which is what the variable string is - a pointer to initial character of "good". Hence, you don't need indirection operator (*).Arranging strings names of teams in order of points obtained by teamI have this project where I am supposed to write a code whereby we enter the names of the country competing in the world cup (1 group, 4 countries) and what each country scored. Then, the program has to print the scores and which two teams are to advance to the next stage like "1st team to advance is %s." and it prints the name of the team with the highest score followed by "2nd team to advance is %s." , printing the country with the 2nd highest score. I can't for the life of me figure out how to write the part where the program prints which country advances to the next stage.
+#include <stdio.h> 
+#include <stdlib.h> 
+
+#define NUMBER 4 
+
+void setTeam(char team[NUMBER][20]) /*Names of team in particular group*/
+{ 
+
+ setvbuf(stdout, NULL, _IONBF, 0); 
+
+ int i;
+ for(i=0;i<NUMBER;i++){ 
+  printf("Enter name of team %d: ", i); 
+  scanf("%s", &team[i]); 
+ } 
+
+ for(i=0;i<NUMBER;i++){  /*print name of teams entered*/
+      printf("team[%d]=\" %s\"\n", i, team[i]); 
+ } 
+} 
+
+void input(char team[NUMBER][20],int group[NUMBER][7]){  /*Enter goals scored 
+to calculate Wins, Draws, Loss, GF, GA, GD and PTS */
+
+  int score_i, score_j;
+  int i, j; 
+  for(i=0;i<NUMBER-1;i++){ 
+      for(j=i+1;j<NUMBER;j++){ 
+          printf("%s vs %s\n",team[i],team[j]); 
+
+          printf("%s :",team[i]); scanf("%d", &score_i); 
+
+          group[i][3] += score_i;
+
+          printf("%s :",team[j]); scanf("%d", &score_j); 
+
+          group[j][3] += score_j;
+
+          group[i][4] += score_j;
+          group[j][4] += score_i;
+
+          if (score_i == score_j)
+          {
+                group[i][1] += 1;
+                group[j][1] += 1;
+          } else if (score_i > score_j) {
+               group[i][0] += 1;
+               group[j][2] += 1;
+          } else {
+               group[j][0] += 1;
+               group[i][2] += 1;
+          }
+
+          group[i][5] += judge(score_i, score_j);
+          group[j][5] += judge(score_j, score_i);
+          group[i][6] = group[i][3] - group[i][4];
+          group[j][6] = group[j][3] - group[j][4];
+      } 
+  }
+} 
+
+int judge(int gain, int loss)
+{
+
+   if (gain == loss || loss == gain)
+        return 1;
+   else if (gain > loss)
+        return 3;
+   else
+       return 0;
+ } 
+
+int display(char team[NUMBER][20], int group[NUMBER][7])
+{ /*Print results*/
+
+  puts("\n\tTeam, \t\tWin,    Draws,   Loss,    GF,    GA,     GD,    PTS");  
+
+  int i, j;  
+
+  for(i=0;i < NUMBER;i++){  
+
+      printf("\t%-10s,\t%3d,\t%8d,\t%d,\t%2d,\t%3d,\t%5d,\t%9d\n", 
+      team[i],group[i][0],group[i][1],group[i][2],group[i][3],group[i] 
+      [4],group[i][5],group[i][6]); 
+  } 
+  putchar('\n');
+} 
+
+void advance(char team[][20], int group[][7])
+{ /*Identify top 2 teams to advance and print name of teams */
+
+  int i, j;
+  int max;
+  char temp[NUMBER][20];
+
+  puts("\tAdvance");
+
+  for(i = 0; i < NUMBER; i++) {
+        for(j = i + 1; j < NUMBER; j++) {
+                if (group[i][3] < group[j][3]) {
+                     max = group[i][3];
+                     group[i][3] = group[j][3];
+                     group[j][3] = max;
+
+                 }
+        }
+   }
+
+
+}
+
+
+
+int main(void)
+{ 
+
+ int group[NUMBER][7] = {0}; 
+ int i,j; 
+ char team[NUMBER][20]; 
+
+ setTeam(team); 
+ input(team, group); 
+ display(team, group); 
+ advance(team, group);
+
+ return 0; 
+}You should compare teams by amount of points earned. I initialized state by assigning that the first and the second team are candidates for next stage. After that all you have to do is to compare whether there is some other team with higher score. If you have found new highest score you need to reassign both first and second team. If you have found a new 2nd place candidate you need to reassign only the second place. 
+void advance(char team[][20], int group[][7])
+{ /*Identify top 2 teams to advance and print name of teams */
+
+  int i, j;
+  int max;
+
+  int max_id = 0;
+  int max_id_prev = 1;
+
+  puts("\tAdvance");
+
+  for(i = 1; i < NUMBER; i++) {
+    if (group[max_id][5] < group[i][5]) {
+       max_id_prev = max_id;
+       max_id = i;
+       continue;
+    }
+    if (group[max_id_prev][5] < group[i][5]) {
+       max_id_prev = i;
+    }
+   }
+  printf("%s", team[max_id]);
+  printf("%s", team[max_id_prev]);
+}
+
+Please consider doing a peer review of your code or post your code on Code review. Also consider organizing your code with structs as representations of the data you have. It will improve readability. There are many books on how to write clean, readable code.256-bit vectorization via OpenMP SIMD prevents compiler's optimization (say function inlining)?Consider the following toy example, where A is an n x 2 matrix stored in column-major order and I want to compute its column sum. sum_0 only computes sum of the 1st column, while sum_1 does the 2nd column as well. This is really an artificial example, as there is essentially no need to define two functions for this task (I can write a single function with a double loop nest where the outer loop iterates from 0 to j). It is constructed to demonstrate the template problem I have in reality.
+/* "test.c" */
+#include <stdlib.h>
+
+// j can be 0 or 1
+static inline void sum_template (size_t j, size_t n, double *A, double *c) {
+
+  if (n == 0) return;
+  size_t i;
+  double *a = A, *b = A + n;
+  double c0 = 0.0, c1 = 0.0;
+
+  #pragma omp simd reduction (+: c0, c1) aligned (a, b: 32)
+  for (i = 0; i < n; i++) {
+    c0 += a[i];
+    if (j > 0) c1 += b[i];
+    }
+
+  c[0] = c0;
+  if (j > 0) c[1] = c1;
+
+  }
+
+#define macro_define_sum(FUN, j)            \
+void FUN (size_t n, double *A, double *c) { \
+  sum_template(j, n, A, c);                 \
+  }
+
+macro_define_sum(sum_0, 0)
+macro_define_sum(sum_1, 1)
+
+If I compile it with
+gcc -O2 -mavx test.c
+
+GCC (say the latest 8.2), after inlining, constant propagation and dead code elimination, would optimize out code involving c1 for function sum_0 (Check it on Godbolt).
+I like this trick. By writing a single template function and passing in different configuration parameters, an optimizing compiler can generate different versions. It is much cleaner than copying-and-pasting a big proportion of the code and manually define different function versions.
+However, such convenience is lost if I activate OpenMP 4.0+ with
+gcc -O2 -mavx -fopenmp test.c
+
+sum_template is inlined no more and no dead code elimination is applied (Check it on Godbolt). But if I remove flag -mavx to work with 128-bit SIMD, compiler optimization works as I expect (Check it on Godbolt). So is this a bug? I am on an x86-64 (Sandybridge).
+
+Remark
+Using GCC's auto-vectorization -ftree-vectorize -ffast-math would not have this issue (Check it on Godbolt). But I wish to use OpenMP because it allows portable alignment pragma across different compilers.
+Background
+I write modules for an R package, which needs be portable across platforms and compilers. Writing R extension requires no Makefile. When R is built on a platform, it knows what the default compiler is on that platform, and configures a set of default compilation flags. R does not have auto-vectorization flag but it has OpenMP flag. This means that using OpenMP SIMD is the ideal way to utilize SIMD in an R package. See 1 and 2 for a bit more elaboration.The simplest way to solve this problem is with __attribute__((always_inline)), or other compiler-specific overrides.
+#ifdef __GNUC__
+#define ALWAYS_INLINE __attribute__((always_inline)) inline
+#elif defined(_MSC_VER)
+#define ALWAYS_INLINE __forceinline inline
+#else
+#define ALWAYS_INLINE  inline  // cross your fingers
+#endif
+
+
+ALWAYS_INLINE
+static inline void sum_template (size_t j, size_t n, double *A, double *c) {
+ ...
+}
+
+Godbolt proof that it works.
+Also, don't forget to use -mtune=haswell, not just -mavx.  It's usually a good idea.  (However, promising aligned data will stop gcc's default -mavx256-split-unaligned-load tuning from splitting 256-bit loads into 128-bit vmovupd + vinsertf128, so code gen for this function is fine with tune=haswell.  But normally you want this for gcc to auto-vectorize any other functions.
+You don't really need static along with inline; if a compiler decides not to inline it, it can at least share the same definition across compilation units.
+
+Normally gcc decides to inline or not according to function-size heuristics.  But even setting -finline-limit=90000 doesn't get gcc to inline with your #pragma omp (How do I force gcc to inline a function?).  I had been guessing that gcc didn't realize that constant-propagation after inlining would simplify the conditional, but 90000 "pseudo-instructions" seems plenty big.  There could be other heuristics.
+Possibly OpenMP sets some per-function stuff differently in ways that could break the optimizer if it let them inline into other functions.  Using __attribute__((target("avx"))) stops that function from inlining into functions compiled without AVX (so you can do runtime dispatching safely, without inlining "infecting" other functions with AVX instructions across if(avx) conditions.)
+One thing OpenMP does that you don't get with regular auto-vectorization is that reductions can be vectorized without enabling -ffast-math.
+Unfortunately OpenMP still doesn't bother to unroll with multiple accumulators or anything to hide FP latency.  #pragma omp is a pretty good hint that a loop is actually hot and worth spending code-size on, so gcc should really do that, even without -fprofile-use.
+So especially if this ever runs on data that's hot in L2 or L1 cache (or maybe L3), you should do something to get better throughput.
+And BTW, alignment isn't usually a huge deal for AVX on Haswell.  But 64-byte alignment does matter a lot more in practice for AVX512 on SKX.  Like maybe 20% slowdown for misaligned data, instead of a couple %.
+(But promising alignment at compile time is a separate issue from actually having your data aligned at runtime.  Both are helpful, but promising alignment at compile time makes tighter code with gcc7 and earlier, or on any compiler without AVX.)I desperately needed to resolve this issue, because in my real C project, if no template trick were used for auto generation of different function versions (simply called "versioning" hereafter), I would need to write a total of 1400 lines of code for 9 different versions, instead of just 200 lines for a single template.
+I was able to find a way out, and am now posting a solution using the toy example in the question.
+
+I planed to utilize an inline function sum_template for versioning. If successful, it occurs at compile time when a compiler performs optimization. However, OpenMP pragma turns out to fail this compile time versioning. The option is then to do versioning at the pre-processing stage using macros only.
+To get rid of the inline function sum_template, I manually inline it in the macro macro_define_sum:
+#include <stdlib.h>
+
+// j can be 0 or 1
+#define macro_define_sum(FUN, j)                            \
+void FUN (size_t n, double *A, double *c) {                 \
+  if (n == 0) return;                                       \
+  size_t i;                                                 \
+  double *a = A, * b = A + n;                               \
+  double c0 = 0.0, c1 = 0.0;                                \
+  #pragma omp simd reduction (+: c0, c1) aligned (a, b: 32) \
+  for (i = 0; i < n; i++) {                                 \
+    c0 += a[i];                                             \
+    if (j > 0) c1 += b[i];                                  \
+    }                                                       \
+  c[0] = c0;                                                \
+  if (j > 0) c[1] = c1;                                     \
+  }
+
+macro_define_sum(sum_0, 0)
+macro_define_sum(sum_1, 1)
+
+In this macro-only version, j is directly substituted by 0 or 1 at during macro expansion. Whereas in the inline function + macro approach in the question, I only have sum_template(0, n, a, b, c) or sum_template(1, n, a, b, c) at pre-processing stage, and j in the body of sum_template is only propagated at the later compile time.
+Unfortunately, the above macro gives error. I can not define or test a macro inside another (see 1, 2, 3). The OpenMP pragma starting with # is causing problem here. So I have to split this template into two parts: the part before the pragma and the part after.
+#include <stdlib.h>
+
+#define macro_before_pragma   \
+  if (n == 0) return;         \
+  size_t i;                   \
+  double *a = A, * b = A + n; \
+  double c0 = 0.0, c1 = 0.0;
+
+#define macro_after_pragma(j) \
+  for (i = 0; i < n; i++) {   \
+    c0 += a[i];               \
+    if (j > 0) c1 += b[i];    \
+    }                         \
+  c[0] = c0;                  \
+  if (j > 0) c[1] = c1;
+
+void sum_0 (size_t n, double *A, double *c) {
+  macro_before_pragma
+  #pragma omp simd reduction (+: c0) aligned (a: 32)
+  macro_after_pragma(0)
+  }
+
+void sum_1 (size_t n, double *A, double *c) {
+  macro_before_pragma
+  #pragma omp simd reduction (+: c0, c1) aligned (a, b: 32)
+  macro_after_pragma(1)
+  }
+
+I no long need macro_define_sum. I can define sum_0 and sum_1 straightaway using the defined two macros. I can also adjust the pragma appropriately. Here instead of having a template function, I have templates for code blocks of a function and can reuse them with ease.
+The compiler output is as expected in this case (Check it on Godbolt).
+
+Update
+Thanks for the various feedback; they are all very constructive (this is why I love Stack Overflow).
+Thanks Marc Glisse for point me to Using an openmp pragma inside #define. Yeah, it was my bad to not have searched this issue. #pragma is an directive, not a real macro, so there must be some way to put it inside a macro. Here is the neat version using the _Pragma operator:
+/* "neat.c" */
+#include <stdlib.h>
+
+// stringizing: https://gcc.gnu.org/onlinedocs/cpp/Stringizing.html
+#define str(s) #s
+
+// j can be 0 or 1
+#define macro_define_sum(j, alignment)                                   \
+void sum_ ## j (size_t n, double *A, double *c) {                        \
+  if (n == 0) return;                                                    \
+  size_t i;                                                              \
+  double *a = A, * b = A + n;                                            \
+  double c0 = 0.0, c1 = 0.0;                                             \
+  _Pragma(str(omp simd reduction (+: c0, c1) aligned (a, b: alignment))) \
+  for (i = 0; i < n; i++) {                                              \
+    c0 += a[i];                                                          \
+    if (j > 0) c1 += b[i];                                               \
+    }                                                                    \
+  c[0] = c0;                                                             \
+  if (j > 0) c[1] = c1;                                                  \
+  }
+
+macro_define_sum(0, 32)
+macro_define_sum(1, 32)
+
+Other changes include:
+
+I used token concatenation to generate function name;
+alignment is made a macro argument. For AVX, a value of 32 means good alignment, while a value of 8 (sizeof(double)) essentially implies no alignment. Stringizing is required to parse those tokens into strings that _Pragma requires.
+
+Use gcc -E neat.c to inspect pre-processing result. Compilation gives desired assembly output (Check it on Godbolt).
+
+A few comments on Peter Cordes informative answer
+Using complier's function attributes. I am not a professional C programmer. My experiences with C come merely from writing R extensions. The development environment determines that I am not very familiar with compiler attributes. I know some, but don't really use them.
+-mavx256-split-unaligned-load is not an issue in my application, because I will allocate aligned memory and apply padding to ensure alignment. I just need to promise compiler of the alignment so that it can generate aligned load / store instructions. I do need to do some vectorization on unaligned data, but that contributes to a very limited part of the whole computation. Even if I get a performance penalty on split unaligned load it won't be noticed in reality. I also don't compiler every C file with auto vectorization. I only do SIMD when the operation is hot on L1 cache (i.e., it is CPU-bound not memory-bound). By the way, -mavx256-split-unaligned-load is for GCC; what is it for other compilers?
+I am aware of the difference between static inline and inline. If an inline function is only accessed by one file, I will declare it as static so that compiler does not generate a copy of it.
+OpenMP SIMD can do reduction efficiently even without GCC's -ffast-math. However, it does not use horizontal addition to aggregate results inside the accumulator register in the end of the reduction; it runs a scalar loop to add up each double word (see code block .L5 and .L27 in Godbolt output).
+Throughput is a good point (especially for floating-point arithmetics which has relatively big latency but high throughput). My real C code where SIMD is applied is a triple loop nest. I unroll outer two loops to enlarge the code block in the innermost loop to enhance throughput. Vectorization of the innermost one is then sufficient. With the toy example in this Q & A where I just sum an array, I can use -funroll-loops to ask GCC for loop unrolling, using several accumulators to enhance throughput.
+
+On this Q & A
+I think most people would treat this Q & A in a more technical way than me. They might be interested in using compiler attributes or tweaking compiler flags / parameters to force function inlining. Therefore, Peter's answer as well as Marc's comment under the answer is still very valuable. Thanks again.Fill function pointer array in external files (C)I have been struggling with function pointers for some time now. Maybe you guys can help me out.
+In my project I have multiple functionalities for the same device and each functionality is written in its own .c file. The generic functionalities (which apply to all device functions) are written in generic.c.
+I would like to create a function pointer array in the generic c file and fill that array in the other function files. So I can call the right function based on a device function identifier in the generic file.
+What I have right now:
+// in generic.h:
+typedef void (*func_ptr_t[])(arguments);
+extern func_ptr_t devFunctions[3];
+
+And I would like to:
+// in function1.c:
+#include "generic.h"
+
+devFunctions[1] = &functionName;
+
+But then it complains about a type specifier missing AND the array initializer must be a list. If I add the type like
+func_ptr_t devFunctions[1] = &functionName;
+
+I get an error about an incomplete element type 'func_ptr_t'.
+I can't initialize the entire array list from one file since it is filled from multiple files.
+Anybody got an idea on how to tackle this?
+Thanks!
+-edit-
+Because you can't use statements outside of functions I've changed my application. Now it does not use an array anymore and it updates the function pointer in the generic.c upon calling the specific function file.
+So the end result:
+In generic.h:
+typedef void (*func_ptr_t)(<function arguments>)
+
+In generic.c:
+func_ptr_t devFunction;
+
+In function1.c:
+#include "generic.h"
+extern func_ptr_t devFunction;
+
+void functionToBeCalledFromMain( void ){
+    devFunction = functionName;
+}
+
+void functionName (void ){
+    // Function to be called from generic.c via function pointer
+}As most of you pointed out, filling the array is a statement which can't be put outside a function (duh...). So what I wanted is not really going to work in this case. I rewritten my application to update a function pointer (not an array anymore) on every run with the function I need. Saves a lot of trouble :)
+Thanks guys!Putting the above comments together, you probably wanted
+typedef void (*func_ptr_t)(arg_type_list);For an example about functions of the type int f(int);, you can check :
+/* function definition */
+int functionName(int arg)
+{
+    /* do things */
+    return arg * 2;
+}
+
+/* create the type "function pointer int->int" */
+typedef int (*func_ptr_t)(int);
+
+/* create the array */
+func_ptr_t devFunctions[3];
+
+int main(void)
+{   
+    /* associate the good function */
+    devFunctions[0] = &functionName;
+
+    /* call it with an arg */
+    return devFunctions[0](42);
+}Same memory address for different processesI just can't figure out why this code works the way it does (rather than I'd expect):
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <sys/wait.h>
+ #include <sys/types.h>
+
+ int main()
+ {
+     int buffer;
+     int* address;
+
+     address=&buffer;
+
+
+     if(fork()==0)
+     {
+         *address=27;
+         printf("Address %ld stores %d\n",(long)address,*address);
+         exit(0);
+     }
+     wait(NULL);
+
+     printf("Address %ld stores %d\n",(long)(&buffer),buffer);    
+     return 0;
+ }
+
+Why does the system store different variables even if they're pointed to the same memory address?
+NOTE: I never really expected this code to work, since otherwise the whole bunch of pipes and stuff wouldn't make any sense; I'd just like to understand what's going on here.This isn't really a C question, it's about the behavior of (modern) operating systems.
+In short: A userspace program on a modern OS runs in some private virtual address space. When accessing memory, the virtual address is translated to a physical address. The mapping between actual memory and virtual address space is set up by the operating system -- the memory is split into pages and a page can be "mapped" into the address space of a process.
+fork() typically just maps the same memory to the second process it creates, but as soon as this memory is written to, the page is copied and the copy is mapped ("copy on write"). A user space program will never see memory that is private to a different user space program.
+I'm sure you can easily find more details searching for the key words given in this answer.From wikipedia: The fork operation creates a separate address space for the child. The child process has an exact copy of all the memory segments of the parent process.
+So basically you create a new process with a different COPY of your original process memory.
+You change something on the duplicate process's memory, which is identical but a copy and expect to see it in the original.
+Normally, processes don't share memory directly.How to shift left n bits from 16 bytes array?I have a 16-byte array, and am trying to left-shift the number of bits - where the number to shift can vary from 1 to 10. I tried the code below, but it only works with a 4 bit shift:
+Rx_Table[16] = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0A, 0xBC};
+if (byteezy == 0x00 && byteezy1 == 0x10) {
+    int i;
+    uint8_t shifted = 0x00;
+    uint8_t overflow = (0xF0 & RxTable[0]) >> 4;
+
+    for (i = (16 - 1); i >= 0; i--) {
+        shifted = (RxTable[i] << 4) | overflow;
+        overflow = (0xF0 & RxTable[i]) >> 4;
+        RxTable1[i] = shifted;
+    }
+
+I am stuck: how to make this work when the number of bits to shift is variable?C Programming -Linked List Implementation with charactersMY CODE:
+#include<stdio.h>
+#include<stdlib.h>
+
+struct node{
+ char data;
+ struct node *next;
+};
+
+void main()
+{   char A;
+struct node *head,*ptr;
+ptr=(struct node *)malloc(sizeof(struct node));
+printf("Enter data for node 1 \n");
+scanf("%c",&ptr->data);
+head=ptr;
+int i=2;
+while(1)
+{
+    ptr->next=(struct node*)malloc(sizeof(struct node));
+    ptr=ptr->next;
+    printf("\nEnter data for node %d:::\n",i);
+    scanf("%c",&ptr->data);
+    ptr->next=NULL;
+    i=i+1;
+    printf("Do you want to continue Y OR N");
+    scanf("%c",&A);
+    if(A=='Y')
+        continue;
+    else
+        break;
+
+}
+
+struct node *temp;
+
+temp=head;
+while(temp!=NULL)
+{
+    printf("%c=>",temp->data);
+    temp=temp->next;
+}
+printf("NULL");
+
+
+
+
+
+}
+
+For this code I can only enter the first character data after that it is skipping the scanf portion within the while loop.
+But when I am doing the same code with integer it is giving me the right output.
+Here if I replace the same code instead of having characters I replace it by integers it works fine. 
+I couldnt find a way to fix it.
+Plz help.As stated in the comments your problem lies not in the linked list implementation, but in the code lines here. 
+scanf("%c",&ptr->data);    //line number 14
+
+scanf("%c",&ptr->data);    //line number 22
+
+scanf("%c",&A);            //line number 26
+
+in all these lines %c consumes the new line character(\n) instead of the users input.
+To correct the issue, you can place a whitespace in front of the %c like this, 
+scanf(" %c",&ptr->data);    //line number 14
+
+scanf(" %c",&ptr->data);    //line number 22
+
+scanf(" %c",&A);            //line number 26Why does pointer arithmetic need to be cast?If I wanted to iterate over a string, in this case 'test', I could use pointer arithmetic like so to get to the next character: 
+char *c = "test";
+*c++;
+putchar(*c);
+
+This would print the second letter 'e'.
+But, if I wanted to go to the third character, why can't I say:
+char *c = "test";
+c = *c + 2;        //*c = *c + 2; also doesn't work
+putchar(*c);       //Exception thrown: write access violation.
+
+?
+To my knowledge, the only way to get to the third character using pointer arithmetic is to cast it like so:
+char *c = "test";
+c = (char *) c + 2;
+putchar(*c);
+
+Can someone please explain to me why that is?c here is a pointer which holds the address of a memory location.
+*c is called de-referencing the pointer which will give the value stored in the memory location pointed by c.
+So
+c = *c + 2
+
+will be
+c = (value stored at c) + 2;
+
+which will not give the memory location like
+c = c + 2;In your first example, c++; simply adds one to c, no dereferencing, so why are you trying to dereference when adding 2?  Simply add 2 to the pointer value:
+char * c = "test";
+c = c + 2; //*c = *c + 2; also doesn't work
+putchar(*c);//Exception thrown: write access violation.Your first code fragment was
+char * c = "test";
+*c++;
+putchar(*c);
+
+and as you noted, it prints e.  But it's important to note that in the second line, the * is completely superfluous.  You've incremented c, and fetched the pointed-to-character -- and then thrown the pointed-to character away.
+It would have worked exactly the same -- and been more clear, with no confusing, extra operators -- if you had instead said
+char * c = "test";
+c++;
+putchar(*c);
+
+Next you wondered why you couldn't increment the pointer by 2.  But of course you can increment the pointer by two -- you could either say
+char * c = "test";
+c++;
+c++;
+putchar(*c);
+
+or
+char * c = "test";
+c += 2;
+putchar(*c);
+
+or
+char * c = "test";
+c = c + 2;
+putchar(*c);
+
+But you wrote
+c = *c + 2;
+
+That didn't work, and no surprise -- again, you have an unnecessary *, and here, it's not so harmless.  Here, you unnecessarily fetch the character that c points to, but instead of throwing it away, you add 2 to it, and then you try to assign the character to your original pointer variable.  Your compiler probably complained about this -- assigning a character to a pointer is meaningless.  It's as if you had said
+c = 'x';
+
+It looks like you may be unsure about what * means in C.  It is not just a marker that says "this variable is a pointer".  It is an operator that actively fetches the value pointed to by the pointer.
+Whenever you're working with pointers, you have to keep clear in your mind the very important distinction between the value of the pointer versus the value pointed to by the pointer.
+Going back to your original example, when you said
+char * c = "test";
+
+the value of the pointer c is "pointer to the first character of the string", and the value pointed to by the pointer is "the character t".
+If you say
+c++
+
+you increment the value  of the pointer.  Now it points at the second character of the string, and the value pointed to is the character e.
+If c is a pointer, then any time I mention c by itself in an expression, I am referring to the value of the pointer.  But any time I stick the operator * in front of it, I am referring to the value pointed to by the pointer.Lets understand the code below:
+char * c = "test";
+c = *c + 2; //*c = *c + 2; also doesn't work
+putchar(*c);//Exception thrown: write access violation.
+
+First statement says that you have an character array whose starting address is stored in variable c. Char are stored as ASCII value in memory.
+Second statement says take value at address in location pointed to by c (ASCII of 'e' is 0x65) add 2 to it and save it as new address. Variable c now contains 0x67.
+Third statement says print value as address stored in c (which is now 0x67). As we do not have access to this memory location an exception is thrown.
+You would want to increment memory location pointed to by c and print the content. For that you would need to do:
+char * c = "test";
+c = c + 2; //Moves the pointer by 2 bytes
+putchar(*c); //Print the character at that memory locationAndroid NDK socket connect() returning 0 when it should fail whilst on 3gI have written a socket in the android NDK and a server in c. It is able to connect to the server fine. However if the server is down or I try to get it to connect to a different random IP the call to connect still returns 0 when it should return -1.
+Here is the code for the client:
+#include <stdio.h>
+#include <jni.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <android/log.h>
+#include <unistd.h>
+
+#define APPNAME "MyApp"
+#define logcat(...)  __android_log_print(ANDROID_LOG_VERBOSE, APPNAME, __VA_ARGS__)
+
+
+int createSocket() {
+    int sockFD;
+    if ((sockFD = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        logcat("Unable to create socket");
+        return -1;
+    }
+
+    logcat("Socket created: %i", sockFD);
+    return sockFD;
+
+
+}
+JNIEXPORT jint JNICALL
+Java_myapp_client( JNIEnv* env,
+                                      jobject thiz ) {
+    struct sockaddr_in server;
+    int sockFD, new_socket;
+    char * message;
+    if ((sockFD = createSocket()) < 0) {
+        return -1;
+    }
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = inet_addr(server ip);
+    server.sin_port = htons(8888);
+    new_socket = connect(sockFD, (struct sockaddr *)&server, sizeof(server));
+    logcat("Connect return value: %i", new_socket);
+
+    int rtn = recv(sockFD, message, sizeof(char), 0);
+    logcat("Message: %i", rtn);
+
+    close(sockFD);
+
+    return 1;
+}
+
+A valid descriptor is made for the socket, the return values for connect and recv are zero when I run this without my server running. Might be worth noting the android device is connected to the internet over mobile internet.I removed android specific parts
+#include <stdio.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+
+int createSocket() {
+    int sockFD;
+    if ((sockFD = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("Unable to create socket");
+        return -1;
+    }
+
+    printf("Socket created: %i", sockFD);
+    return sockFD;
+
+
+}
+int main() {
+    struct sockaddr_in server;
+    int sockFD, new_socket;
+    char * message;
+    if ((sockFD = createSocket()) < 0) {
+        return -1;
+    }
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server.sin_port = htons(8888);
+    new_socket = connect(sockFD, (struct sockaddr *)&server, sizeof(server));
+    printf("Connect return value: %i", new_socket);
+
+    int rtn = recv(sockFD, message, sizeof(char), 0);
+    printf("Message: %i", rtn);
+
+    close(sockFD);
+
+    return 1;
+}
+
+This works as expected. Try it yourself by connecting to 127.0.0.1. If there is no server running on your host machine then it will fail to connect (connect will return -1 and errno will be set appropriately). 
+Make sure the IP address you are using for connection is really pointing to your server. 
+Also there is a problem in recv:
+int rtn = recv(sockFD, message, sizeof(char), 0);
+
+Variable message is a pointer that has not be assigned to any memory (it contains some stack garbage value) and you are overwriting it. See manual for recv (2).
+To fix this you should either assign your pointer to some allocated memory:
+message = malloc(1); //char is always a single byte
+
+or use stack instead of heap for storing the message byte:
+char message;
+...
+int rtn = recv(sockFD, &message, sizeof(char), 0);
+
+I assumed your message is always a single byte. 
+Keep in mind that in here:
+printf("Message: %i", rtn);
+
+you are printing the return code not the actual message.Delete record binary file cI just made a program to delete a record from a binary file, but the problem is even if the program finds a match with the name, it does't actually delete it from the file when I write the records on a temporary file. Do I get wrong in the else condition perhaps?
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int dd;
+    int mm;
+    int yyyy;
+}date;
+
+struct _food
+{
+    char category[20];
+    char name[30];
+    int amount;
+    data expiry;
+    int calories;
+} food;
+int main()
+{
+    FILE* fba;
+    FILE* temp;
+    int found = 0;
+    char nome_t[30];
+    char newname[] = "alimenti.bin";
+    char oldname[] = "temp.bin";
+    fba = fopen("alimenti.bin", "rb");
+    temp = fopen("temp.bin", "wb");
+
+    printf("Type the name of the food you want to delete:\n");
+    gets(nome_t);
+    while(fread(&food,sizeof(food),1,fba))
+    {
+        if(strcmp(nome_t,food.name) != 0)   
+        {
+            fwrite(&food,sizeof(food),1,temp);
+
+        }
+        else{
+            found = 1;
+            printf("Match found. Food deleted.\n");
+
+        }
+
+    }
+    if (!found){
+        printf("No match.\n");
+
+    }
+
+    fclose(fba);
+    fclose(temp);
+    remove(oldname);
+    rename(oldname,newname);
+    system("PAUSE");
+    return 0;
+
+
+}You are removing the updated file (temp.bin, aka oldname) :
+remove(oldname);
+
+before you attempt to replace the original file (alimenti.bin, aka newname) with it :
+rename(oldname,newname);
+
+Did you mean :
+remove(newname);unable to get preprocessed source file or object file if I include header from a different directorymy folder/file structure:
+testing
+    folder
+        head.h
+    main.c
+
+main.c
+#include "head.h"
+int main(){
+foo(3);
+return 1;
+}
+
+head.h
+void foo(int x){
+x = 5;
+}
+
+in cmd I go to "testing" folder and type in:
+
+gcc -c -lfolder main.c -o main.o
+
+but that gets me an error:
+
+main.c:1:18: fatal error: head.h: No such file or directory
+  #include "head.h"
+
+From what I understand, flag -ldir_name specifies that compiler should look inside of that folder for any #include files.
+Can you please help me undersand what I am doing wrong. I also tried getting preporcessor's output:
+
+gcc -E -lfolder main.c -o main.i
+
+again this should look for head.h in "folder", paste its content inside of main.cfprintf/fputs vs cout performance for large stringsWhen I made tests on fprintf(), fputs(), and ofstream operator (<<), I realized C functions(both) offer better run-time performance, but when input strings get larger, both C functions run slower than C++'s operator. 
+I wonder the reason of bad performance of C++ on small strings, and the reason why it outperforms the C for larger strings.
+Appreciate it.
+Note: Unfortunately, I couldn't share the strings for size 1000+ chars.
+Test Results 
+- String Size -> 20 chars, C++(<<): 0,80 C(fprintf): 0,50 C(fputs):
+   0,20
+- String Size -> 50 chars, C++(<<): 1,06 C(fprintf): 0,80 C(fputs):
+   0,35
+- String Size -> 1000 chars, C++(<<): 6,39 C(fprintf): 8,35 C(fputs):
+   5,01
+
+-  String Size -> 2000 chars, C++(<<): 12,33 C(fprintf): 16,84 C(fputs):
+   9,06
+
+-   String Size -> 50000 chars, C++(<<): 0,20 C(fprintf): 0,39 C(fputs):
+   0,27 (1000 runs instead of 1 million runs)
+
+-   String Size -> 100000 chars, C++(<<): 0,40 C(fprintf): 0,45 C(fputs):
+   0,74 (1000 runs instead of 1 million runs)
+
+Here is the code
+#include <iostream>
+#include <fstream>
+#include <string.h>
+#include "Stopwatch.h"
+
+using namespace std;
+
+void testNewline(string test_str,int run){
+    StopWatch timer;
+    ofstream outdata("writeToFile-CPP-newline.txt");
+    timer.start();
+    for (int i = 0 ; i < run ; i++){
+        outdata << i << ":" << test_str << "\n";
+    }
+    timer.stop();
+    outdata.close();
+    cout << "C++ Time spent:  - " << timer.seconds() << endl;
+}
+
+int main() {
+    int run = 1000000;
+    string test_str(str100);
+    size_t len = test_str.length();
+    cout << "Write File - " << run << " Runs\n";
+    cout << "Length is " << len << " chars\n";
+
+    testNewline(test_str,run);
+
+    return 0;
+}
+
+Stopwatch.h - Cpp
+#include <time.h>
+#ifndef STOPWATCH_H_
+#define STOPWATCH_H_
+
+#define str20 "a very long literal "
+#define str50 "a very long literal string a very very long string"
+#define str100 "a very long literal string a very very long stringa very long literal string a very very long string"
+#define str1000 ...
+#define str2000 ...
+#define str50000 ...
+
+class StopWatch{
+private:
+    clock_t start_;
+    clock_t end_;
+    bool isRunning_;
+public:
+    void start(){
+        start_ = clock();
+        end_ = 0;
+        isRunning_ = true;
+    }
+
+    void stop(){
+        if(isRunning_){
+            end_ = clock();
+            isRunning_ = false;
+        }
+    }
+
+    double seconds() const
+    {
+        return double (end_ - start_) / CLOCKS_PER_SEC;
+    }
+
+    StopWatch(): start_(), end_(), isRunning_() {}
+};    
+#endif /* STOPWATCH_H_ */
+
+WriteFile.c
+#include <stdio.h>
+#include <stdlib.h>
+#include "Stopwatch.h"
+
+int main(void) {
+
+    const int run = 1000000;
+    int i;
+    size_t len = strlen(str100);
+    char *test_str = (char *) malloc(sizeof(char)*(len+1));
+    strcpy(test_str,str100);
+
+    FILE *file = fopen("writeToFile-C.txt","w");
+    clock_t start_ = start();
+    for (i = 0; i < run ; i++){
+        fputs(test_str,file);
+    }
+    clock_t end_ = stop();
+    fclose(file);
+
+    printf("Write File - %d Runs\nString Length is %d chars\nC (fputs) Time spent: %.2f seconds\n",run,len,seconds(start_,end_));
+
+    FILE *file2 = fopen("writeToFile-C-2.txt","w");
+    clock_t start2_ = start();
+    for (i = 0; i < run ; i++){
+        fprintf(file2,"%d:%s\n",i,test_str);
+    }
+    clock_t end2_ = stop();
+    fclose(file2);
+
+    printf("Write File - %d Runs\nString Length is %d chars\nC (fprintf) Time spent: %.2f seconds\n",run,len,seconds(start2_,end2_));
+
+    return EXIT_SUCCESS;
+}
+
+StopWatch.h - C 
+#include <time.h>
+#include <string.h>
+#ifndef STOPWATCH_H_
+#define STOPWATCH_H_
+
+#define str20 "a very long literal "
+#define str50 "a very long literal string a very very long string"
+#define str100 "a very long literal string a very very long stringa very long literal string a very very long string"
+#define str1000 ...
+#define str2000 ...
+#define str50000 ...  
+
+clock_t start(){
+    return clock();
+}
+
+clock_t stop(){
+    return clock();
+}
+
+double seconds(clock_t start, clock_t end)
+{
+    return (double) (end - start) / CLOCKS_PER_SEC;
+}
+
+#endif /* STOPWATCH_H_ */
+
+I used MinGW Compiler.  
+Compile code for C++ : g++ -O3 -Wall -c
+Compile code for C: gcc -O3 -Wall -c  
+Edit: I am not worried about the insignificant difference for small strings, but it is an academic curiosity.This is an interesting question.  The question, restated, is: why are fputs and fprintf faster for short strings, while << to cout is faster for longer strings?
+I suspect, as suggested in some of the comments, that << to cout is faster because C++ strings carry their size up-front and explicitly.  C-style strings, on the other hand, require scanning to find the terminating '\0', which is an additional expense.
+However, the overhead of << and cout is greater, so its advantages are not seen for shorter strings.
+I wrote another version of your program (attached below) and tried it on various string sizes and numbers of trials, with these results on my machine.  I also threw the stdio function fwrite into the mix.
+string length   trials       cout     fprintf  fputs    fwrite
+10              100000000    9        8        8        7
+100             100000000    10       9        8        8
+1000            100000000    14       17       18       12
+10000           10000000     6        10       10       6
+100000          1000000      4        10       9        4
+1000000         1000000     11        72       71       10
+10000000        100000       7        95       94       8
+
+Presumably the important distinction is that fprintf and fputs have to print the characters while simultaneously checking each one to see whether it's \0.  cout and <<, on the other hand, like fwrite, know the count of characters up front, and so can blindly write exactly that many.
+The power and flexibility of cout and << come at a (small) price, but it seems to be a one-time cost, per "call" rather than per character written.
+And then fwrite, which also knows the count up front, does just as well as cout, or better.  It looks like cout somehow ekes out a win on the last, hugest trial, which is a bit of a surprise.  It may just be because every call to fwrite has to pass four arguments, and fwrite has to do an extra multiplication of nels × elsize.
+But with all of this said, any time we're examining performance, it's important to remember that If you have to perform millions of carefully-controlled trials just to detect a small difference, the difference probably doesn't matter in practice.  Use the style of i/o that's most natural for you, the problem you're solving, and the language you're using.  Unless you're writing a high-performance program that's i/o intensive, it probably won't matter which i/o calls you use.
+In particular, I cheated: I ran all of my trials with standard output redirected to /dev/null, to minimize the i/o time, and maximize any actual computational differences between the four methods under test.  If the output had been "real" -- to a file, pipe, or network stream -- I suspect it would have dominated the performance, and I would have had to perform many more trials to show any difference between the methods.
+Finally, here's the program I used:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <string>
+#include <iostream>
+
+int main(int argc, char *argv[])
+{
+    int n = atoi(argv[1]);
+    int m = atoi(argv[2]);
+    char *p = (char *)malloc(n);
+    memset(p, 'x', n-2);
+    p[n-2] = '\n';
+    p[n-1] = '\0';
+    std::string s = p;
+    int i;
+    time_t t1, t2, t3, t4, t5;
+
+    t1 = time(NULL);
+    for(i = 0; i < m; i++)
+        std::cout << s;
+    t2 = time(NULL);
+    for(i = 0; i < m; i++)
+        fprintf(stdout, "%s", p);
+    t3 = time(NULL);
+    for(i = 0; i < m; i++)
+        fputs(p, stdout);
+    t4 = time(NULL);
+    for(i = 0; i < m; i++)
+        fwrite(p, 1, n, stdout);
+    t5 = time(NULL);
+
+    fprintf(stderr, "cout %ld ",    t2-t1);
+    fprintf(stderr, "fprintf %ld ", t3-t2);
+    fprintf(stderr, "fputs %ld ",   t4-t3);
+    fprintf(stderr, "fwrite %ld\n", t5-t4);
+}Identify C functions (opening and closing braces) in a fileI have a C file in which I would like to add a print at the beginning and end of each function that includes file name, function name and line number.
+I am trying to automate this for an entire folder of C files using python.
+Example: For function add in math.c file 
+int add(int a, int b){
+   sum = a +b;
+   return sum;
+}
+
+I would want the result file to look something like this:
+int add(int a, int b){
+   printf("Math.c, add, 12");
+   sum = a +b;
+   return sum;     
+}
+
+I am looking at the regex as suggested in this link Using Python Regex to Find C function in File
+Any other suggestions? Ctags is the other option I am exploring, but I prefer using python libraries if any for this purpose.
+Edit:
+
+Running the code on a microcontroller
+Not using Linux
+Debugger with limited capabilities (can get printf only)You can use predefined macros such as __file__, __func__ and __line__. This would result in a common printf statement:
+printf("%s, %s, %d\n", __FILE__, __func__, __LINE__)
+
+which you need to add to each function.
+This question has already be similarly answered here: 
+Print the file name, line number and function name of a calling function - C ProgAddress as a operand in sizeof() operatorI was just trying an example and i tried to check the output when an address is passed as an argument in the sizeof
+operator and i got output of 4. Now my question is when you pass a pointer in sizeof operator why is it showing 4 bytes of memory when actually there is no pointer variable, it's just only an address?
+#include<stdio.h>
+int main()
+{
+  int a=1;
+  int c;
+  c=sizeof(&a);
+  printf("%d\n",c);
+  return 0;
+}It's because sizeof returns the size of a type, as per C11 6.5.3.4 The sizeof and _Alignof operators /2 (my emphasis):
+
+The sizeof operator yields the size (in bytes) of its operand, which may be an expression or the parenthesized name of a type. The size is determined from the type of the operand.
+
+The type of &a where a is an int is covered by 6.5.3.2 Address and indirection operators /3 in the same standard:
+
+The unary & operator yields the address of its operand. If the operand has type "type", the result has type "pointer to type".
+
+In other words, int a; sizeof(&a) is functionally equivalent to sizeof(int *).sizeof operator works on the type of the operand.
+Quoting C11, chapter §6.5.3.4 (emphasis mine)
+
+The sizeof operator yields the size (in bytes) of its operand, which may be an
+  expression or the parenthesized name of a type. The size is determined from the type of
+  the operand. [....]
+
+&a is of type int *, so your statement is the same as sizeof(int *). The result, is the size of a pointer (to integer), in your platform.
+That said, sizeof produces a type of size_t as result, 
+
+use a variable of type size_t
+use %zu to print the result.Handling errors of posix_spawn()I've found an example code using posix_spaw() from here.
+In that page, run_cmd() is defined like below.
+void run_cmd(char *cmd) {
+    ...
+    status = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
+    if (status == 0) {
+        printf("Child pid: %i\n", pid);
+    } else {
+        printf("posix_spawn: %s\n", strerror(status));
+    }
+}
+
+My question is "Is it okay to give return value of posix_spawn() to strerror() as an argument".
+If it is not okay, what would be the best way to handle errors of posix_spawn()?Yes, posix_spawn() returns 0 on success and errno on failure. So it's OK to pass its result to strerror.
+According to the documentation:
+
+The posix_spawn() and posix_spawnp() functions fail only in the case
+         where the underlying fork(2) or vfork(2) call fails;  in these cases,
+         these functions return an error number, which will be one of the
+         errors described for fork(2) or vfork(2).
+In addition, these functions fail if:
+ENOSYS Function not supported on this system.
+
+Also from the source you can see that it simply returns errno.Entering password into terminal through cI searched for this question and could only find python variants. If this is a duplicate apologies upfront.
+I'm trying to write a script in c that auto setup systems so that I don't have too manually do it on heaps of computers. For part of the script I need to enter a password.If you have access to the terminal, why not use bash for these setups? In both instances of C, or bash, if you're accessing high privilege level areas, you'll need privilege access. The thing you'd be looking for would be a sudo command. It'll prompt you for the password prior to running it, and is just ran as follows:
+sudo someExecutableSome programs (that prompts for password) use isatty(STDIN_FILENO) call for ensuring that password is typed via terminal.
+In that case it not possible use normal pipes for sending password to the program.
+For those programs, you can create a pseudo terminal, that is used instead of a pipe. Example:
+void test(void)
+{
+    const int fdm = posix_openpt(O_RDWR | O_NOCTTY);
+    if (fdm != -1)
+    {
+        char name[100];
+        unlockpt(fdm);
+        ptsname_r(fdm, name, sizeof(name));
+
+        const int fds = open(name, O_RDWR | O_NOCTTY);
+        if (fds != -1)
+        {
+            const pid_t child_pid = fork();
+
+            if (child_pid == -1)
+            {
+                // TODO: Error handling
+            }
+            else if (child_pid == 0)
+            {
+                dup2(fds, STDIN_FILENO);
+                dup2(fds, STDOUT_FILENO);
+                close(fds);
+                close(fdm);
+                execl("/sbin/program_that_requires_password_from_terminal", "blabla", (char*) NULL);
+            }
+            else
+            {
+                const char password[] = "mypassword\n";
+                int status;
+                close(fds);
+                // TODO: wait prompt from the program by reading fdm
+                write(fdm, password, strlen(password));
+                waitpid(-1, &status, 0);
+                close(fdm);
+            }
+        }
+    }
+}
+
+In that way isatty(STDIN_FILENO) in the target program returns 'true'.Key-Value pair in C?I have a string in the format of 
+"SERVERID=12345\nSERVERKEY=asdasw\nSERVERAPPID=123213\n"
+
+I've parsed this line by line using strtok().
+Is there a way to make a key-value pair of each line? Like maybe store them in some sort of an array? What I mean is, if I want SERVERID, I just say Array['SERVERID'] and it'll return 12345 as the value. Is there a way to do it in C?Standard C doesn't give you any "container types" like the one you're looking for. Still you have several options to solve your problem:
+
+Might sound silly, but you could switch to a different language. It's at least something to think about. For example, C++ comes to mind, offering the std::map type.
+Use some third-party library. A popular choice is GLib, it offers a hash table you could use.
+There's always the option to implement it yourself. A very simple idea would be to use an array of a struct, e.g.
+struct stringpair {
+    char *key;
+    char *value;
+};
+
+struct stringpair *table;
+
+// ...
+size_t entries = 42; // number of entries you found
+table = malloc(entries * sizeof *table); // check for NULL after this
+
+// look for an entry:
+char *value = 0;
+for (size_t i = 0; i < entries; ++i)
+{
+    if (!strcmp(table[i].key, "SERVERID"))
+    {
+        value = table[i].value;
+        break;
+    }
+}
+
+This is of course a very basic solution and doesn't perform well with a lot of entries. I also didn't test this code, it's just to give you a rough idea. If you need fast lookups, you will need to implement a hashtable instead, or use option 1 or 2.What you're looking for here would be a form of a dictionary. Typically, but not always, these use hashtables. There are many ways of creating a hashtable in C
+You can find your answer here:
+What is a hash table and how do you make it in C?
+You could also see other implementations such as a combined data structures, like a dictionary-linked list, and more. Just find a way to convert your string (char *) into a number, and find a way to use that number as an index.Why does memcpy return string is never equal to the same string present in an array?I am using a simple string matching and searching.
+Why does *arr is never equal to point though their values(why does I) are same? I am confused what is the cause of this?Is it related to strings or is there any other reason? Any help would be appreciated. I am sorry if the question is not clear. 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int search(char ** arr, int size, char *point);
+
+int main()
+{
+    char *array[5]={0};
+    char original[50];
+    char toSearch[50];
+    char *point;     
+    int size=5,  searchIndex,i;
+
+    /* Copy a string into the original array */
+    strcpy(original, "why this is not equal");
+
+    /* Copy the first 10 characters of the original array into the newcopy    array*/
+    point = memcpy(toSearch, original, 10);
+
+    /*string to search*/     
+    array[2]="why this i";
+
+    searchIndex = search(array, size, point);
+
+    if(searchIndex == -1)
+    {
+        printf("%s does not exists in array \n", point);
+    } else
+    printf("%s is found at %d position.", toSearch, searchIndex + 1);
+
+    return 0;
+}
+
+int search(char ** arr, int size, char *point)
+{
+    int index = 0;
+    // Pointer to last array element arr[size - 1]
+    char ** arrEnd = (arr + size - 1);
+
+    /* Why *arr!=point is never false,
+       even when both are giving out same values (why this I)?
+    */
+    while(arr <= arrEnd && *arr!=point)
+    {
+        printf("%s == %s", *arr,point);
+        arr++;
+        index++;
+    }
+
+    if(arr <= arrEnd)
+    {
+        printf("%s after found \n",*arr);
+        return index;
+    }
+
+    return -1;
+}
+
+Output:
+(null) == why this i 
+(null) == why this i   
+why this i == why this i  
+(null) == why this i   
+(null) == why this i 
+why this i does not exists in array
+
+Thank YouI assume that you are asking why the address of the variable of type array-of-char is not identical to the address of the string literal you copy to it.
+This is a tricky question, because, excuse me for saying so, it is unclear what could make you expect the address of any variable be different after copying something to it.
+Consider the example of not one but two different arrays of char being filled with the same string literal.
+char toSearch1[50];
+char toSearch2[50];
+char *point1;
+char *point2;
+
+point1 = memcpy(toSearch1, original, 10);
+point2 = memcpy(toSearch2, original, 10);
+/* or, depending on what to you is more convincingly copying the same literal */
+point2 = memcpy(toSearch2, toSearch1, 10);
+
+Afterwards, the two arrays are still two different variables of type array-of-char and memcpy returns the address of the destination, i.e. of the two different arrays.
+Please imagine how those two arrays could have identical address now.
+If you follow up with
+strcpy(original1, "is this in one or both arrays?");
+
+Would you then expect the two arrays to have different addresses again?
+If this does not answer your question, you have a fundamentally different understanding of pointers and addresses of variables than most programmers and I recommend to revise it by finding a tutorial on pointers and addresses.
+(Note, for this explanation of what you are asking about I am skipping the discussion of checking lengths in relation to array sizes, using safer versions of string copying, memcpy not correctly null terminating copied strings. All of that is however important for making reliable code, as e.g. Lundin correctly reminds us.)In C, string are just null terminated char arrays. As ordinary arrays, they decay to pointers when directly used in expression. So when you write str1 == str2 you are just comparing the pointers to their first element.
+And two pointers are only equal if they point to the very same object (same address). That is the reason why standard library offers strcmp to compare null terminated strings, and memcmp to compare arbitrary buffers of known size.strftime and nonnormalized dates/timesMost definitions of strftime's %H, %M, and %S specifiers (including those in the ANSI/ISO C Standards) contain language like
+
+%H   is replaced by the hour (24-hour clock) as a decimal number (00-23).
+
+Now, that little notation "(00-23)" at the end tells you the
+range of numbers you're going to see if the struct tm you're
+printing was just created by localtime or gmtime.
+My question concerns the presence or absence of a requirement
+that the struct tm being referenced by strftime must have been
+one just generated by localtime or gmtime.  I don't think there's
+such a requirement, but if there isn't, those notations "(00-23)"
+and "(00-59)" don't really have any normative implications for
+strftime -- they're more of a misplaced requirement on the values
+generated by localtime and gmtime.
+But if strftime doesn't restrict the ranges of the various struct tm
+fields to their "normal" values, it makes me wonder how much
+latitude a push-the-boundaries programmer actually has when
+calling strftime.  Are the values as unlimited as they are when
+calling, say, mktime?
+To make the question more concrete, it came to me when I found
+myself writing this code:
+time_t dt = t2 - t1;
+struct tm *tmp = gmtime(&dt);
+if(dt > 86400)
+    tmp->tm_hour += dt / 86400 * 24;
+strftime(etbuf, sizeof(etbuf), "elapsed: %H:%M:%S", tmp);
+
+That is, I'm subtracting two times, and letting gmtime and
+strftime convert the difference to HH:MM:SS format for me.
+But if the time delta was more than a day, I'm not printing it
+as days; I'm just lumping it in with the hours (which, it's true,
+might end up being a very large number if there were months or
+years between t1 and t2).
+So, language lawyer question: Is this legal and portable?
+When calling strftime, are tm_hour, tm_min, and the rest
+limited to their normal ranges, or not?  (Yes, I've tried it,
+and nonnormalized values work -- not at all surprisingly --
+as expected under the popular implementations, but that's not
+the question.)
+[Full disclosure: I am posting the same question to the tz mailing list.]The C11 standard 7.27.3.5/3 says:
+
+If any of the specified values is outside the normal range, the characters stored are unspecified.
+
+Which I take to mean that the input must be normalized for the function to behave correctly; and a conforming implementation of strftime might operate by naively reading and displaying the values stored in the struct without performing any analysis on them.Why does shifting a variable by more than its width in bits zeroes out?This question is inspired by other questions from StackOverflow. Today, while browsing StackOverflow, I've come across an issue of bitshifting a variable by a value k that is >= the width of that variable in bits. This means shifting a 32-bit int by 32 or more bit positions.
+Left shift an integer by 32 bits
+Unexpected C/C++ bitwise shift operators outcome
+From these questions, it is obvious that if we attempt to shift a number by k bits that are >= the bit width of the variable, only the least-significant log2k bits are taken. For a 32-bit int, the least significant 5 bits are masked and taken to be the shift amount.
+So in general, if w = width of the variable in bits,
+x >> k becomes x >> (k % w)
+For an int, this is x >> (k % 32).
+
+The count is masked to five bits, which limits the count range to 0 to 31.
+
+So I've written a small little program to observe the behavior that should theoretically be produced. I've written in comments the resulting shift amount % 32.
+#include <stdio.h>
+#include <stdlib.h>
+
+#define PRINT_INT_HEX(x) printf("%s\t%#.8x\n", #x, x);
+
+int main(void)
+{
+    printf("==============================\n");
+    printf("Testing x << k, x >> k, where k >= w\n");
+
+    int      lval = 0xFEDCBA98 << 32;
+    //int      lval = 0xFEDCBA98 << 0;
+
+    int      aval = 0xFEDCBA89 >> 36;
+    //int      aval = 0xFEDCBA89 >> 4;
+
+    unsigned uval = 0xFEDCBA89 >> 40;
+    //unsigned uval = 0xFEDCBA89 >> 8;
+
+    PRINT_INT_HEX(lval)
+    PRINT_INT_HEX(aval)
+    PRINT_INT_HEX(uval)
+
+    putchar('\n');
+
+    return EXIT_SUCCESS;
+}
+
+And the output does not match the expected behavior of the shift instructions!
+==============================
+Testing x << k, x >> k, where k >= w
+lval    00000000 
+aval    00000000
+uval    00000000
+
+=====================================================================
+Actually I was a bit confused with Java. In C/C++, shifting an int by a number of bits greater than the bit width, could possibly be reduced k % w, but this is not guaranteed by the C standard. There is no rule which says that this kind of behavior should happen all the time. It is undefined behavior.
+However, this is the case in Java. This is a rule of the Java programming language.
+Bitshift operators description in Java language specification
+Weird result of Java Integer left shift
+java : shift distance for int restricted to 31 bitsThe linked questions specifically state that shifting by an amount greater than the bit width of the type being shifted invokes undefined behavior, which the standard defines as "behavior, upon use of a nonportable or erroneous program construct or of erroneous data, for which this International Standard imposes no requirements"
+When you invoke undefined behavior, anything can happen.  The program may crash, it may output strange results, or it may appear to work properly.  Also, how undefined behavior manifests itself can change if you use a different compiler or different optimization settings on the same compiler.
+The C standard states the following regarding the bitwise shift operators in section 6.5.7p3:
+
+The integer promotions are performed on each of the operands.  The
+  type of the result is that  of  the  promoted  left  operand.   If 
+  the  value  of  the  right  operand  is  negative  or  is greater than
+  or equal to the width of the promoted left operand, the behavior is
+  undefined.
+
+In this case it's possible that the compiler could reduce the amount to shift modulo the bit width, as you suggested, or it could treat it as mathematically shifting by that amount resulting in all bits being 0.  Either is a valid result because the standard does not specify the behavior.One reason for the undefined-ness is that the 8086, the original x86, did not mask any bits off the shift count. It instead literally performed the shifts, using one clock tick per position.
+Intel then realized that allowing 255+ clock ticks for a shift instruction perhaps wasn't such a good idea. They probably considered maximum interrupt response time, for example.
+From my old 80286-manual:
+
+To reduce the maximum execution time, the iAPX 286 does not allow shift counts greater than 31. If a shift count greater than 31 is attempted, only the bottom five bits of the shift count are used. The iAPX 86 uses all 8 bits of the shift count.
+
+That gave you different results for the exact same program on a PC/XT and a PC/AT.
+So what should the language standard say?
+Java solved this by not using the underlying hardware. C instead chose to say that the effect is unclear.C - Two Concurrently Running Programs need to Share data?I have two C programs that need to run simultaneously on a small computer in order to do some simulation. One program will receive user-input from a separate Windows machine, the other program will communicate with another separate machine in order to actually perform the simulation algorithms. They will both always be connected and always have ports open while the small computer is active.
+The problem I have run into is that the user-inputted information will be used within program running the algorithms, i.e.: the one not constantly listening for user input. I can't see myself merging the two programs as the simulation requires very fast communication, and can't be bogged down by listening on the other port. And this setup obviously prohibits simply linking the files or fancy header work.
+So, anyone have any ideas? One thing they could do is read/write data from/to a file in a hardcoded location, but that seems pretty cheesy. Should I just scrap the current outline of the project and go a different direction?
+Thanks in advance!If possible, I would build this as a single process running two threads, one listening for input from the Windows machine, the other running the simulation itself.
+This would make it fairly easy for the listening thread to simply update the data in-place, where the simulation thread will use it.
+The one tricky part is coordinating the two--if the simulation thread tries to read data while the listening thread is trying to write it, you're liable to get corrupted data.
+To avoid this, you could (for one example) have two separate data areas, one for the current data, and one for the next generation of data, as it's being updated by the listening thread.
+The listening thread and the simulation thread then have an atomic flag (or maybe two) to indicate which data area each should use at a given time.Running multiple make instances at a time results in errorsI have an LSF system where commands can be sent to different machines to execute at one time, with a shared filesystem. 
+I want to make different modules of my C program at one time. Like 'make reportmoduletestbench' and 'make parsemoduletestbench'
+When I run them sequentially, it's fine. But takes a long time of course.
+When I run them at the same I get errors like cannot find file and blahblah has a modification time of 0.0002 seconds into the future.
+It makes sense that I get errors like this but is there any way to still be able to run the makes at the same time and not get these errors?What is the behavioral difference between vTaskDelay and _delay_ms?1. Introduction
+I cannot seem to find information or a detailed explanation about the behavioral differences between the following functions in a FreeRTOS task:
+
+vTaskDelay
+_delay_ms
+
+2. Code
+Suppose you have the following codes:
+IdleHook + task creation
+Long value = 0;
+
+void vApplicationIdleHook( void ) {
+    while(1)
+    {
+        // empty
+    }
+}
+
+int main(void)
+{
+     xTaskCreate(TaskIncrement, (const portCHAR *)"up" , 256, NULL, 2, NULL );
+     xTaskCreate(TaskDecrement, (const portCHAR *)"down" , 256, NULL, 1, NULL );
+
+     vTaskStartScheduler();
+}
+
+Tasks with vTaskDelay
+static void TaskDecrement(void *param)
+{
+    while(1)
+    {
+        for(unsigned long i=0; i < 123; i++) {
+            //semaphore take
+            value--;
+            //semaphore give
+        }
+        vTaskDelay(100);
+    }
+}
+
+static void TaskIncrement(void *param)
+{
+    while(1)
+    {
+        for(unsigned long i=0; i < 123; i++) {
+            //semaphore take
+            value++;
+            //semaphore give
+        }
+        vTaskDelay(100);
+    }
+}
+
+Tasks with _delay_ms
+static void TaskDecrement(void *param)
+{
+    while(1)
+    {
+        for(unsigned long i=0; i < 123; i++) {
+            //semaphore take
+            value--;
+            //semaphore give
+        }
+        _delay_ms(100);
+    }
+}
+
+static void TaskIncrement(void *param)
+{
+    while(1)
+    {
+        for(unsigned long i=0; i < 123; i++) {
+            //semaphore take
+            value++;
+            //semaphore give
+        }
+        _delay_ms(100);
+    }
+}
+
+3. Question
+What happens with the flow of the program when the tasks are provided with a vTaskDelay versus _delay_ms?
+Note: the two given example tasks have different priorities.From https://www.freertos.org/Documentation/FreeRTOS_Reference_Manual_V10.0.0.pdf:
+
+Places  the task  that  calls  vTaskDelay() into  the  Blocked  state  for  a  fixed number  of  tick interrupts. Specifying  a  delay  period  of  zero ticks  will  not result  in  the  calling  task being  placed  into  the Blocked state, but will result in the calling task yielding to any Ready state tasks that share its priority. Calling vTaskDelay(0) is equivalent to calling taskYIELD().
+
+I think you get the idea already, but if you have multiple tasks created, then vTaskDelay() will put the running task into the "Blocked" state for the specified number of tick interrupts (not milliseconds!) and allow the task with the next highest priority to run until it yields control (or gets preempted, depending on your FreeRTOS configuration).
+I don't think _delay_ms() is part of the FreeRTOS library.  Are you sure it's not a platform specific function?  My guess is, if the highest priority task calls _delay_ms(), then it will result in a busy wait.  Otherwise, a task with a higher priority may preempt the task that calls _delay_ms() as it is delaying (that is, _delay_ms() will not yield control immediately).
+Perhaps a better summary of the above: in a multitasking application, _delay_ms() is not deterministic.Unable to allocate CUDA device memory for cufftComplex data typeI am trying to allocate a cufftComplex array into memory on a CUDA device (GEFORCE GTX 1080) using the following code:
+cufftComplex *d_in, *d_out;
+int ds = sizeof(cufftComplex) * width * height;
+CUResult test_din = cuMemAlloc((void**)&d_in, ds);
+CUResult test_dout = cuMemAlloc((void**)&d_out, ds);
+printf("test_din:  %s\n", cudaGetErrorString(test_din));
+printf("test_dout:  %s\n", cudaGetErrorString(test_dout));
+
+When I run this code the error that I get is:
+
+test_din:  initialization error
+test_dout:  initialization error
+
+When I compile the code I do get a warning about using void** but all the examples of cufft that I've seen, including the code samples that come with Cuda 9.1, include the void** type cast.  The warning is worded as follows:
+
+/usr/local/cuda/include/cuda.h:90:49: note: expected 'CUdeviceptr *' but argument is of type 'void **'
+
+Is there something obvious that I am doing wrong here?cuMemAlloc is from the CUDA driver API.
+If you study any proper driver API programs, you will find that one of the first things you need to do is to issue:
+cuInit();
+
+to start using CUDA.  Perhaps you have not done that (you are supposed to provide a MCVE).  That is a likely reason for this particular error.
+You will run into other disconnects between the CUDA driver API and CUDA runtime API if you intermix the two.  It should not be necessary for most codes, and I don't recommend it for beginners.
+Study sample codes to learn how to use one or the other.  For example, study the vectorAdd sample code to learn the basics of a CUDA runtime API program.  Study the corresponding vectorAddDrv to learn the basics of a CUDA driver API program.
+The easiest fix here is probably just to replace your calls to cuMemAlloc with cudaMalloc:
+cufftComplex *d_in, *d_out;
+int ds = sizeof(cufftComplex) * width * height;
+cudaError_t test_din = cudaMalloc((void**)&d_in, ds);
+cudaError_t test_dout = cudaMalloc((void**)&d_out, ds);
+printf("test_din:  %s\n", cudaGetErrorString(test_din));
+printf("test_dout:  %s\n", cudaGetErrorString(test_dout));How to encode 3840 nb_samples to a codec that asks for 1024 using ffmpegFFmpeg has an example muxing code on https://ffmpeg.org/doxygen/4.0/muxing_8c-example.html
+This code generates frame by frame video and audio. What I am trying to do is to change 
+ost->tmp_frame = alloc_audio_frame(AV_SAMPLE_FMT_S16, c->channel_layout,
+                                       c->sample_rate, nb_samples);
+
+to
+ost->tmp_frame = alloc_audio_frame(AV_SAMPLE_FMT_S16, c->channel_layout,
+                                       c->sample_rate, 3840);
+
+so that it generates 3840 samples per channel instead of 1024 samples which is the default for nb_samples (aac codec).
+I tried to combine code from https://ffmpeg.org/doxygen/4.0/transcode_aac_8c-example.html which has an example on buffering the frames.
+My resulting program crashes when generating audio samples after a couple of frames when assigning *q++ a new value at the first iteration:
+/* Prepare a 16 bit dummy audio frame of 'frame_size' samples and
+ * 'nb_channels' channels. */
+static AVFrame *get_audio_frame(OutputStream *ost)
+{
+    AVFrame *frame = ost->tmp_frame;
+    int j, i, v;
+    int16_t *q = (int16_t*)frame->data[0];
+    /* check if we want to generate more frames */
+    if (av_compare_ts(ost->next_pts, ost->enc->time_base,
+                      STREAM_DURATION, (AVRational){ 1, 1 }) >= 0)
+        return NULL;
+    for (j = 0; j <frame->nb_samples; j++) {
+        v = (int)(sin(ost->t) * 10000);
+        for (i = 0; i < ost->enc->channels; i++)
+            *q++ = v;
+        ost->t     += ost->tincr;
+        ost->tincr += ost->tincr2;
+    }
+    frame->pts = ost->next_pts;
+    ost->next_pts  += frame->nb_samples;
+    return frame;
+}
+
+Maybe I don't get the logic behind encoding.
+Here is the full source that i've come up with:
+https://paste.ee/p/b07qf
+The reason i am trying to accomplish this task is that I have a capture card sdk that outputs 2 channel 16 bit raw pcm 48000Hz which has 3840 samples per channel and I am trying to encode its output to aac. So basically if I get the muxing example to work with 3840 nb_samples this will help me understand the concept.
+I have already looked at How to encode resampled PCM-audio to AAC using ffmpeg-API when input pcm samples count not equal 1024 but the example uses "encodeFrame", which the examples on ffmpeg documentation doesn't use or I am mistaken.
+Any help is greatly appreciated.Ok here is the solution for anyone interested. 
+Since the codec accepts 1024 samples, we need to put 1920 samples into a buffer and feed the codec 1024 samples at a time.
+I barrowed buffering code from : How to encode resampled PCM-audio to AAC using ffmpeg-API when input pcm samples count not equal 1024Alternative to writing the same code before the loopI want to make the for loop execute the code in the beginning. However, my beginning state is same as my ending state. Is there any way I can execute the code without writing it before the loop?
+for(int i = queue1->front; 
+    i%queue1->size != queue1->front; 
+    i++) {
+    //some code
+}
+
+In the code, I am using a circular array and I want to print that using a loop.Aside from using a do-while-loop you could use a flag to enter the loop in any case like this:
+int first = 1;
+for (int i = queue1->front; i%queue1->size != queue1->front || first; i++){
+    first = 0;
+    //some code
+}
+
+You can even integrate it directly into the for loop header, if you like:
+for (int i = queue1->front, f=1; i%queue1->size != queue1->front || f; i++, f=0) {You can simply use a do while loop. The case where you want a loop that executes an arbitrary amount of times, but at least one is the typical use case for this kind of loop.
+int i = queue1->front;
+do { 
+    //some code
+    i++
+} while(i%queue1->size != queue1->front)
+
+Another option is to make sure that the condition in the for loop is true the first time. There are different ways to do this. One way is to use a flag.
+int flag = 1;
+for( ... ; ... || flag; ... ) {
+    flag = 0;
+    ...
+}
+
+You could use a goto. I would not recommend it though. 
+goto label;
+int i=queue1->front; // Init will be skipped
+                     // using this method
+for(...) {
+    label:
+    ...
+}
+
+If the reason that you don't want to write the code twice just is to avoid duplicated code, you could refactor it out to a function. Sure, you'll have to write the function name twice, but it may still be an improvement.
+myFunction();
+for(...) {
+     myFunction();
+}Misra compliant macro for Power of 2 in CI have the following macro
+#define POWER_OF_TW0(x) ( ((x) > 0)  && (!((x)&((x) - 1))))
+
+In order to make it misra compliant i tried
+#define POWER_OF_TW0(x) ( ((x) > 0)  && (!((unsigned)(x)&((unsigned)(x) - 1u))))
+
+But this is still not misra compliant, because if the code is as below
+uint8_t val = 4;
+if(POWER_OF_TWO(val))
+{
+   ..
+}
+
+The misra tool will complain for unsigned number compared with signed number 0 ((x) > 0).
+it will be happy if the declaration for val was signed e.g. int8_t.
+I feel the only way out is to consider this macro will be given positive numbers and change the code to ((x) != 0u) i.e;
+#define POWER_OF_TW0(x) ( ((x) != 0u)  && (!((unsigned)(x)&((unsigned)(x) - 1u))))
+
+Please let me know if there is an alternative solution.Use a static inline function instead of a macro. (MISRA advises against "macro functions" anyway, see this SO question, so you should do that in any case.) Once it's an inline function you can type x as unsigned to avoid a lot of casting, as well as the > 0u issue.C11 brings along with it _Generic which allows you to have macros that perform different actions based on the type passed into it. As an example with your POWER_OF_TWO, you could do something like this:
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#define POWER_OF_TWO(X) _Generic((X), \
+    uint8_t: ((X) != 0u)  && (!((X)&((X) - 1u))), \
+    int8_t:  ((X) > 0)  && (!((X)&((X) - 1))) \
+)
+
+int main( void ){
+   uint8_t a = 2;
+   int8_t b = 2;
+   printf("%d\n", POWER_OF_TWO(a));
+   printf("%d\n", POWER_OF_TWO(b));
+   a++;
+   b++;
+   printf("%d\n", POWER_OF_TWO(a));
+   printf("%d\n", POWER_OF_TWO(b));
+}
+
+Or, incorporating the suggestions by Doug Currie and Lundin to use inline functions which is prefix/postfix safe:
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+static inline _Bool power_of_two_int8(int8_t x) {
+   return (x > 0) && (!(x & (x - 1)));
+}
+
+static inline _Bool power_of_two_uint8(uint8_t x) {
+   return (x != 0u) && (!(x&(x - 1u)));
+}
+
+#define POWER_OF_TWO(X) _Generic((X), \
+    uint8_t: power_of_two_uint8((X)), \
+    int8_t:  power_of_two_int8((X))   \
+)
+
+int main( void ){
+   uint8_t a = 2;
+   int8_t b = 2;
+   printf("%d\n", POWER_OF_TWO(a++));
+   printf("%d\n", POWER_OF_TWO(b++));
+   printf("%d\n", POWER_OF_TWO(a));
+   printf("%d\n", POWER_OF_TWO(b));
+   return EXIT_SUCCESS;
+}
+
+You can find more about _Generic at CppReference or in secition 6.5.1.1 of the C11 Standard draft.
+FOOTNOTE
+Lundin has pointed out in the comments that MISRA C:2012 does not yet support C11 as of 2018, so the following answer will unfortunately not satisfy MISRA compliance without a deviation.
+UPDATE February 2021
+MISRA C:2012 now supports some C11 language features.  However, it states that type generic expressions are "prohibited without the support of a deviation against Rule 1.4".Returning to the top of the code/resetting codeI'm very new to coding. I am doing a task. I want my code to basically restart again if they answer y to do you want again.
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, const char * argv[]) {
+    char play;
+    int choice;
+
+    printf("Welcome to Two doors.\n");
+    printf("Would you like to play? (y/n): ");
+    scanf("%s", &play);
+
+    if (play == 'y')
+    {
+        printf("You are a prisoner in a room with 2 doors and 2 guards.\n");
+        printf("One of the doors will guide you to freedom and behind the other is a hangman --you don't know which is which.\n");
+        printf("One of the guards always tells the truth and the other always lies. You don't know which one is the truth-teller or the liar either.\n");
+        printf("You have to choose and open one of these doors, but you can only ask a single question to one of the guards.\n");
+        printf("What do you ask so you can pick the door to freedom?\n\n");
+        printf("\t1. Ask the truth-guard to point to the door of doom.\n");
+        printf("\t2. Ask the liar-guard to point to the door of doom.\n");
+        printf("\t3. Doesn't matter which one you pick.\n");
+        printf ("Enter a number between 1 and 3: ");
+        scanf("%i" , &choice);
+
+        char *answer = "No matter which one you choose the guards both tell you which door leads to death, and therefore you can pick the other door.\n";
+
+        switch (choice) {
+            case 1:
+                printf(answer);
+                break;
+            case 2:
+                printf(answer);
+                break;
+            case 3:
+                printf(answer);
+                break;
+            default:
+                break;
+        }
+
+        printf("Would you like to play again? (y/n): ");
+        scanf("%s", &play);
+        if (play == 'y')
+            printf(main);
+    }
+
+    return 0;
+}A good idea would be to wrap the part which should be repeated multiple times in do {} while () loop. 
+Something like this:
+do {
+    printf("You are a prisoner in a room with 2 doors and 2 guards.\n");
+    printf("One of the doors will guide you to freedom and behind the other is a hangman --you don't know which is which.\n");
+    printf("One of the guards always tells the truth and the other always lies. You don't know which one is the truth-teller or the liar either.\n");
+    printf("You have to choose and open one of these doors, but you can only ask a single question to one of the guards.\n");
+    printf("What do you ask so you can pick the door to freedom?\n\n");
+    printf("\t1. Ask the truth-guard to point to the door of doom.\n");
+    printf("\t2. Ask the liar-guard to point to the door of doom.\n");
+    printf("\t3. Doesn't matter which one you pick.\n");
+    printf ("Enter a number between 1 and 3: ");
+    scanf("%i" , &choice);
+
+    char *answer = "No matter which one you choose the guards both tell you which door leads to death, and therefore you can pick the other door.\n";
+
+    switch (choice) {
+        case 1:
+            printf(answer);
+            break;
+        case 2:
+            printf(answer);
+            break;
+        case 3:
+            printf(answer);
+            break;
+        default:
+            break;
+    }
+
+    printf("Would you like to play again? (y/n): ");
+    int result = getchar();
+    while (result == '\n' || result == EOF) 
+       result = getchar();
+    }
+    if (result == EOF) break;
+    play = (char)result;
+while (play == 'y')
+
+UPD: As user3629249 pointed out, the input reading in the sample from the question is incorrect. So I fixed it.Use type defined in C library in C++ program with namespace like schemeI have written a C library which defines some functions and types like the following:
+typedef struct {
+  int i;
+} A;
+void func1(void);
+int func2(A* a);
+
+I now want to use these functions and create variables of type A in a C++ program. Unfortunately C does not have namespaces but I would still like to emulate some similar structure to avoid name collisions in the C++ program. However I don't like the option of prepending every function and struct with a prefix:
+typedef struct {
+  int i;
+} library_A;
+void library_func1(void);
+int library_func2(A* a);
+
+I found this nice way to emulate a namespace scheme by defining a struct which has some pointers to the functions:
+/*interface.h*/
+struct library {
+    void (*func1)(void);
+    void (*func2)(A*);
+};
+
+extern const struct library Library;
+/* end interface.h */
+
+/* interface.c */
+#include "interface.h"
+
+void func1(void)
+{
+   ...
+}
+void func2(A* a)
+{
+   ...
+}
+
+const struct library Library = {
+    .func1 = func1,
+    .func2 = func2,
+};
+/* end interface.c */
+
+/* C++ program */
+#include "interface.h"
+
+int main(void)
+{
+    Library.method1();
+    A a;
+    a.i = 5;
+    Library.method2(&a);
+    return 0;
+}
+/* end C++ program */
+
+Is it possible to also include the definition of type A in Library or a  different way such that a type Library.A is defined in the C++ program and I can write the C++ program as
+#include "interface.h"
+
+int main(void)
+{
+    Library.method1();
+    Library.A a;
+    a.i = 5;
+    Library.method2(&a);
+    return 0;
+}To my knowledge, it's not possible to do this.
+
+However I don't like the option of prepending every function and struct with a prefix
+
+That is the proper way of handling this situation, though. Think about it this way: namespaces work as prefixes too, the difference is that instead of underscore _ you use double colons ::.
+Your approach of using a Library global is surprising from a user's perspective. As a user my first question would be:
+
+
+Is there a technical reason why I shouldn't use the library functions directly?
+
+
+If there isn't a reason besides you, the developer, simply not liking how library_XYZ looks, then my next thought would be:
+
+
+Pointless weirdness. The library developer doesn't take this seriously or is inexperienced.
+
+
+And another thing, it will be extra work for you to maintain the library helper struct whenever you add, remove or rename stuff from the library. It will eventually become a burden to update that global.Visual Studio Code ignores debug symbolsI'm trying to debug C using visual studio code on a Mint VM, code is as follows:
+#include <stdio.h>
+
+int main(int numargs, char* argvector[])
+{
+   printf("test\n");
+  return(0);
+}
+
+Compiled with:
+gcc test.c -g -o test
+
+based on the output of ls -l, I can verify that gcc is adding symbols.
+When I attempt to debug this program using vs-code using the C/C++ extension, I receive the following error:
+Warning: Debuggee TargetArchitecture not detected, assuming x86_64.
+=cmd-param-changed,param="pagination",value="off"
+Stopped due to shared library event (no libraries added or removed)
+Loaded '/lib64/ld-linux-x86-64.so.2'. Symbols loaded.
+Breakpoint 1, main (numargs=1, argvector=0x7fffffffdd18) at test.c:5
+5     printf("test\n");
+[Inferior 1 (process 8322) exited normally]
+The program '/home/ccsd/test/test' has exited with code 0 (0x00000000).
+
+gcc version: 5.4.0 20160609
+vs-c version: 1.24.1
+my launch.json file is as follows:
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(gdb) Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/grow",
+            "processName": "grow",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+             ]
+        }
+    ]
+}
+
+You may note that this is not a duplicate of Stopped due to shared library event - Visual Studio Code because I am already using the -g switch.
+I would like to know how I can fix this. Thank you in advance.Assuming the use of "additionalSOLibSearchPath" option of launch.json did not help, the following setting might add a shared library into gdb's consideration:
+"setupCommands":[
+    {
+        "description": "Additional libs for gdb",
+        "text": "set solib-search-path sharedLibraryPath/lib"
+    }
+]
+
+PS: gdb may still raise Stopped due to shared library event (no libraries added or removed) warning, nevertheless.How to extract multiple strings from a single file in C [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+Ciao,
+Look at my code below.
+That`s a standard program for Log in authentication.
+In the file "Login.txt"  located 1 string with user name.
+When program starts, it asks to enter the user name, then compare this string with the string saved in "Login.txt", if both equal then - success, if not equal, then we can try only 3 times till the program ends;
+I need to save in "Login.txt" 3 strings (user names) for example:
+Brad 
+David
+Peter
+So I need to call each string from "Login.txt separately to char buf[], then to call scanf function (David - for example), after use strcmp for both, and as a result both strings should be equal each other;
+Question:
+How to extract multiple strings "separately" and put each to different char buf[] from a single file in C FILE .txt?
+Thank you in advance.
+CODE:
+int main() {
+
+    system("cls");
+    FILE *p;
+    int n=3,b,v;
+    char buf[20],buf2[20],Login[20],Password[20];
+    p=fopen("Login.txt","rt");
+    fgets(buf,20,p);
+    fclose(p);
+    p=fopen("Password.txt","rt");
+    fgets(buf2,20,p);
+    fclose(p);
+    printf("%s",buf);         
+    do { 
+        printf("Please Log in. You have %d tries\n",n);
+        printf("Enter your Login\n");
+        scanf("%s",Login);
+        printf("\nEnter your Password\n");
+        scanf("%s",Password);
+        printf("\nCompare Login = %d Compare Login = %d\n",strcmp(buf,Login),strcmp(buf2,Password));
+        n--;
+        b=strcmp(buf,Login);
+        v=strcmp(buf2,Password);
+
+        if (v==0&&b==0){
+            printf("\nYou logged in\n\n");
+            break;
+        }
+        else if (n==0) {
+            printf("\nYou failed\n\n");
+        }
+    }
+    while (n!=0);
+}It sounds like your asking how to get both your username and password from the same file. Yes?
+In order to extract the username and password from a single string (buf), you need to use a delimiter to separate them. Let's say Login.txt looks like this:
+MyUsername1
+MyPassword1
+MyUsername2
+MyPassword2
+
+In this case, the delimiter is the line ending characters (\r\n on Windows).
+You need split the string stored in buf apart using, for example, strtok or strsep (see an example).
+It's going to take some learning on your part to figure out exactly how to do it. If I just type up a fully functioning program for you, you won't learn anything; so I'm not going to do that.Should I use block device over char device for reading and writing to memory?I just started to work in a new company and I'm new in the embedded world.
+They gave me a task, I have done it and it's working but I don't know if I did it the right way.
+I will describe the task and what I have done.
+I was requested to hide some small piece of the DDR from the Linux OS, then some HW feature can write something to this small piece of memory I saved. After that I need to be able to read this small piece of memory to a file.
+To hide a chunk of the DDR from the Linux I just changed the Linux memory arg to be equal to the real memory size - (the size I needed + some small size for safety). I have got the idea and the idea for the driver I will describe in a sec from this post.
+After that the Linux is seeing less memory then the HW has and the top section of the DDR is hided from the kernel and I can use it for my storage without worry.
+I think that I have done this part right, not something I can say about the next part.
+For the next part, to be able to read this piece of DDR I saved, I wrote a Char device driver, it’s working, it’s reading the DDR chunk I saved to a file piece by piece, every piece is of size no more then some value I decided, can't do it in one copy because it will require allocating a big buffer and I don’t have enough RAM space for that.
+Now I read about block device and I started to think that maybe block device fits better for my program, but I'm not relay sure because first it's working and if it's not broken... second I never wrote block device driver, I also never wrote char device driver until the one I described before, so I don't sure if this is the time to use block device over char device.This depends on the intended use, but according to your description a character device is much more likely to be what you want. The difference:
+a character device takes simple read and write commands and gets no help from the kernel. This is suitable for reading or writing from devices (and from anything that resembles a device, both if it is an actual stream that's read sequentially or supports 'seek' and can read the same data over and over again).
+a block device hooks into the kernel's memory paging system and is capable of serving as a back-end for virtual memory pages. It can host a swap space, be the storage for a file system, etc. It is a much more complex beast than a character device. You need this only for something that stores a large amount of data that needs to be accessed by mapping it into the address space of a process (normally this is needed only if you put a file system on it).Fibonacci Sequence using Linked List crashes after linked list is destroyed. How can I trace the error?I'm working on a program that calculates any number in the Fibonacci Sequence without using the int data type since it would overflow. Instead I am using linked lists to hold the digits that represent each number. My current issue is with freeing memory allocated to linked lists that I no longer need. If I'm calculating F(10000), I'd like the thousands of previous lists to be freed. The program as is produces each value up to "F(7) = 13" before crashing and showing "exit status -1". I'd really just like to know what's causing this error and go from there. Any help is appreciated. Thank you and I apologize for the large amount of code.
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct Node
+{
+int digit;
+struct Node *next;
+} Node;
+
+typedef struct ListyInt
+{
+Node *head;
+int length;
+} ListyInt;
+
+
+
+Node *create_node(unsigned int digit, ListyInt *listy);
+Node *removeNode(Node *node, ListyInt *listy);
+void listyPrintHelper(Node *current);
+ListyInt *destroyListyInt(ListyInt *listy);
+ListyInt *fib(unsigned int n);
+
+
+
+void listyPrint(ListyInt *p)
+{
+if (p == NULL || p->head == NULL)
+{
+    printf("(null pointer)\n");
+    return;
+}
+
+listyPrintHelper(p->head);
+printf("\n");
+}
+
+void listyPrintHelper(Node *current)
+{
+if (current == NULL)
+    return;
+
+listyPrintHelper(current->next);
+printf("%d", current->digit);
+}
+
+int main()
+{
+ int i;
+ ListyInt *p;
+
+for (i = 0; i <= 1000; i++)
+{
+    printf("F(%d) = ", i);
+    listyPrint(p = fib(i));
+    destroyListyInt(p);
+}
+
+ return 0;
+}
+
+ListyInt *listyAdd(ListyInt *p, ListyInt *q)
+{
+ ListyInt *listy = NULL;
+ Node *ptemp = NULL;
+ Node *qtemp = NULL;
+ Node *temp = NULL;
+ ListyInt *temp_list = NULL;
+ unsigned int x = 0;
+ unsigned int count = 0;
+
+ if (p == NULL || q == NULL)
+{
+  return NULL;
+}
+
+ listy = malloc(sizeof(ListyInt));
+
+ if (listy == NULL)
+{
+  return NULL;
+}
+
+listy->length = 0;
+
+if (q->length > p->length)
+{
+temp_list = q;
+q = p;
+p = temp_list;
+}
+
+ while (count < p->length)
+ {
+  if (count == 0)
+  {
+  x = p->head->digit + q->head->digit;
+  ptemp = p->head->next;
+  qtemp = q->head->next;
+  listy->head = create_node(x, listy);
+  temp = listy->head;
+  temp->next = create_node(0, listy);
+
+  if (temp->digit > 9)
+  {
+    temp->digit = temp->digit - 10;
+    temp->next->digit = temp->next->digit + 1;
+   }
+ }
+
+else
+{
+  temp->next->next = create_node(0, listy);
+
+  if (qtemp == NULL)
+  {
+    temp->next->digit += ptemp->digit;
+    ptemp = ptemp->next;
+    temp = temp->next;
+  }
+
+  else
+  {
+    x = ptemp->digit + qtemp->digit;
+    temp->next->digit += x;
+
+    if (temp->next->digit > 9)
+    {
+      temp->next->digit = temp->next->digit - 10;
+      temp->next->next->digit = temp->next->next->digit + 1;
+    }
+
+    qtemp = qtemp->next;
+    ptemp = ptemp->next;
+    temp = temp->next;
+   }
+ }
+
+ if (count == p->length - 1 && temp->next->digit == 0)
+ {
+   temp->next = removeNode(temp->next, listy);
+ }
+
+  count++;
+ }
+
+return listy;
+}
+
+ListyInt *destroyListyInt(ListyInt *listy)
+{
+  if (listy == NULL)
+  {
+    return NULL;
+  }
+
+Node *current = listy->head;
+Node *temp;
+
+while (current != NULL)
+{
+    temp = current->next;
+    free(current);
+    current = temp;
+}
+
+    free(listy);
+
+return NULL;
+}
+
+ListyInt *fib(unsigned int n)
+{
+  ListyInt *spiral = malloc(sizeof(ListyInt));
+  ListyInt *p = NULL;
+  ListyInt *q = NULL;
+  unsigned int count = 2;
+
+  if (spiral == NULL)
+  {
+    return NULL;
+  }
+
+  if (n == 0)
+  {
+    spiral->head = create_node(0, spiral);
+    return spiral;
+  }
+
+ if (n == 1)
+ {
+    spiral->head = create_node(1, spiral);
+    return spiral;
+ }
+
+ p = malloc(sizeof(ListyInt));
+ p->head = create_node(0, p);
+
+ q = malloc(sizeof(ListyInt));
+ q->head = create_node(1, q);
+
+ while (count <= n)
+ {
+    spiral = listyAdd(p, q);
+    destroyListyInt(p);
+    p = q;
+    q = spiral;
+    count++;
+  }
+
+ return spiral;
+}
+
+Node *create_node(unsigned int digit, ListyInt *listy)
+{
+  if (listy == NULL)
+  {
+    return NULL;
+  }
+
+  Node *new_node = malloc(sizeof(Node));
+
+  new_node->digit = digit;
+  new_node->next = NULL;
+
+  listy->length++;
+
+  return new_node;
+}
+
+Node *removeNode(Node *node, ListyInt *listy)
+{
+  if (node == NULL)
+  {
+    return NULL;
+  }
+
+  if (listy == NULL)
+  {
+    return NULL;
+  }
+
+  free(node);
+  node = NULL;
+  listy->length--;
+  return NULL;
+}I'd really just like to know what's causing this error and go from there.
+
+Long story short, C's equivalent of a NullPointerException, as far as I can tell.
+Long story longer, I haven't had time to fully examine your code or debug it, but I have had time to run it through gdb, which is included with most Linux installations. If you're using Visual Studio, I vaguely remember there being a debug mode, which should show you roughly the same information, just in a different place. This is GDB's output:
+Starting program: /home/ubuntu/C/a.out 
+F(0) = 0
+F(1) = 1
+F(2) = 1
+F(3) = 2
+F(4) = 3
+F(5) = 5
+F(6) = 8
+F(7) = 13
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00000000004008db in listyAdd (p=0x6036a0, q=0x6036e0) at main.c:117
+117         temp->next->digit += ptemp->digit;
+
+(Okay, that's not all of it, but that's the relevant bit.)
+What those last three lines mean is that you got a segfault. There are a bunch of things that can cause it, but based on that line, it looks like it's been caused by trying to dereference an invalid pointer. That's either a NULL pointer (a value of 0x0) or a pointer you've already freed. 
+If you're on Linux, you can then run Valgrind on it to figure out what, exactly, happened. It'll tell you if it's using a freed pointer or a NULL one, and that'll give you a good starting point to find the actual bug. You can also use your IDE's debugger (or GDB, if you want to try playing with the command-line version, but I wouldn't recommend it) to step through your program and see what the values of the variables involved are, which you can walk backwards from to see where they're being changed and invalidated.
+If I had to guess, though, I'd say 0andriy's comments hit it on the nose -- you seem to be freeing things twice, and you probably meant to free them once, at the end. 
+I'm somewhat intentionally leaving this vague. Segfaults are common and (as you've noticed) difficult to debug, and you can only really learn how through experience. I think being shown the answer would honestly be less helpful than working through it yourself, and with tools like Valgrind and your debugger, that's not actually that hard, just tedious.I found the issue. It was because the length of my linked lists weren't being reset when fib() was called. Thanks for your help everyone.
