@@ -1,0 +1,3863 @@
+Can num++ be atomic for 'int num'?In general, for int num, num++ (or ++num), as a read-modify-write operation, is not atomic. But I often see compilers, for example GCC, generate the following code for it (try here):
+void f()
+{
+  
+  int num = 0;
+  num++;
+}
+
+f():
+        push    rbp
+        mov     rbp, rsp
+        mov     DWORD PTR [rbp-4], 0
+        add     DWORD PTR [rbp-4], 1
+        nop
+        pop     rbp
+        ret
+
+Since line 5, which corresponds to num++ is one instruction, can we conclude that num++ is atomic in this case?
+And if so, does it mean that so-generated num++ can be used in concurrent (multi-threaded) scenarios without any danger of data races (i.e. we don't need to make it, for example, std::atomic<int> and impose the associated costs, since it's atomic anyway)?
+UPDATE
+Notice that this question is not whether increment is atomic (it's not and that was and is the opening line of the question). It's whether it can be in particular scenarios, i.e. whether one-instruction nature can in certain cases be exploited to avoid the overhead of the lock prefix. And, as the accepted answer mentions in the section about uniprocessor machines, as well as this answer, the conversation in its comments and others explain, it can (although not with C or C++).This is absolutely what C++ defines as a Data Race that causes Undefined Behaviour, even if one compiler happened to produce code that did what you hoped on some target machine. You need to use std::atomic for reliable results, but you can use it with memory_order_relaxed if you don't care about reordering.  See below for some example code and asm output using fetch_add.
+
+But first, the assembly language part of the question:
+
+Since num++ is one instruction (add dword [num], 1), can we conclude that num++ is atomic in this case?
+
+Memory-destination instructions (other than pure stores) are read-modify-write operations that happen in multiple internal steps. No architectural register is modified, but the CPU has to hold the data internally while it sends it through its ALU. The actual register file is only a small part of the data storage inside even the simplest CPU, with latches holding outputs of one stage as inputs for another stage, etc., etc.
+Memory operations from other CPUs can become globally visible between the load and store. I.e. two threads running add dword [num], 1 in a loop would step on each other's stores. (See @Margaret's answer for a nice diagram). After 40k increments from each of two threads, the counter might have only gone up by ~60k (not 80k) on real multi-core x86 hardware.
+
+"Atomic", from the Greek word meaning indivisible, means that no observer can see the operation as separate steps.  Happening physically / electrically instantaneously for all bits simultaneously is just one way to achieve this for a load or store, but that's not even possible for an ALU operation. I went into a lot more detail about pure loads and pure stores in my answer to Atomicity on x86, while this answer focuses on read-modify-write.
+The lock prefix can be applied to many read-modify-write (memory destination) instructions to make the entire operation atomic with respect to all possible observers in the system (other cores and DMA devices, not an oscilloscope hooked up to the CPU pins). That is why it exists.  (See also this Q&A).
+So lock add dword [num], 1 is atomic. A CPU core running that instruction would keep the cache line pinned in Modified state in its private L1 cache from when the load reads data from cache until the store commits its result back into cache.  This prevents any other cache in the system from having a copy of the cache line at any point from load to store, according to the rules of the MESI cache coherency protocol (or the MOESI/MESIF versions of it used by multi-core AMD/Intel CPUs, respectively).  Thus, operations by other cores appear to happen either before or after, not during.
+Without the lock prefix, another core could take ownership of the cache line and modify it after our load but before our store, so that other store would become globally visible in between our load and store.  Several other answers get this wrong, and claim that without lock you'd get conflicting copies of the same cache line.  This can never happen in a system with coherent caches.
+(If a locked instruction operates on memory that spans two cache lines, it takes a lot more work to make sure the changes to both parts of the object stay atomic as they propagate to all observers, so no observer can see tearing.  The CPU might have to lock the whole memory bus until the data hits memory.  Don't misalign your atomic variables!)
+Note that the lock prefix also turns an instruction into a full memory barrier (like MFENCE), stopping all run-time reordering and thus giving sequential consistency.  (See Jeff Preshing's excellent blog post. His other posts are all excellent, too, and clearly explain a lot of good stuff about lock-free programming, from x86 and other hardware details to C++ rules.)
+
+On a uniprocessor machine, or in a single-threaded process, a single RMW instruction actually is atomic without a lock prefix. The only way for other code to access the shared variable is for the CPU to do a context switch, which can't happen in the middle of an instruction. So a plain dec dword [num] can synchronize between a single-threaded program and its signal handlers, or in a multi-threaded program running on a single-core machine. See the second half of my answer on another question, and the comments under it, where I explain this in more detail.
+
+Back to C++:
+It's totally bogus to use num++ without telling the compiler that you need it to compile to a single read-modify-write implementation:
+;; Valid compiler output for num++
+mov   eax, [num]
+inc   eax
+mov   [num], eax
+
+This is very likely if you use the value of num later: the compiler will keep it live in a register after the increment.  So even if you check how num++ compiles on its own, changing the surrounding code can affect it.
+(If the value isn't needed later, inc dword [num] is preferred; modern x86 CPUs will run a memory-destination RMW instruction at least as efficiently as using three separate instructions.  Fun fact: gcc -O3 -m32 -mtune=i586 will actually emit this, because (Pentium) P5's superscalar pipeline didn't decode complex instructions to multiple simple micro-operations the way P6 and later microarchitectures do.  See the Agner Fog's instruction tables / microarchitecture guide for more info, and the x86 tag wiki for many useful links (including Intel's x86 ISA manuals, which are freely available as PDF)).
+
+Don't confuse the target memory model (x86) with the C++ memory model
+Compile-time reordering is allowed. The other part of what you get with std::atomic is control over compile-time reordering, to make sure your num++ becomes globally visible only after some other operation.
+Classic example: Storing some data into a buffer for another thread to look at, then setting a flag. Even though x86 does acquire loads/release stores for free, you still have to tell the compiler not to reorder by using flag.store(1, std::memory_order_release);.
+You might be expecting that this code will synchronize with other threads:
+// int flag;  is just a plain global, not std::atomic<int>.
+flag--;           // Pretend this is supposed to be some kind of locking attempt
+modify_a_data_structure(&foo);    // doesn't look at flag, and the compiler knows this.  (Assume it can see the function def).  Otherwise the usual don't-break-single-threaded-code rules come into play!
+flag++;
+
+But it won't. The compiler is free to move the flag++ across the function call (if it inlines the function or knows that it doesn't look at flag). Then it can optimize away the modification entirely, because flag isn't even volatile.
+(And no, C++ volatile is not a useful substitute for std::atomic.  std::atomic does make the compiler assume that values in memory can be modified asynchronously similar to volatile, but there's much more to it than that.  (In practice there are similarities between volatile int to std::atomic with mo_relaxed for pure-load and pure-store operations, but not for RMWs).  Also, volatile std::atomic<int> foo is not necessarily the same as std::atomic<int> foo, although current compilers don't optimize atomics (e.g. 2 back-to-back stores of the same value) so volatile atomic wouldn't change the code-gen.)
+Defining data races on non-atomic variables as Undefined Behaviour is what lets the compiler still hoist loads and sink stores out of loops, and many other optimizations for memory that multiple threads might have a reference to.  (See this LLVM blog for more about how UB enables compiler optimizations.)
+
+As I mentioned, the x86 lock prefix is a full memory barrier, so using num.fetch_add(1, std::memory_order_relaxed); generates the same code on x86 as num++ (the default is sequential consistency), but it can be much more efficient on other architectures (like ARM).  Even on x86, relaxed allows more compile-time reordering.
+This is what GCC actually does on x86, for a few functions that operate on a std::atomic global variable.
+See the source + assembly language code formatted nicely on the Godbolt compiler explorer. You can select other target architectures, including ARM, MIPS, and PowerPC, to see what kind of assembly language code you get from atomics for those targets.
+#include <atomic>
+std::atomic<int> num;
+void inc_relaxed() {
+  num.fetch_add(1, std::memory_order_relaxed);
+}
+
+int load_num() { return num; }            // Even seq_cst loads are free on x86
+void store_num(int val){ num = val; }
+void store_num_release(int val){
+  num.store(val, std::memory_order_release);
+}
+// Can the compiler collapse multiple atomic operations into one? No, it can't.
+
+# g++ 6.2 -O3, targeting x86-64 System V calling convention. (First argument in edi/rdi)
+inc_relaxed():
+    lock add        DWORD PTR num[rip], 1      #### Even relaxed RMWs need a lock. There's no way to request just a single-instruction RMW with no lock, for synchronizing between a program and signal handler for example. :/ There is atomic_signal_fence for ordering, but nothing for RMW.
+    ret
+inc_seq_cst():
+    lock add        DWORD PTR num[rip], 1
+    ret
+load_num():
+    mov     eax, DWORD PTR num[rip]
+    ret
+store_num(int):
+    mov     DWORD PTR num[rip], edi
+    mfence                          ##### seq_cst stores need an mfence
+    ret
+store_num_release(int):
+    mov     DWORD PTR num[rip], edi
+    ret                             ##### Release and weaker doesn't.
+store_num_relaxed(int):
+    mov     DWORD PTR num[rip], edi
+    ret
+
+Notice how MFENCE (a full barrier) is needed after a sequential-consistency stores. x86 is strongly ordered in general, but StoreLoad reordering is allowed. Having a store buffer is essential for good performance on a pipelined out-of-order CPU. Jeff Preshing's Memory Reordering Caught in the Act shows the consequences of not using MFENCE, with real code to show reordering happening on real hardware.
+
+Re: discussion in comments on @Richard Hodges' answer about compilers merging std::atomic num++; num-=2; operations into one num--; instruction:
+A separate Q&A on this same subject: Why don't compilers merge redundant std::atomic writes?, where my answer restates a lot of what I wrote below.
+Current compilers don't actually do this (yet), but not because they aren't allowed to.  C++ WG21/P0062R1: When should compilers optimize atomics? discusses the expectation that many programmers have that compilers won't make "surprising" optimizations, and what the standard can do to give programmers control.  N4455 discusses many examples of things that can be optimized, including this one.  It points out that inlining and constant-propagation can introduce things like fetch_or(0) which may be able to turn into just a load() (but still has acquire and release semantics), even when the original source didn't have any obviously redundant atomic ops.
+The real reasons compilers don't do it (yet) are: (1) nobody's written the complicated code that would allow the compiler to do that safely (without ever getting it wrong), and (2) it potentially violates the principle of least surprise.  Lock-free code is hard enough to write correctly in the first place.  So don't be casual in your use of atomic weapons: they aren't cheap and don't optimize much.  It's not always easy easy to avoid redundant atomic operations with std::shared_ptr<T>, though, since there's no non-atomic version of it (although one of the answers here gives an easy way to define a shared_ptr_unsynchronized<T> for gcc).
+
+Getting back to num++; num-=2; compiling as if it were num--:
+Compilers are allowed to do this, unless num is volatile std::atomic<int>.  If a reordering is possible, the as-if rule allows the compiler to decide at compile time that it always happens that way.  Nothing guarantees that an observer could see the intermediate values (the num++ result).
+I.e. if the ordering where nothing becomes globally visible between these operations is compatible with the ordering requirements of the source
+(according to the C++ rules for the abstract machine, not the target architecture), the compiler can emit a single lock dec dword [num] instead of lock inc dword [num] / lock sub dword [num], 2.
+num++; num-- can't disappear, because it still has a Synchronizes With relationship with other threads that look at num, and it's both an acquire-load and a release-store which disallows reordering of other operations in this thread.  For x86, this might be able to compile to an MFENCE, instead of a lock add dword [num], 0 (i.e. num += 0).
+As discussed in PR0062, more aggressive merging of non-adjacent atomic ops at compile time can be bad (e.g. a progress counter only gets updated once at the end instead of every iteration), but it can also help performance without downsides (e.g. skipping the atomic inc / dec of ref counts when a copy of a shared_ptr is created and destroyed, if the compiler can prove that another shared_ptr object exists for entire lifespan of the temporary.)
+Even num++; num-- merging could hurt fairness of a lock implementation when one thread unlocks and re-locks right away.  If it's never actually released in the asm, even hardware arbitration mechanisms won't give another thread a chance to grab the lock at that point.
+
+With current gcc6.2 and clang3.9, you still get separate locked operations even with memory_order_relaxed in the most obviously optimizable case.  (Godbolt compiler explorer so you can see if the latest versions are different.)
+void multiple_ops_relaxed(std::atomic<unsigned int>& num) {
+  num.fetch_add( 1, std::memory_order_relaxed);
+  num.fetch_add(-1, std::memory_order_relaxed);
+  num.fetch_add( 6, std::memory_order_relaxed);
+  num.fetch_add(-5, std::memory_order_relaxed);
+  //num.fetch_add(-1, std::memory_order_relaxed);
+}
+
+multiple_ops_relaxed(std::atomic<unsigned int>&):
+    lock add        DWORD PTR [rdi], 1
+    lock sub        DWORD PTR [rdi], 1
+    lock add        DWORD PTR [rdi], 6
+    lock sub        DWORD PTR [rdi], 5
+    retWithout many complications an instruction like add DWORD PTR [rbp-4], 1 is very CISC-style.
+It perform three operations: load the operand from memory, increment it, store the operand back to memory.
+During these operations the CPU acquire and release the bus twice, in between any other agent can acquire it too and this violates the atomicity.
+AGENT 1          AGENT 2
+
+load X              
+inc C
+                 load X
+                 inc C
+                 store X
+store X
+
+X is incremented only once....and now let's enable optimisations:
+f():
+        rep ret
+
+OK, let's give it a chance:
+void f(int& num)
+{
+  num = 0;
+  num++;
+  --num;
+  num += 6;
+  num -=5;
+  --num;
+}
+
+result:
+f(int&):
+        mov     DWORD PTR [rdi], 0
+        ret
+
+another observing thread (even ignoring cache synchronisation delays) has no opportunity to observe the individual changes.
+compare to:
+#include <atomic>
+
+void f(std::atomic<int>& num)
+{
+  num = 0;
+  num++;
+  --num;
+  num += 6;
+  num -=5;
+  --num;
+}
+
+where the result is:
+f(std::atomic<int>&):
+        mov     DWORD PTR [rdi], 0
+        mfence
+        lock add        DWORD PTR [rdi], 1
+        lock sub        DWORD PTR [rdi], 1
+        lock add        DWORD PTR [rdi], 6
+        lock sub        DWORD PTR [rdi], 5
+        lock sub        DWORD PTR [rdi], 1
+        ret
+
+Now, each modification is:-
+
+observable in another thread, and
+respectful of similar modifications happening in other threads.
+
+atomicity is not just at the instruction level, it involves the whole pipeline from processor, through the caches, to memory and back.
+Further info
+Regarding the effect of optimisations of updates of std::atomics.
+The c++ standard has the 'as if' rule, by which it is permissible for the compiler to reorder code, and even rewrite code provided that the outcome has the exact same observable effects (including side-effects) as if it had simply executed your code.
+The as-if rule is conservative, particularly involving atomics.
+consider:
+void incdec(int& num) {
+    ++num;
+    --num;
+}
+
+Because there are no mutex locks, atomics or any other constructs that influence inter-thread sequencing, I would argue that the compiler is free to rewrite this function as a NOP, eg:
+void incdec(int&) {
+    // nada
+}
+
+This is because in the c++ memory model, there is no possibility of another thread observing the result of the increment. It would of course be different if num was volatile (might influence hardware behaviour). But in this case, this function will be the only function modifying this memory (otherwise the program is ill-formed).
+However, this is a different ball game:
+void incdec(std::atomic<int>& num) {
+    ++num;
+    --num;
+}
+
+num is an atomic. Changes to it must be observable to other threads that are watching. Changes those threads themselves make (such as setting the value to 100 in between the increment and decrement) will have very far-reaching effects on the eventual value of num.
+Here is a demo:
+#include <thread>
+#include <atomic>
+
+int main()
+{
+    for (int iter = 0 ; iter < 20 ; ++iter)
+    {
+        std::atomic<int> num = { 0 };
+        std::thread t1([&] {
+            for (int i = 0 ; i < 10000000 ; ++i)
+            {
+                ++num;
+                --num;
+            }
+        });
+        std::thread t2([&] {
+            for (int i = 0 ; i < 10000000 ; ++i)
+            {
+                num = 100;
+            }
+        });
+        
+        t2.join();
+        t1.join();
+        std::cout << num << std::endl;
+    }
+}
+
+sample output:
+99
+99
+99
+99
+99
+100
+99
+99
+100
+100
+100
+100
+99
+99
+100
+99
+99
+100
+100
+99The add instruction is not atomic. It references memory, and two processor cores may have different local cache of that memory.
+IIRC the atomic variant of the add instruction is called lock xaddSince line 5, which corresponds to num++ is one instruction, can we conclude that num++ is atomic in this case?
+
+It is dangerous to draw conclusions based on "reverse engineering" generated assembly. For example, you seem to have compiled your code with optimization disabled, otherwise the compiler would have thrown away that variable or loaded 1 directly to it without invoking operator++. Because the generated assembly may change significantly, based on optimization flags, target CPU, etc., your conclusion is based on sand.
+Also, your idea that one assembly instruction means an operation is atomic is wrong as well. This add will not be atomic on multi-CPU systems, even on the x86 architecture.Even if your compiler always emitted this as an atomic operation, accessing num from any other thread concurrently would constitute a data race according to the C++11 and C++14 standards and the program would have undefined behavior.
+But it is worse than that. First, as has been mentioned, the instruction generated by the compiler when incrementing a variable may depend on the optimization level. Secondly, the compiler may reorder other memory accesses around ++num if num is not atomic, e.g.
+int main()
+{
+  std::unique_ptr<std::vector<int>> vec;
+  int ready = 0;
+  std::thread t{[&]
+    {
+       while (!ready);
+       // use "vec" here
+    });
+  vec.reset(new std::vector<int>());
+  ++ready;
+  t.join();
+}
+
+Even if we assume optimistically that ++ready is "atomic", and that the compiler generates the checking loop as needed (as I said, it's UB and therefore the compiler is free to remove it, replace it with an infinite loop, etc.), the compiler might still move the pointer assignment, or even worse the initialization of the vector to a point after the increment operation, causing chaos in the new thread. In practice, I would not be surprised at all if an optimizing compiler removed the ready variable and the checking loop completely, as this does not affect observable behavior under language rules (as opposed to your private hopes).
+In fact, at last year's Meeting C++ conference, I've heard from two compiler developers that they very gladly implement optimizations that make naively written multi-threaded programs misbehave, as long as language rules allow it, if even a minor performance improvement is seen in correctly written programs.
+Lastly, even if you didn't care about portability, and your compiler was magically nice, the CPU you are using is very likely of a superscalar CISC type and will break down instructions into micro-ops, reorder and/or speculatively execute them, to an extent only limited by synchronizing primitives such as (on Intel) the LOCK prefix or memory fences, in order to maximize operations per second.
+To make a long story short, the natural responsibilities of thread-safe programming are:
+
+Your duty is to write code that has well-defined behavior under language rules (and in particular the language standard memory model).
+Your compiler's duty is to generate machine code which has the same well-defined (observable) behavior under the target architecture's memory model.
+Your CPU's duty is to execute this code so that the observed behavior is compatible with its own architecture's memory model.
+
+If you want to do it your own way, it might just work in some cases, but understand that the warranty is void, and you will be solely responsible for any unwanted outcomes. :-)
+PS: Correctly written example:
+int main()
+{
+  std::unique_ptr<std::vector<int>> vec;
+  std::atomic<int> ready{0}; // NOTE the use of the std::atomic template
+  std::thread t{[&]
+    {
+       while (!ready);
+       // use "vec" here
+    });
+  vec.reset(new std::vector<int>());
+  ++ready;
+  t.join();
+}
+
+This is safe because:
+
+The checks of ready cannot be optimized away according to language rules.
+The ++ready happens-before the check that sees ready as not zero, and other operations cannot be reordered around these operations. This is because ++ready and the check are sequentially consistent, which is another term described in the C++ memory model and that forbids this specific reordering. Therefore the compiler must not reorder the instructions, and must also tell the CPU that it must not e.g. postpone the write to vec to after the increment of ready. Sequentially consistent is the strongest guarantee regarding atomics in the language standard. Lesser (and theoretically cheaper) guarantees are available e.g. via other methods of std::atomic<T>, but these are definitely for experts only, and may not be optimized much by the compiler developers, because they are rarely used.On a single-core x86 machine, an add instruction will generally be atomic with respect to other code on the CPU1. An interrupt can't split a single instruction down the middle.
+Out-of-order execution is required to preserve the illusion of instructions executing one at a time in order within a single core, so any instruction running on the same CPU will either happen completely before or completely after the add.
+Modern x86 systems are multi-core, so the uniprocessor special case doesn't apply.
+If one is targeting a small embedded PC and has no plans to move the code to anything else, the atomic nature of the "add" instruction could be exploited.  On the other hand, platforms where operations are inherently atomic are becoming more and more scarce.
+(This doesn't help you if you're writing in C++, though.  Compilers don't have an option to require num++ to compile to a memory-destination add or xadd without a lock prefix.  They could choose to load num into a register and store the increment result with a separate instruction, and will likely do that if you use the result.)
+
+Footnote 1: The lock prefix existed even on original 8086 because I/O devices operate concurrently with the CPU; drivers on a single-core system need lock add to atomically increment a value in device memory if the device can also modify it, or with respect to DMA access.Back in the day when x86 computers had one CPU, the use of a single instruction ensured that interrupts would not split the read/modify/write and if the memory would not be used as a DMA buffer too, it was atomic in fact (and C++ did not mention threads in the standard, so this wasn’t addressed).
+When it was rare to have a dual processor (e.g. dual-socket Pentium Pro) on a customer desktop, I effectively used this to avoid the LOCK prefix on a single-core machine and improve performance.  
+Today, it would only help against multiple threads that were all set to the same CPU affinity, so the threads you are worried about would only come into play via time slice expiring and running the other thread on the same CPU (core).  That is not realistic.
+With modern x86/x64 processors, the single instruction is broken up into several micro ops and furthermore the memory reading and writing is buffered.  So different threads running on different CPUs will not only see this as non-atomic but may see inconsistent results concerning what it reads from memory and what it assumes other threads have read to that point in time: you need to add memory fences to restore sane behavior.No.
+https://www.youtube.com/watch?v=31g0YE61PLQ
+(That's just a link to the "No" scene from "The Office")
+Do you agree that this would be a possible output for the program:
+sample output:
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+100
+
+If so, then the compiler is free to make that the only possible output for the program, in whichever way the compiler wants.  ie a main() that just puts out 100s.
+This is the "as-if" rule.
+And regardless of output, you can think of thread synchronization the same way - if thread A does num++; num--; and thread B reads num repeatedly, then a possible valid interleaving is that thread B never reads between num++ and num--.  Since that interleaving is valid, the compiler is free to make that the only possible interleaving.  And just remove the incr/decr entirely.
+There are some interesting implications here:
+while (working())
+    progress++;  // atomic, global
+
+(ie imagine some other thread updates a progress bar UI based on progress)
+Can the compiler turn this into:
+int local = 0;
+while (working())
+    local++;
+
+progress += local;
+
+probably that is valid.  But probably not what the programmer was hoping for :-(
+The committee is still working on this stuff.  Currently it "works" because compilers don't optimize atomics much.  But that is changing.
+And even if progress was also volatile, this would still be valid:
+int local = 0;
+while (working())
+    local++;
+
+while (local--)
+    progress++;
+
+:-/Yes, but...
+Atomic is not what you meant to say. You're probably asking the wrong thing.
+The increment is certainly atomic. Unless the storage is misaligned (and since you left alignment to the compiler, it is not), it is necessarily aligned within a single cache line. Short of special non-caching streaming instructions, each and every write goes through the cache. Complete cache lines are being atomically read and written, never anything different.
+Smaller-than-cacheline data is, of course, also written atomically (since the surrounding cache line is).
+Is it thread-safe?
+This is a different question, and there are at least two good reasons to answer with a definite "No!".
+First, there is the possibility that another core might have a copy of that cache line in L1 (L2 and upwards is usually shared, but L1 is normally per-core!), and concurrently modifies that value. Of course that happens atomically, too, but now you have two "correct" (correctly, atomically, modified) values -- which one is the truly correct one now?
+The CPU will sort it out somehow, of course. But the result may not be what you expect.
+Second, there is memory ordering, or worded differently happens-before guarantees. The most important thing about atomic instructions is not so much that they are atomic. It's ordering.
+You have the possibility of enforcing a guarantee that everything that happens memory-wise is realized in some guaranteed, well-defined order where you have a "happened before" guarantee. This ordering may be as "relaxed" (read as: none at all) or as strict as you need.
+For example, you can set a pointer to some block of data (say, the results of some calculation) and then atomically release the "data is ready" flag. Now, whoever acquires this flag will be led into thinking that the pointer is valid. And indeed, it will always be a valid pointer, never anything different. That's because the write to the pointer happened-before the atomic operation.That a single compiler's output, on a specific CPU architecture, with optimizations disabled (since gcc doesn't even compile ++ to add when optimizing in a quick&dirty example), seems to imply incrementing this way is atomic doesn't mean this is standard-compliant (you would cause undefined behavior when trying to access num in a thread), and is wrong anyways, because add is not atomic in x86.
+Note that atomics (using the lock instruction prefix) are relatively heavy on x86 (see this relevant answer), but still remarkably less than a mutex, which isn't very appropriate in this use-case.
+Following results are taken from clang++ 3.8 when compiling with -Os.
+Incrementing an int by reference, the "regular" way :
+void inc(int& x)
+{
+    ++x;
+}
+
+This compiles into :
+inc(int&):
+    incl    (%rdi)
+    retq
+
+Incrementing an int passed by reference, the atomic way :
+#include <atomic>
+
+void inc(std::atomic<int>& x)
+{
+    ++x;
+}
+
+This example, which is not much more complex than the regular way, just gets the lock prefix added to the incl instruction - but caution, as previously stated this is not cheap. Just because assembly looks short doesn't mean it's fast.
+inc(std::atomic<int>&):
+    lock            incl    (%rdi)
+    retqWhen your compiler uses only a single instruction for the increment and your machine is single-threaded, your code is safe. ^^Try compiling the same code on a non-x86 machine, and you'll quickly see very different assembly results.
+The reason num++ appears to be atomic is because on x86 machines, incrementing a 32-bit integer is, in fact, atomic (assuming no memory retrieval takes place). But this is neither guaranteed by the c++ standard, nor is it likely to be the case on a machine that doesn't use the x86 instruction set. So this code is not cross-platform safe from race conditions.
+You also don't have a strong guarantee that this code is safe from Race Conditions even on an x86 architecture, because x86 doesn't set up loads and stores to memory unless specifically instructed to do so. So if multiple threads tried to update this variable simultaneously, they may end up incrementing cached (outdated) values
+The reason, then, that we have std::atomic<int> and so on is so that when you're working with an architecture where the atomicity of basic computations is not guaranteed, you have a mechanism that will force the compiler to generate atomic code.Missing __stack_chk_fail Symbol Using GCCBased on what I've seen with hardening audit tools the way to detect stack cookies/canaries is to dump symbols with readelf -s and look for the __stack_chk_fail symbol.
+I build my code with -fstack-protector-strong and as expected canaries are generally detected. The problem is some of the binaries I build don't have the __stack_chk_fail even though the -fstack-protector-strong option is used. 
+Are there situations/conditions where binaries may not include the __stack_chk_fail symbol even though stack protection is enabled?SSH Tunneling using libssh2I am trying to do a SSH-TUNNEL trough libssh2. Till now i was doing it with this command :
+server# sshpass -p password ssh -vvv username@1.2.3.4 -o StrictHostKeyChecking=no -N -D 1.2.3.4:5555
+
+the -D 1.2.3.4:5555 is used to open the tunnel on internet on that port then i go and use it with CURL :
+server# curl --SOCKS5 "1.2.3.4:5555" "www.somesite.com"
+-- content of the website --
+
+Now i am trying to do the same, but with libssh2, thus i need to do it in C/C++
+I tried both examples from libssh2
+direct_tcpip.c -> https://www.libssh2.org/examples/direct_tcpip.html
+Fingerprint: 5D 75 A3 D9 10 65 D5 C4 6B CA 37 98 26 33 53 24 F8 19 1B F9
+Authentication methods: publickey,password
+Waiting for TCP connection on 1.2.3.4:5555...
+Forwarding connection from 1.2.3.4:58595 here to remote 1.2.3.4:22
+read: Connection reset by peer <-- When I use curl command
+
+and
+tcpip-forward.c -> https://www.libssh2.org/examples/tcpip-forward.html
+Fingerprint: 5D 75 A3 D9 10 65 D5 C4 6B CA 37 98 26 33 53 24 F8 19 1B F9
+Authentication methods: publickey,password
+Waiting for TCP connection on 1.2.3.4:5555...
+Forwarding connection from 1.2.3.4:58595 here to remote 1.2.3.4:22
+The remote client at 1.2.3.4:5555 disconnected! <-- When I use curl command
+
+and curl command :
+server# curl --SOCKS5 "1.2.3.4:5555" "somesite.com"
+ curl: (7) Received invalid version in initial SOCKS5 response.
+What is the problem? Is libssh2 capable of tunneling or not? 
+P.S. The project is compatible C/C++, that's why I put two tags.Converting floats to and displaying Binary Numbers in CSo I'm just diving into C during my first few days of classes. My professor proposed a question/ more of a challenge for us so I thought I'd propose it here. 
+float x,y,z;
+x = 0.0;
+y = 1.0;
+z = -2.5;
+
+He wanted us to display these numbers in binary and hexadecimal without using %x etc. He also hinted to use a union:
+union U {
+float y;
+unsigned z;
+};
+
+Thank you for your time in advance. I'm just looking for help/ an explanation on how to develop such conversion.The correct way, not violating the strict aliasing rule would be to alias the float with a char array, which is allowed by the C standard.
+union U {
+  float y;
+  char c[sizeof (float)];
+};
+
+This way you will be able to access the individual float y; bytes using the c array, and convert them into binary/hex using the very simple algorithm that can be easily found around (I will leave it up to you, as it is your assignment).Segmentation Fault using free() in c [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+How to copy a char array in C?
+
+                                (13 answers)
+                            
+
+Closed 5 years ago.
+
+
+
+I am trying to find the issue with a bit of C code that I have. The debugger says that the error occurs when I try to free the mem from a pointer:
+int main(int argc, char *argv[]){   
+    char *desc = malloc(30 * sizeof(char));
+    if(desc == NULL)                    
+    {
+        fprintf(stderr, "Error - cannot allocate memory\n");
+    }
+    desc = "Debug this program.";
+    printf("Description: %s\n", desc);
+    free(desc);//break point here
+    int cpid = fork();
+    ....You reassigned desc and then freed a pointer to a string literal, that's illegal and it causes the segmentation fault.
+You apparently failed to understand what malloc() is for, malloc() requests memory from the OS and returns a pointer to valid memory that you can use in your program.
+After you malloc() you can use the memory, but not all pointers need to me malloc()ed. For example, you can have pointers to string literals and they are useful too.
+But you can't pass anything to free() except if it was returned by malloc()/calloc()/realloc(). A pointer to a string literal or holding the address of a variable is not such a pointer, and passing it to free() is undefined behavior.
+Only use malloc() if you know that you MUST, for example to allocate a lot of memory that would overflow the stack or to allocate an unknown ammount of memory that you can calculate at runtime. Otherwise, don't.At first you allocated dynamically memory and its address assigned to the pointer desc
+char *desc = malloc(30 * sizeof(char));
+
+Then you reassigned the pointer with the address of the first character of the string literal "Debug this program."
+desc = "Debug this program.";
+
+Thus the address of the allocated memory was lost.
+Then you are trying to free the memory occupied by the string literal
+free(desc);//break point here
+
+However string literals have static storage duration and can not be freed by using standard function free.
+Instead of this assignment statement
+desc = "Debug this program.";
+
+you should use standard C function strcpy as for example
+strcpy( desc, "Debug this program." );You are trying to free address of a literal string, that is illegal.
+To init an mallocated string with your literal string you can use, e.g. strcpy:
+strcpy(desc, "Debug this program.");
+
+You should also exit/terminate your program in case of malloc fails.Simply said (and read the other solutions), that memory is not yours to delete.krb5_get_init_creds_opt_set_pkinit in MIT Kerberos?I'm looking for a function like 
+krb5_get_init_creds_opt_set_pkinit
+
+that we can find in Heimdal version of Kerberos, to eventually be able to get credentials from smartcard. 
+But I failed to find the same function in the MIT Kerberos version. It seems this function was removed. 
+So how the MIT Kerberos has replaced this function ?Heterogeneous data types in multiple dynamic values in a Pro *C query IN clauseThis is related to the following discussion
+Multiple dynamic values in a Pro *C query IN clause 
+My question is: What determines the value of L[..], is it the length of data defined in Oracle Table Description as Varchar(100) or size of the destination buffer of character array say defined of size 50 i.e. char xx[50]; then should L[..] be 100 or 50? And data type T[..] should be 1?
+If I use data type T[..] as 6, then will the value of L[..] change?
+What about datatypes in destination (our own data structures where we fetch the results) are declared as int, long, short whereas Oracle side datatype is NUMBER(10), what we should use as T[..]? 3? and length L[..] as sizeof(int)?
+Please help me with a detailed note on usage of L and T variables related to the V variable.Socket client using SelectIm trying to implement a client function which can establish connection with multiple servers using select() function. But I'm not a expert in using select() function.
+However my client can enable a connection with the multiple servers but it could not able to read messages from those multiple servers.
+As per my following example , i connected my client with two servers ( 192.168.100.136, 192.168.100.138).
+After connected with those two servers , my client was receiving messages from only one server (192.168.100.136) , instead of receiving messages from multiple servers..
+I'm not sure about the way I used select() function in my sample program.
+Please correct my sample application to get the desired o/p..
+Thanks in advance
+int main()
+{
+    int port = 10001 ;
+    char ip[][32] = {"192.168.100.136","192.168.100.138"};
+    int count = 2 ;
+    int ret = clientSelect(ip,port,count);
+    return 0 ;
+}   
+int clientSelect(char **ipAddr ,int port , int count)
+    {
+    SOCKET max_sd = 0;
+    SOCKET socketId[10] = {0};
+    SOCKET sd = 0 ;
+    SOCKET client_sock[1024] = {0} ;
+    fd_set readfds;
+    int i ,j , ret;
+    char recvBuf[1024] = "";
+    char errMsg[256] = "" ;
+    struct sockaddr_in server ;
+
+    FD_ZERO(&readfds);
+    // Socket Initialization
+    for(i = 0; i<count ; i++)
+    {
+        ret = initSocket(&socketId[i]);//Small function to create socket
+        if (ret != 1)
+        {
+            return ret ;
+        }
+        //Server info
+        server.sin_addr.s_addr  = inet_addr(ipAddr[i]);
+        server.sin_family       = AF_INET;
+        server.sin_port         = htons(port);
+        // Conect to server
+        if (connect(socketId[i], (struct sockaddr *)&server , sizeof(server)) < 0)
+        {
+            printf("connect ::Failed to connect to server %s:%d",ipAddr[i],port);
+            return -1;
+        }
+        // Set Socket fd
+        FD_SET(socketId[i], &readfds); 
+
+        max_sd = (max_sd>socketId[i])?max_sd:socketId[i];
+    }
+    while(TRUE)
+    {
+        ret = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+        if (ret < 0)
+        {
+            printf("select failed\n ");
+            return -1;
+        }
+        for ( j = 0 ; j<max_sd ; j++)
+        {
+            sd = client_sock[j] ;
+            if (FD_ISSET(sd, &readfds)) 
+            {
+                ret = recv(sd,(char *)recvBuf,sizeof(recvBuf), 0);
+                if(ret > 0 )
+                {
+                    printf("Message received from socket %d : %s\n",sd,recvBuf);
+                    send(sd,(char *)recvBuf,strlen(recvBuf),0);
+                }
+            }
+        }
+    }
+
+    return ret ;
+
+}The fd_set must be initialized before each use.
+Your code should be like:
+int clientSelect(char **ipAddr ,int port , int count)
+{
+    SOCKET max_sd = 0;
+    SOCKET socketId[10] = {0};
+    SOCKET sd = 0 ;
+
+    fd_set readfds;
+    int i ,j , ret;
+    char recvBuf[1024] = "";
+    char errMsg[256] = "" ;
+    struct sockaddr_in server ;
+
+    // Socket Initialization
+    for(i = 0; i<count ; i++)
+    {
+        ret = initSocket(&socketId[i]);//Small function to create socket
+        if (ret != 1)
+        {
+            return ret ;
+        }
+        //Server info
+        server.sin_addr.s_addr  = inet_addr(ipAddr[i]);
+        server.sin_family       = AF_INET;
+        server.sin_port         = htons(port);
+        // Conect to server
+        if (connect(socketId[i], (struct sockaddr *)&server , sizeof(server)) < 0)
+        {
+            printf("connect ::Failed to connect to server %s:%d",ipAddr[i],port);
+            return -1;
+        }       
+    }
+
+
+    while(TRUE)
+    {
+        // init fd_set
+        FD_ZERO(&readfds); // added by siva to initialize socket descriptors
+        for(i = 0; i<count ; i++)
+        {
+            //FD_ZERO(&readfds); // Commented by siva to avoid initialization for each socket
+            FD_SET(socketId[i], &readfds); 
+            max_sd = (max_sd>socketId[i])?max_sd:socketId[i];
+        }
+        ret = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+        if (ret < 0)
+        {
+            printf("select failed\n ");
+            return -1;
+        }
+        // warning: you don't know the max_sd value
+        for(i = 0; i<count ; i++)
+        {
+            sd = socketId[i] ;
+            if (FD_ISSET(sd, &readfds)) 
+            {
+                ret = recv(sd,(char *)recvBuf,sizeof(recvBuf), 0);
+                if(ret > 0 )
+                {
+                    printf("Message received from socket %d : %s\n",sd,recvBuf);
+                    send(sd,(char *)recvBuf,strlen(recvBuf),0);
+                }
+            }
+        }
+    }
+
+    return ret ;
+
+}Trouble with the QDBMP library in CHi i recently was searching for a way to make bitmap image with C, so i found the QDBMP library which look's easy but i've got a problem.
+When i create a bmp image and a color, it stay black always, here is the code:
+#include <stdio.h>
+#include <stdlib.h>
+#include "qdbmp.h"
+
+void main() {
+
+BMP* image = BMP_Create(640,480,8);
+int i,j;
+
+for(i=0;i<640;i++){
+    for(j=0;j<640;j++){
+        BMP_SetPixelRGB(image,i,j,10,20,100);
+    }
+}   
+
+BMP_WriteFile(image,"image.bmp");
+BMP_Free(image);
+
+}If you use index color (8 bits depth), you must create a palette and use indexed color. See BMP_SetPixelIndex and BMP_SetPaletteColor
+If you want a faster (I mean if you don't want to modify your code too much) result (but a bigger file) use 16 or 32 bits depth images.If you create an 8-bit BMP, the coloring uses a palette. Before you can set any color, you must first initialize the palette. The library provides:
+void BMP_SetPaletteColor( BMP* bmp, UCHAR index, UCHAR r, UCHAR g, UCHAR b );
+
+An 8 bit BMP has 256 palette entries:
+for (i=0; i<256; i++)
+    BMP_SetPaletteColor(image, i, i,i,i);
+
+Next you use the following function to set the color:
+void BMP_SetPixelIndex( BMP* bmp, UINT x, UINT y, UCHAR val );C How can I calculate an average of a list without loops? [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+So I created a linked List in C using structs and it stores ints. My mission is to calculate the average of the values in the list without using recursion or loops.
+I already have the list's item count I just need the sum.
+Any ideas?Simply have two varibles - count, total; Update them in Add and Delete.
+When u want avg, just return total/count.The list is not length bounded, but i found a solution.
+I create a variable in the list's ateuct to save the sum of the list, and i change the sum of the list each time I add or remove a cell. When I want to calculate the sums I'll just divide the sum by the count.
+Thank you anyway for your help :)Error C3861: 'execute_assert': identifier not foundAlright, this should be easy enough. 
+I am programming a dll whose source code is too big to post here. 
+But it only has three errors from the same repeating code...
+// Test parameter s
+execute_assert(s >= MAX_ACL_DEPTH, "MAX_ACL_DEPTH too small");
+
+Now I know EXECUTE_ASSERT is a macro so I think I only need to include a header.
+I just need to know the header.
+I'm building using Visual Studio 2012 Ultimate.
+Thanks.Thanks for the insight.
+I included... 
+C:\Program Files\Microsoft SDKs\Windows\v7.1\Samples\multimedia\directshow\baseclasses
+In project properties after adding 
+#include <Streams.h>
+#include <wxdebug.h>
+
+and changed
+execute_assert
+
+to
+EXECUTE_ASSERT
+
+Result...
+1>  Generating Code...
+1>c:\users\...\Analytical.lib
+========== Rebuild All: 1 succeeded, 0 failed, 0 skipped ==========Using uint32_t* to change value of uint8_t arrayConsider I have 2 unsigned numbers, of 32 bits each, saved in a single array. The first number is contained in positions [0; 3] and the second in positions [4; 8]. I now which to change the value of one of the numbers, is the following code allowed/problematic?
+uint8_t array[8];
+//...Fill it up...
+
+uint32_t *ptr = NULL;
+ptr = (uint32_t*)&array[0];
+*ptr = 12345;
+
+ptr = (uint32_t*)&array[4];
+*ptr = 54321;You may not access an uint8_t array with a pointer to uint32_t. That's a violation of the strict aliasing rule (the other way around would be ok - if uint8_t is a character type).
+Instead, you might want to use "type punning" to circumvent the C (C99 and above) type system. For that, you use a union with members of the respective types:
+union TypePunning {
+  uint32_t the_ints[2];
+  uint8_t the_bytes[2 * sizeof(uint32_t)];
+}
+// now e.g. write to the_bytes[1] and see the effect in the_ints[0].
+// Beware of system endianness, though!Splitting 32 bit register in variable size bytesI want to split a  general purpose register into three separate registers; two 8 bit registers & one 16 bit register. This is the approach I am using but I think  it may be wrong.
+typedef struct {
+       volatile uint8_t reg_0;
+       volatile uint8_t reg_1;
+       volatile uint16_t reg_2;
+} reg_split;
+
+#define REG_BASE (0xA040000C)
+#define REG ((reg_split *)REG_BASE)
+
+And this is how I am accessing the register:
+REG->reg_0 = 0xFF;
+
+Is this the wrong approach or is their a cleaner solution?What's most important for all kinds of memory mappings like these, is that you verify that the C code yields the expected result. You have to consider padding and alignment.
+Some minor nit-picks with your example:
+
+Always ensure that all hex literals in your code have a type that makes sense. 0xA040000C in your case is of a signed type, most likely unsigned int. Had you used a literal like 0x5040000C however, it would be of (signed) int type. On most systems it doesn't make sense to have signed addresses. "Sloppy types" can cause all manner of subtle bugs, particularly when combined with various forms of integer promotion.
+Move the volatile qualifier out of the struct. Avoid using type qualifiers inside structs if possible - they usually cause lots of type compatibility hiccups.
+Pointer notation for hardware registers is a bit peculiar. The most common style is to regard registers as declared variables.
+
+With the above remarks in mind, your code could be re-written as:
+typedef struct {
+  uint8_t  reg_0;
+  uint8_t  reg_1;
+  uint16_t reg_2;
+} reg_split;
+
+#define REG_BASE (0xA040000Cu)
+#define REG (*(volatile reg_split *)REG_BASE)
+
+_Static_assert(sizeof(reg_split) == 4, "Unwanted padding detected");
+
+...
+
+REG.reg_0 = 0xFF;Why do fseek & fputc not work in my program?I am learning to program in C. Please explain why my program doesn't work. What is wrong? The program creates a file, writes a number into this file, and increases this number each time I run this program. The program counts how many times I have opened the file. 
+#include <stdio.h>
+
+int main (void)
+{
+    int n;
+    int c;
+    FILE* f = fopen("count_pr.bin", "a+");
+    if ((c=fgetc(f)) == EOF)
+    {
+        n=1;
+        fputc(n, f);
+    }
+    else 
+    {
+        ++n;
+        fseek(f, 0, SEEK_SET);
+        fputc(n, f);
+    }
+    printf ("The program was opened: %d\n", n);
+    fclose(f);
+}In the "a+" mode, from here
+
+append/update: Open a file for update (both for input and output) with all output operations writing data at the end of the file. Repositioning operations (fseek, fsetpos, rewind) affects the next input operations, but output operations move the position back to the end of file. The file is created if it does not exist.
+
+Output operations move the position back to the end of the file. So every write you do will be at the end of the file.
+In addition, you need to make changes as suggested by Klas
+If you want to overwrite the number each time, you should use r+ mode
+
+read/update: Open a file for update (both for input and output). The file must exist.
+
+There is still the issue of creating the file if it does not exist, so in that case, if the file cannot be opened in r+ mode, then you can open it in "w" or "w+" mode and only write to it.
+I have updated the code below.
+#include <stdio.h>
+int main (void)
+{
+    int n;
+    int c;
+    FILE* f = fopen("count_pr.bin", "r+");
+    if (f == NULL)
+    {
+        f = fopen("count_pr.bin", "w");
+        if (f != NULL)
+        {
+           n = 1;
+           fputc(n, f);
+        }
+        else
+        {
+           printf (" File Open Error");
+           exit(1);
+        }
+    }
+    else
+    {    
+        c=fgetc(f);
+        n = c+1;
+        fseek(f, 0, SEEK_SET);
+        fputc(n, f);
+    }
+    printf ("The program was opened: %d\n", n);
+    fclose(f);
+}You read the value into c. Then you increase the uninitialized variable n by one and write n to the file. Since n is uninitialized you invoke undefined behaviour.
+You need to use the value you read:
+    else 
+    {
+        n = c + 1;  // Changed line
+        fseek(f, 0, SEEK_SET);
+        fputc(n, f);
+    }How to get Div Row ID in Code Behind?I would like to ask how do I get this control at code behind. I know it can be done at client side. I tried but get an error:
+
+"Object reference not set to an instance of an object."
+
+What is the correct method to get it? If it is textbox, I just declare textbox. But this is div class. 
+Code Behind
+ TableRow trStatusB = fvAddOn.FindControl("EditProductNameRow") as TableRow;
+
+Client Side
+ <div class="Row" id="EditNameRow" runat="server"> 
+</div>C: Get input and store it into a char without any librariesIs it possible to get a input and store it into a char without any additionals libraries?
+So gets() and other functions like this are not available.
+Any ideas?The only specified "input" available to a program without libraries is through int main(int argc, char *argv[]).  @j2ko @kiner_shah
+The only "output" available is int main()'s return value.Infinite while loop in C when given value and subtracting until zeroI have just began to learn C. I am writing a program that gives change back to the customer in quarters, nickels, dimes and pennies. For some reason when the while loop reaches 0 it does not break.
+EDIT: This question is very similar to another question already on SO (Is floating point math broken?). I would keep this question for those searching for answers regarding the while loop, like myself, who had no idea the floating point number was causing the infinite while loop.   
+#include <stdio.h>
+#include <cs50.h>
+
+int main(void){
+    float val;
+    int quarters = 0;
+    int dimes = 0;
+    int nickels = 0;
+    int pennies = 0;
+
+    printf("How much change is due?: \n");
+
+    val = GetFloat();
+
+    while (val > 0){
+
+        if (val >= 0.25){
+            quarters += 1;
+            val -= 0.25;
+        }
+        else if (val >= 0.1) {
+            dimes += 1;
+            val -= 0.1;
+        }
+        else if (val >= 0.05){
+            nickels += 1;
+            val -= 0.05;
+        }
+        else if (val >= 0.01){
+            pennies += 1;
+            val -= 0.01;
+        }
+
+        printf("%f \n", val);
+    }
+
+    printf("Quarters: %i\n", quarters);
+    printf("Dimes: %i\n", dimes);
+    printf("Nickels: %i\n", nickels);
+    printf("Pennies: %i\n", pennies);
+
+    return 0;
+}
+
+Any suggestions on how to handle?This is because float can't represent all values 100% correctly. For some input values your program will end up with valbeing greater than zero and less than 0.1. Then you have a deadlock.
+Changing your print to:
+printf("%0.30f \n", val);
+
+will output:
+
+0.009999995119869709014892578125
+
+on my system.
+A better approach could be to do the calculations in int instead. Something like:
+#include <stdio.h>
+#include <cs50.h>
+#include <math.h>
+
+int main(void){
+    float val;
+    int intval;
+    int quarters = 0;
+    int dimes = 0;
+    int nickels = 0;
+    int pennies = 0;
+
+    printf("How much change is due?: \n");
+
+    val = GetFloat();
+
+    intval = roundf(100 * val);  // Multiply by 100 and convert to int
+
+    // Use intval instead of val for the remaining code
+    while (intval > 0){
+
+        if (intval >= 25){     // note: 0.25 --> 100 * 0.25 --> 25 
+            quarters += 1;     // similar for all other code below 
+            intval -= 25;
+        }
+        else if (intval >= 10) {
+            dimes += 1;
+            intval -= 10;
+        }
+        else if (intval >= 5){
+            nickels += 1;
+            intval -= 5;
+        }
+        else if (intval >= 1){
+            pennies += 1;
+            intval -= 1;
+        }
+
+        printf("%d \n", intval );
+    }
+
+    printf("Quarters: %i\n", quarters);
+    printf("Dimes: %i\n", dimes);
+    printf("Nickels: %i\n", nickels);
+    printf("Pennies: %i\n", pennies);
+
+    return 0;
+}Checking with a debugger, you will see that the floating point values are not accurate.
+In this example. after assigning val = (float)0.41 you can see in gdb:
+(gdb) p val
+$2 = 0.409999996
+
+The endless loop happens because at the end val is bigger than 0 but smaller than 0.01
+the easiest solution is to break in such case. Of course you might lose a penny:
+while (val >= 0.01){
+    ...How to pass a array's total elements as an function's postion parameter?I had a array in c:
+int array[] = {1, 2, 3, 4};
+
+and I had a function's protype like this:
+int add_all(int a, int b, int c, int d);
+
+But how can I pass the array's all elements as the function's parameter at one time?
+I know in python, this can be done like this:
+array=[1,2,3,4]
+add_all(*array)
+
+Could someone tell me how to achieve the same effect in C?Try this:
+#include <boost/preprocessor/arithmetic/add.hpp>
+#include <boost/preprocessor/control/while.hpp>
+#include <boost/preprocessor/tuple/elem.hpp>
+#include <boost/preprocessor/tuple/push_back.hpp>
+#include <boost/preprocessor/tuple/reverse.hpp>
+
+#define ARRAY_ELEM(x,n) x[n]
+
+#define PRED(n, state) BOOST_PP_TUPLE_ELEM(3, 1, state)
+
+#define OP(d, state) \
+   OP_D( \
+      d, \
+      BOOST_PP_TUPLE_ELEM(3, 0, state), \
+      BOOST_PP_TUPLE_ELEM(3, 1, state), \
+      BOOST_PP_TUPLE_ELEM(3, 2, state) \
+   ) 
+
+#define OP_D(d, res, c, arr_name) \
+   ( \
+      BOOST_PP_TUPLE_PUSH_BACK(res,ARRAY_ELEM(arr_name,BOOST_PP_DEC(c))), \
+      BOOST_PP_DEC(c), \
+      arr_name \
+   ) \
+
+
+#define UNPACK_REVERSE(ARR_NAME,N) \
+    BOOST_PP_TUPLE_ELEM( \
+      3, 0, \
+      BOOST_PP_WHILE(PRED, OP, ((ARRAY_ELEM(ARR_NAME,BOOST_PP_DEC(N))), \
+                    BOOST_PP_DEC(N),ARR_NAME) ) \
+   )
+/*The macro to be called*/
+#define UNPACK(ARR_NAME,N) \
+    BOOST_PP_TUPLE_REVERSE(UNPACK_REVERSE(ARR_NAME,N))
+
+And here's a usage example:
+void print3(int x, int y, int z){
+    printf("%d,%d,%d\n",x,y,z);
+}
+int main(){
+    int z[3]={1,2,3};
+    print3 UNPACK(z,3);
+    return 0;
+}
+
+This macro uses Boost's Preprocessor library in a loop to generate and expand the array elements in a tuple. Hope it helps.Use this:
+int add_all(array, 4);
+
+When you call a function, and you try to pass it an array, this array
+will be converted to a pointer to the first element of the array.
+Function prototype 
+int add_all(int[] , int size);
+
+or
+int add_all(int* , int size);How do I wait for particular response without neglecting other responses using select in c sockets?I have a single client program where I need to send a request and timed wait for the corresponding response. But I should be receiving all other responses even if it is waiting or not.
+My pseudocode:
+Recv Section:
+struct timeval timeout = {
+     .tv_sec = 5,
+     .tv_usec = 0
+};
+
+while (1) {
+   ret = select(maxfd + 1, &rdfd, NULL, NULL, &timeout);
+   if (ret == 0) {
+       fprintf(stderr, "No response for request\n");
+       return;
+   }
+
+   ret = recvfrom(.buf..);
+
+   struct standard_msg *std_msg = buf;
+
+   switch(std_msg->type) {
+        case TYPE_1: 
+            if expecting response for TYPE_1
+            read and retun from here;
+            else loop until timeout
+        case TYPE_2:
+            if expecting response for TYPE_2
+            read and return from here
+            else loop until timeout
+        default:
+            print buf
+   }
+}
+
+Send Section:
+while(1) {
+   struct timeval timeout = {
+      .tv_sec = 50,
+      .tv_usec = 0
+   }
+   select(1, NULL, NULL, NULL, &timeout);
+   send_a_packet_wait_for_ITS_response(); //which will call the recv_secion
+}
+
+The send happens by reading the contents of file every 50 secs. Lets say if a packet is sent got reply right back, now I will be waiting for  50 secs to send other packet. During this time I cannot read any packet that is received. And if the file reaches EOF there is nothing to send and now also I cannot read any packet.
+So here I need to continuously listen to all packets and also listen for a particular packet. Is it possible to run a listen code for all other packets and listen code for particular packets? How do I solve this problem?
+My intention is to get reply for a particular request within a configured timeout, without losing other packets.
+Thanks in advanceNo interpretation of the payload itself (i.e. OSI layer 5..7) is done by the OS when you read from a socket. This means all application layer logic like this has to be done in the application itself. Which means that you need to read each packet even if you don't need it know, in which case you could just put it in some application specific buffer for later use.ImageMagic library with Cmake: linking errorI'm programming in C. I want use ImageMagick library but some fuction can't be resolved.
+This is my cMakeList.txt file:
+cmake_minimum_required(VERSION 3.3)
+project(WebServer)
+
+set(CMAKE_C_COMPILER "/usr/bin/gcc")
+
+set(SOURCE_FILES io.c server.c lock_fcntl.c sig_handler.c thread_job.c    msg_parser.c)
+set(LIB http-parser-master/http_parser.c )
+
+set(CMAKE_USE_PTHREADS_INIT true)
+set(CMAKE_USE_PTHREADS_INIT ON)
+
+find_package(Threads REQUIRED)
+find_package(ImageMagick COMPONENTS ImageWand)
+
+include_directories(header)
+include_directories(http-parser-master)
+
+#include_directories(/usr/local/include/ImageMagick-7/MagickWand)
+include_directories(${ImageMagick_INCLUDE_DIRS})
+
+add_executable(server ${SOURCE_FILES} ${LIB})
+add_executable(client client.c io.c)
+add_executable(main main.c io.c)
+
+target_link_libraries(main ${ImageMagick_LIBRARIES})
+target_link_libraries(server Threads::Threads)
+
+and this is the source main.c:
+#include <ImageMagick-7/MagickWand/MagickWand.h>
+#include "basic.h"
+
+void convert_image(char *path, float quality_factor, char *out) {
+
+    int width, height;
+    MagickWand *n_wand = NULL;
+
+    MagickWandGenesis();
+
+    m_wand = (struct MagickWand *) NewMagickWand();
+
+
+    MagickReadImage(m_wand,"logo:");
+
+    width = MagickGetImageWidth(m_wand);
+    height = MagickGetImageHeight(m_wand);
+
+    if((width /= 2) < 1)width = 1;
+    if((height /= 2) < 1)height = 1;
+
+    MagickResizeImage(m_wand,width,height,LanczosFilter,1);
+
+    MagickSetImageCompressionQuality(m_wand,95);
+
+    MagickWriteImage(m_wand,"logo_resize.jpg");
+
+   if(m_wand)m_wand = (struct MagickWand *) DestroyMagickWand(m_wand);
+
+    MagickWandTerminus();
+}
+
+On build I get this error:
+Scanning dependencies of target main
+[ 33%] Building C object CMakeFiles/main.dir/main.c.o
+[ 66%] Linking C executable main
+CMakeFiles/main.dir/main.c.o: nella funzione "convert_image":
+/home/emanuele/ClionProjects/WebServer/main.c:14: riferimento non    definito a "MagickWandGenesis"
+/home/emanuele/ClionProjects/WebServer/main.c:16: riferimento non      definito a "NewMagickWand"
+/home/emanuele/ClionProjects/WebServer/main.c:19: riferimento non definito a "MagickReadImage"
+/home/emanuele/ClionProjects/WebServer/main.c:22: riferimento non definito a "MagickSetImageCompressionQuality"
+/home/emanuele/ClionProjects/WebServer/main.c:25: riferimento non definito a "MagickWriteImage"
+ /home/emanuele/ClionProjects/WebServer/main.c:28: riferimento non definito a "DestroyMagickWand"
+ /home/emanuele/ClionProjects/WebServer/main.c:30: riferimento non  definito a "MagickWandTerminus"
+collect2: error: ld returned 1 exit status
+make[3]: *** [main] Errore 1
+make[2]: *** [CMakeFiles/main.dir/all] Errore 2
+make[1]: *** [CMakeFiles/main.dir/rule] Errore 2
+make: *** [main] Errore 2
+
+ImageMagick is correctly installed and it work by command line. How to solve?In your case you get the linker errors because find_package cannot find a configuration for the library.
+find_package looks for a file in the format of <name>Config.cmake or <lower-case-name>-config.cmake which will set the necessary variables.
+Not every library has these files and when not you have to manually specify the library name in target_link_library(...) and other configurations (like library path and include path etc. if necessary)Why doesn't the NumPy-C api warn me about failed allocations?I've been writing a Python extension that writes into a NumPy array from C. During testing, I noticed that certain very large arrays would generate a segfault when I tried to access some of their elements. 
+Specifically, the last line of the following code segment fails with a segfault:
+    // Size of buffer we will write to
+    npy_intp buffer_len_alt = BUFFER_LENGTH;
+
+    //
+    PyArray_Descr * dtype;
+    dtype = PyArray_DescrFromType(NPY_BYTE);
+    PyObject* column = PyArray_Zeros(1, &buffer_len_alt, dtype, 0);
+
+    //Check that array creation succeeds
+    if (column == NULL){
+        // This exit point is not reached, so it looks like everything is OK
+        return (PyObject *) NULL;
+    }
+
+    // Get the array's internal buffer so we can write to it
+    output_buffer = PyArray_BYTES((PyArrayObject *)column);
+
+    // Try writing to the buffer
+    output_buffer[0] = 'x'; //No segfault
+    output_buffer[((int) buffer_len_alt) - 1] = 'x'; // Segfault here
+
+I checked and found that the error occurs only when I try to allocate an array of about 3GB (i.e. BUFFER_LENGTH is about 3*2^30). It's not surprising that an allocation of this size would fail, even if Python is using it's custom allocator. What really concerns me is that NumPy did not raise an error or otherwise indicate that the array creation did not go as planned.
+I have already tried checking PyArray_ISCONTIGUOUS on the returned array, and using PyArray_GETCONTIGUOUS to ensure it is a single memory segment, but the segfault would still occur. NPY_ARRAY_DEFAULT creates contiguous arrays, so this shouldn't be necessary anyways.
+Is there some error flag I should be checking? How can I detect/prevent this situation in the future? Setting BUFFER_LENGTH to a smaller value obviously works, but this value is determined at runtime and I would like to know the exact bounds.
+
+EDIT:
+As @DavidW pointed out, the error stems from casting buffer_len_alt to an int, since npy_intp can be a 64-bit number. Replacing the cast to int with a cast to 'unsigned long' fixes the problem for me.The issue (diagnosed in the comments) was actually with the array lookup rather than the allocation of the array.  Your code contained the line
+output_buffer[((int) buffer_len_alt) - 1] = 'x'
+
+When buffer_len_alt (approx value 3000000000) was cast to an (32 bit) int (maximum value 2147483647) you ended up with an invalid address, probably a large negative number.
+The solution is just to use
+output_buffer[buffer_len_alt - 1] = 'x'
+
+(i.e. I don't see why you should need a cast at all).Setting up tmk_keyboard firmware on Arduino NanoI'm trying to install keyboard firmware to my Arduino Nano chip. There's tmk_keyboard code project for that, in this example I install one_key.vusb but I tried other setups as well.
+git clone https://github.com/tmk/tmk_keyboard.git
+cd tmk_keyboard/keyboard/onekey
+make clean
+make -f Makefile.vusb
+sudo avrdude -C <arduino dir>/etc/avrdude.conf  -p atmega328p -vv -c arduino  -b 57600 -P /dev/ttyUSB0 -D -Uflash:w:onekey_vusb.hex:i
+
+Then after replugging tried shorting pb0 and pb1 as pointed out in one_key docs (which are d9 and d8 on Arduino), but no effect. 
+I also tried setting MCU = atmega328p and F_CPU = 16000000Lin the Makefile.vusb, and building again, but still no effectC programming-3 testing condition in if statements#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+   float marks;
+   char sports;
+   char dance[10];
+
+   printf("Enter your marks:\n");
+   scanf(" %f",&marks);
+
+   printf("Do you play sports?? <y/n>\n");
+   scanf(" %c",&sports);
+
+   printf("Do you dance?? <yes/no>\n");
+   scanf(" %s",dance);
+
+   if((marks >=70) && (sports == 'y') &&(dance == "yes"))
+  {
+    printf("You are a Good Student\n");
+} else{
+    printf("You are a Average student\n");
+}
+
+return 0;
+
+
+
+
+}
+
+In any scenario am not getting output as -you are a good student
+am getting output if i make dance as char but i want it to solve using string.
+can anyone tell me whats wrong in this code.When you do dance == "yes" you are comparing two pointers (the pointer to the first element in the array dance, and the pointer to the first letter in "yes"). And those two pointers will never be the same.
+To compare string you need to use the strcmp function:
+strcmp(dance, "yes") == 0Use strcmp() in your code instead of dance == "yes" because dance read the three characters, plus the implicit \0 terminator and  your condition becomes false.Do I "have to" free() static dynamically allocated pointers?I have a function with a for loop and inside the loop (and depending on the input) certain variables are initialized once (the first time) using malloc().
+These variables are declared like this:
+static double *vector;
+and then I allocate the memory using
+malloc(size*sizeof(double));
+
+The Question is:
+Do I have to free these variables in the last iteration of the loop inside the called function or not?
+UPDATE: maybe I explained myself wrong for some people. The thing is the called function (func_A) allocates memory for certain vectors it uses depending on the input from the main function. Then, this func_A is called several times from a loop in the main. That is why I define the variables as static, so that they are not defined everytime the func_A is called (for a matter of time consumption), because the dimensions will not change throughout the whole run. The variables are static but not global, so I can not free them from the main (right?).You should always balance a malloc with a call to free.
+In your case, you could call it when you know you no longer need the vector.
+If that's not practical then you could always make a call to atexit; passing to it a pointer to a suitable function which will free the memory. See http://www.tutorialspoint.com/c_standard_library/c_function_atexit.htm
+Although you can often rely on operating systems to clean up for you on program termination, it's rather crude to rely on that.Every malloc call needs to have corresponding free call, when the data is not used anymore.you need to free the pointer.
+as a rule of thumb - everything you allocate with malloc/new is on the heap and needs to be free'd/deleted everything else is on the stack and doesn't
+p.s. if you only used a grbage collected language such as java/go/python you wouldn't need to know any of thisIt seems a vector is allocated once and then used during the life time of the prorgam. The vector is stored in the static variable. Before terminating the program it would be a good idea to free the vector, but the termination will also do that for you.
+It sounds like the function is not prepared to work with different (in particular: larger) vector sizes during the program's life time.Do I have to free these variables in the last iteration of the loop inside the called function or not?
+
+You can, but you don't have to.
+You only have to free() the memory allocated by memory allocator functions when you don't need it anymore.
+One of the major purpose of memory allocation using malloc() and family is to overcome the limitation regarding scope of local variables (returning address of local variable from a function is illegal), so you never have to free() the memory "inside the called function". You can very well return the pointer (returned by malloc()) to the caller, perform some other operations with that pointer (memory) and then, clean up (free()) the pointer from the caller of the sub-function.
+One thing to remember though, you need to pass the exact pointer to free() which was originally returned by malloc() or family.Failed to build C code by using generated NDK toolchainI am working on build a c library for android 5.1.1. 
+First I build a standalone toolchain by following the  google ndk standalone toolchain guild.
+<prebuilt_ndk_r12b_path>/build/tools/make-standalone-toolchain.sh --platform=android-22 --ndk-dir=<prebuilt_ndk_r12b_path> --install-dir=/home/r0ng/utilities/ndk --toolchain=x86_64-linux-android-4.9
+
+After that, I exported CC, AR and RANLIB in ~/.bashrc
+export ANDROID_NDK=/home/r0ng/utilities/ndk
+SYSROOT=$ANDROID_NDK/sysroot
+
+export CC="$ANDROID_NDK/bin/arm-linux-androideabi-gcc-4.9.x --sysroot=$SYSROOT"
+export AR="$ANDROID_NDK/bin/arm-linux-androideabi-gcc-ar --sysroot=$SYSROOT"
+export RANLIB="$ANDROID_NDK/bin/arm-linux-androideabi-gcc-ranlib --sysroot=$SYSROOT"
+
+But when I tried to compile by using cmake ... I had the following errors:
+-- The C compiler identification is GNU 4.9.0
+-- The CXX compiler identification is GNU 4.9.3
+-- Check for working C compiler: /home/r0ng/utilities/ndk/bin/arm-linux-androideabi-gcc
+-- Check for working C compiler: /home/r0ng/utilities/ndk/bin/arm-linux-androideabi-gcc -- broken
+CMake Error at /usr/share/cmake-3.5/Modules/CMakeTestCCompiler.cmake:61 (message):
+  The C compiler "/home/r0ng/utilities/ndk/bin/arm-linux-androideabi-gcc" is
+  not able to compile a simple test program.
+
+  It fails with the following output:
+
+   Change Dir: /home/r0ng/projects/relic/build/CMakeFiles/CMakeTmp
+
+
+
+  Run Build Command:"/usr/bin/make" "cmTC_8d7ca/fast"
+
+  /usr/bin/make -f CMakeFiles/cmTC_8d7ca.dir/build.make
+  CMakeFiles/cmTC_8d7ca.dir/build
+
+  make[1]: Entering directory
+  '/home/r0ng/projects/relic/build/CMakeFiles/CMakeTmp'
+
+  Building C object CMakeFiles/cmTC_8d7ca.dir/testCCompiler.c.o
+
+  /home/r0ng/utilities/ndk/bin/arm-linux-androideabi-gcc
+  --sysroot=/home/r0ng/utilities/ndk -o
+  CMakeFiles/cmTC_8d7ca.dir/testCCompiler.c.o -c
+  /home/r0ng/projects/relic/build/CMakeFiles/CMakeTmp/testCCompiler.c
+
+  Linking C executable cmTC_8d7ca
+
+  /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_8d7ca.dir/link.txt
+  --verbose=1
+
+  /home/r0ng/utilities/ndk/bin/arm-linux-androideabi-gcc
+  --sysroot=/home/r0ng/utilities/ndk
+  CMakeFiles/cmTC_8d7ca.dir/testCCompiler.c.o -o cmTC_8d7ca -rdynamic
+
+
+  /home/r0ng/utilities/ndk/bin/../lib/gcc/arm-linux-androideabi/4.9.x/../../../../arm-linux-androideabi/bin/ld:
+  error: cannot open crtbegin_dynamic.o: No such file or directory
+
+
+  /home/r0ng/utilities/ndk/bin/../lib/gcc/arm-linux-androideabi/4.9.x/../../../../arm-linux-androideabi/bin/ld:
+  error: cannot open crtend_android.o: No such file or directory
+
+
+  /home/r0ng/utilities/ndk/bin/../lib/gcc/arm-linux-androideabi/4.9.x/../../../../arm-linux-androideabi/bin/ld:
+  error: cannot find -lc
+
+
+  /home/r0ng/utilities/ndk/bin/../lib/gcc/arm-linux-androideabi/4.9.x/../../../../arm-linux-androideabi/bin/ld:
+  error: cannot find -ldl
+
+  collect2: error: ld returned 1 exit status
+
+  CMakeFiles/cmTC_8d7ca.dir/build.make:97: recipe for target 'cmTC_8d7ca'
+  failed
+
+  make[1]: *** [cmTC_8d7ca] Error 1
+
+  make[1]: Leaving directory
+  '/home/r0ng/projects/relic/build/CMakeFiles/CMakeTmp'
+
+  Makefile:126: recipe for target 'cmTC_8d7ca/fast' failed
+
+  make: *** [cmTC_8d7ca/fast] Error 2
+
+
+
+
+
+  CMake will not be able to correctly generate this project.
+Call Stack (most recent call first):
+  CMakeLists.txt:6 (project)
+
+
+-- Configuring incomplete, errors occurred!
+See also "/home/r0ng/projects/relic/build/CMakeFiles/CMakeOutput.log".
+See also "/home/r0ng/projects/relic/build/CMakeFiles/CMakeError.log".
+
+It seems that the compiler is unable to find "crtbegin_dynamic.o", "crtend_android.o", "libc" neither "libdl". But when I checked, those files are all in the folder $HOME/utilities/ndk/sysroot/usr/lib. And I already set the --sysroot in CC, AR and RANLIB.
+
+Update 1 :
+After changed the toolchain generation command based on  Dan Albert's comment, The command cmake .. is able to be run successfully. But when I run make . I got following error:
+arm-linux-androideabi-gcc-4.9.x: error: unrecognized command line option '-m64'
+src/CMakeFiles/relic.dir/build.make:62: recipe for target 'src/CMakeFiles/relic.dir/relic_err.c.o' failed
+make[2]: *** [src/CMakeFiles/relic.dir/relic_err.c.o] Error 1
+CMakeFiles/Makefile2:120: recipe for target 'src/CMakeFiles/relic.dir/all' failed
+make[1]: *** [src/CMakeFiles/relic.dir/all] Error 2
+Makefile:138: recipe for target 'all' failed
+make: *** [all] Error 2
+
+Thanks,
+
+Environment:
+
+OS: Ubuntu 16.04 LTS
+gcc / g++: 4.9.3
+AOSP: 5.1.1_r30
+NDK: android-ndk-r12b
+cmake: 3.5.1If you want to use cmake, you don't need a standalone toolchain. Android Studio natively supports cmake now: http://tools.android.com/tech-docs/external-c-builds
+NDK r13 (not released yet) will also ship a cmake toolchain file for using cmake directly (the method shown in https://stackoverflow.com/a/5099229/632035).You shouldn't add --sysroot= explicitly. Standalone toolchain already knows about proper one.How to define the task.json to compile C/C++ code in vscode by using the cl.exe on windows?I have installed the Microsoft Visual C++ Build Tools 2015 on my 64bit win10 , and can use the cl.exe to compile and link the C/C++ program in a plain Command Prompt window by the following steps (some instructions from Setting the Path and Environment Variables for Command-Line Builds):
+ 1. cd "\Program Files (x86)\Microsoft Visual Studio 14.0\VC"
+ 2. vcvarsall amd64
+ 3. cl helloworld.c
+
+The helloworld.c is just a simple C source file to print "Hello world!". I aslo try to congfigure the task.json to directly compile and link C/C++ programs in the vs code. Here is my task.json:
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "0.1.0",
+    "command": "vcvarsall amd64 && cl",
+    "isShellCommand": true,
+    "args": ["${file}"],
+    "showOutput": "always"
+}
+
+And the path of vsvarsall and cl have been added in the PATH. But it still doesn't work (the output is put at the end of the post). So my question is that: how can I to define the task.json which can first run the vcvarsall amd64 to set system variables and then execute the cl command to compile and link programs.As Rudolfs Bundulis said, make a batch file and just call it, inside it do everything you need to do.
+tasks.json:
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "0.1.0",
+    "command": "build.bat",
+    "isShellCommand": true,
+    "args": [],
+    "showOutput": "always"    
+}
+
+And in your project have the build.bat goodness.
+build.bat:
+@echo off
+call "E:\programs\VS2015\VC\vcvarsall.bat" x64      <----- update your path to vcvarsall.bat
+
+..
+cl %YourCompilerFlags% main.cpp %YourLinkerFlags%
+..
+
+I would mention that you'd like to have another visual studio code bootstraper batch that would set the vcvars environment and then starts up the editor so you don't set the vcvars for every build. Like so:
+@echo off
+call "E:\programs\VS2015\VC\vcvarsall.bat" x64      <----- update your path to vcvarsall.bat
+
+code
+
+This way you can omit setting the vcvarsall.bat every time you compile the code. Minimal rebuild flag will also help you a lot so you only compile changed files.Segmentation fault (core dumped) for a C code [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I am getting an error when I run a C code, which converts the count number to brightness temperature of satellite data. It is giving me segmentation fault. I am pasting my code here. Can any one suggest me where the problem with the code.
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define N150 150
+
+int main(int argc, char *argv[]){
+  int   lon_tl=80,  lat_tl=60;
+  int   lon_br=200, lat_br=-60;
+  float lon_inc=0.04;
+  float lat_inc=0.04;
+
+  FILE  *fp;
+  char  outputfilename[N150];
+  float tmp_NX, tmp_NY;
+  int   i, j, k, nk, NX, NY, tmp_count, count[N150];
+  short *data_all;
+  float *dt, tmp_tbb, tbb[N150];
+
+  if(argc!=2){
+     fprintf(stderr,"Usage: geoss2bt.c inputfilename1\n");
+     fprintf(stderr," e.g.: ./geoss2bt IMG_DK01IR1_200705010030.geoss\n");
+     exit(1);
+  }
+  tmp_NX=(lon_br-lon_tl)/lon_inc;  tmp_NY=(lat_tl-lat_br)/lat_inc;
+  NX=(int)(tmp_NX);  NY=(int)(tmp_NY);
+  data_all=(short*)malloc(2*NY*NX);
+  dt=(float*)malloc(4*NY*NX);
+  for(i=0;i<NY*NX;i++){
+     data_all[i]=-999;
+     dt[i]=-999.;
+  }
+
+  if((fp=fopen(argv[1],"r"))==NULL){
+     fprintf(stderr,"*** input file (%s) cannot open ***\n",argv[1]);
+     exit(1);
+  }
+  fread(data_all,sizeof(short),NY*NX,fp);
+  fclose(fp);
+
+  if((fp=fopen("tbbtable.txt","r"))==NULL){
+     fprintf(stderr,"*** TBB table (tbbtable.txt) cannot open ***\n");
+     exit(1);
+  }
+  k=0;
+  while(!feof(fp)){
+     fscanf(fp,"%d %f",&tmp_count, &tmp_tbb);
+     count[k]=tmp_count;  tbb[k]=tmp_tbb;
+     k++;
+  }
+  nk=k;
+  fclose(fp);
+
+  for(i=0;i<NY;i++){
+  for(j=0;j<NX;j++){
+     if(data_all[NX*i+j]<count[0]){ dt[NX*i+j]=-999.; }
+     else if(data_all[NX*i+j]==count[0]) { dt[NX*i+j]=tbb[0]; }
+     else{
+        for(k=1;k<nk;k++){
+           if(data_all[NX*i+j]<=count[k]){
+            dt[NX*i+j]=tbb[k]-(tbb[k]-tbb[k-1])*(count[k]-data_all[NX*i+j])/(count[k]-count[k-1]);
+            goto LOOP;
+           }
+        }
+     }
+     LOOP:;
+  }
+  }
+
+  sprintf(outputfilename,"tbb_%s",argv[1]);
+  fp = fopen(outputfilename,"w");
+  fwrite(dt,sizeof(float),NX*NY,fp);
+  fclose(fp);
+
+  free(data_all);  free(dt);
+  return 0;
+}In end of code, you write:
+fopen(outputfilename,"w");
+fwrite(dt,sizeof(float),NX*NY,fp);
+fclose(fp);
+
+I think it should be:
+fp = fopen(outputfilename,"w");
+fwrite(dt,sizeof(float),NX*NY,fp);
+fclose(fp);
+
+But, you code is prone to errors:
+
+your malloc returns are not tested,
+your fread returns are not tested,
+your fscanf returns are not tested,
+you use feof the wrong way (see https://stackoverflow.com/a/4299360/1212012),
+...
+
+Do not hesitate to comment your code, it will never be useless.I'm not sure, but maybe this is also may cause problems. According to my calculations you are allocate is this two lines, approximately 54MB of memory :
+data_all=(short*)malloc(2*NY*NX);
+dt=(float*)malloc(4*NY*NX); 
+
+Which may cause segmentation fault through stack overflow, make sure you set your stack size big enough. 
+Why stack overflow causes segmentation fault instead of stack overflow in Linux?How printf statement works in the below code?void main()
+{
+printf("Adi%d"+2,3);
+}
+
+output= i3  
+This printf statement worked, but how the statement worked ?printf("Adi%d"+2,3);
+
+"Adi%d" - is interpreted as start of the address of the memory where the string literal "Adi%d" is stored. When you add 2 to it, it became address of memory where string "i%d" is stored. So basically you passed to printf string: "i%d". Then %d and printf came into play replacing %d with 3, hence the output i3.Its part of pointer to character, nothing to do with printf, "Adi" + 2 will  make it read from position 0 + 2 = 2 that will be i
+int main()
+{
+    char* a = "Adi" + 2;
+    printf(a); // output i
+
+}Matlab int16() C equivalent?In Matlab there is a function called int16, that rounds e.g. double values to the next integer. Is there any simple equivalent in C to that?
+Especially for the rounding of negative numbers, e.g. -1.65 to -2 and 1.33 to -1.The int16 function, rounds and clamps the values. So an equivalent would look like this
+int16_t  int16( double d ) 
+{
+  return isnan(d) ? 0 : (d > 32767.0) ? 
+    32767 : 
+    (d <-32768.0) ? -32768 : (int16_t)round(d)) ;
+}
+
+EDIT: int16 also returns 0 for NAN input, so handle this as well.
+Also note, that the code really needs the case differentiations, as the conversion of double to int16_t in C is undefined for NAN and values outside of the range of the target integer.Select subset of elements from __m256 ?I have a __m256, which is used to store 8 floats, the elements inside are like:
+__m256 v = {0,1,2,3,4,5,6,7};
+
+Now I want to get another __m256 of values like:
+__m256 dst = {0,1,2,4,5,6,x,x};
+
+x here means I don't care. 
+I am not familiar with SIMD, could anybody help ? Or give me some hints ?
+Thanks!You could use AVX2 intrinsic _mm256_permutevar8x32_ps. It helps you to shuffle elements inside 256-bit vector. See an example below: 
+__m256 a = { 10, 20, 30, 40, 50, 60, 70, 80 };
+__m256i k = _mm256_setr_epi32(0, 1, 2, 4, 5, 6, 0, 0);
+__m256 b = _mm256_permutevar8x32_ps(a, k);You need an instruction which will operate across 128 bit lanes. Unfortunately most AVX/AVX2 shuffle/permute instructions will only operate within the two 128 bit lanes of a 256 bit AVX vector, however there are a few which do not have this limitation. In this particular case the intrinsic you are looking for is _mm256_permutevar8x32_ps:
+#include <stdio.h>
+#include <immintrin.h>
+
+int main(void)
+{
+    __m256 v0 = _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7);
+    __m256i vperm = _mm256_setr_epi32(0, 1, 2, 4, 5, 6, 0, 0);
+
+    __m256 v1 = _mm256_permutevar8x32_ps(v0, vperm);
+
+    float f0[8], f1[8];
+
+    _mm256_storeu_ps(f0, v0);
+    _mm256_storeu_ps(f1, v1);
+
+    printf("v0: %g %g %g %g %g %g %g %g\n", f0[0], f0[1], f0[2], f0[3], f0[4], f0[5], f0[6], f0[7]);
+    printf("v1: %g %g %g %g %g %g %g %g\n", f1[0], f1[1], f1[2], f1[3], f1[4], f1[5], f1[6], f1[7]);
+
+    return 0;
+}
+
+Compile and test:
+$ gcc -Wall -mavx2 blackball.c 
+$ ./a.out 
+v0: 0 1 2 3 4 5 6 7
+v1: 0 1 2 4 5 6 0 0One byte char array appears to store 8 input string characters [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Output of a C string program
+
+                                (3 answers)
+                            
+
+Closed 5 years ago.
+
+
+
+The following piece of c code appears to take up to 8 characters in the input and then give segFaults for larger inputs. 
+int main()
+{
+  char a[1];
+  printf("Input:\n");
+  scanf("%s",a);
+  printf("%s\n",a);
+  printf("%d\n",strlen(a));
+  printf("%d\n",sizeof(a));
+
+  return 0;
+}
+
+Outputs
+Case 1:
+Input:
+aaaaaaaa
+aaaaaaaa
+8
+1
+
+Case 2:
+Input:
+aaaaaaaaa
+aaaaaaaaa
+9
+1
+[1]    15688 segmentation fault (core dumped) 
+
+My machine is a 64-bit Intel Linux
+Compiler is gcc version 6.1.1 20160802 (GCC)
+Sequence of commands performed:
+gcc -c -g test.c  - creates output file test.o
+gcc -o test test.o
+./test
+I am a beginner at c programming. Any insight is much appreciated.
+On the surface I would expect it to give some error or warning on input of 2 or more characters.
+Also, objdump -d test gave sub    $0x10,%rsp which implies that the stack stores 16 bytes for the main(). So maybe it should be taking 16 characters and not 8 as input.When you have an array declared as:
+char a[1];
+
+it can hold only one character for a well behaving program. If you put more than one character into the array, the program is subject to undefined behavior. You cannot make sense of how such a program behaves when its behavior is, by definition, undefined.
+Don't do it.
+It's pointless to make sense of the behavior of such a program.I keep getting a segfault when trying to pass a struct node* and then print using printfFull code here: https://gist.github.com/IamSlightly/5debd2373231a62c0a44665902e9ca7f
+Not sure exactly why this is happening but it happens in line 43 when the printf tries to access the returned value. 
+struct node* kv = Lookup (13);
+if (kv)
+    printf ("%s\n", kv->val_ptr);
+
+struct node* Lookup(int x){
+  struct node *holder;
+  holder = head;
+  while ((holder->key!=x) && (holder->next!=NULL)){
+    holder = holder->next;
+  }
+  if (holder->key==x) {
+    printf("\nlets try this shit again\n");
+    return holder;
+  } else {
+    printf("\n*** %d is not in the linked_list ***\n", x);
+    return NULL;
+  }
+}If you're crashing on:
+printf ("%s\n", kv->val_ptr);
+
+then it's a safe bet that either kv or kv->val_ptr are not pointing to something that's "kosher".
+Since your Lookup code seems to preclude returning an invalid pointer (assuming of course you haven't screwed up the creation of the linked list), it's likely that the val_ptr field hasn't been set correctly, or it's pointing at something that isn't a string.
+Your best bet is to use a debugger (or printf lines if you don't have a decent one) and examine values before attempting to use them. That will greatly assist you in figuring out the root cause.
+If you were to go the printf route (I'd prefer a debugger but it's not always an option), I would be looking at code like the following, place before your own if (kv) line:
+if (kv) {
+    printf ("Starting DEBUG\n");
+    fflush (stdout); fsync (fileno (stdout));
+
+    printf ("kv as pointer is %p\n", kv);
+    fflush (stdout); fsync (fileno (stdout));
+
+    printf ("kv->val_ptr as pointer is %p\n", kv->val_ptr);
+    fflush (stdout); fsync (fileno (stdout));
+
+    printf ("kv->val_ptr as char[10] is %10.10s\n");
+    fflush (stdout); fsync (fileno (stdout));
+
+    printf ("Ending DEBUG\n");
+    fflush (stdout); fsync (fileno (stdout));
+}
+
+This shows how to write debugging statements in such a way that they'll be flushed before the core dump stops output.
+Basically, what you need to do is to narrow down the issue gradually until you can isolate it to a specific line, then work out what's wrong with that line :-)
+
+As an aside, if an empty list will consist of head being set to NULL, that Lookup code is going to crash on you. That's probably not the case here since you've stated it's the actual printf line which is crashing.
+A better one would be something like:
+struct node* Lookup (int x) {
+    struct node *holder = head;
+    while (holder != NULL)
+        if (holder->key == x)
+            return holder;
+    return NULL;
+}
+
+
+In addition, based on the code at the link you gave, you may want to add function prototypes to your header file. You have the structure and variables such as head but it's a good idea for any code using your implementation to have properly-defined definitions for the functions within it. As an example, it should contain something like:
+int Insert(int, char*, int);
+
+for the Insert function, ditto for the other functions you wish to call.Issues translating C++ string manipulation to C [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+So I have a small portion of my program that is doing base conversion. In this case from a byte buffer (base 256) to base 58.
+I'm trying to translate this portion into C, so that when I need to write other implementations of it I can just reuse the same code.
+From the original C++:
+static unsigned int divide_58(string& x)  {
+    const size_t length = x.length();
+    size_t pos = 0;
+    char *quotient = new char[length];
+
+    for (size_t i = 0; i < length; ++i) {
+        const size_t j = i + 1 + x.length() - length;
+        if (x.length() < j)
+            break;
+
+        const unsigned int value = base2dec(x.c_str(), j);  //defined elsewhere; consistent in both
+
+        quotient[pos] = (unsigned char)(value / 58);
+        if (pos != 0 || quotient[pos] != ascii[0])
+            pos++;
+
+        size_t len = 4;
+        char *temp_str = dec2base(value % 58, len);  //defined elsewhere; consistent in both
+        x.replace(0, j, temp_str, len);  //Replace the contents at 0 thru j with the whole contents of temp_str, moving things appropriately
+        free(temp_str);
+    }
+
+    // calculate remainder
+    const unsigned int remainder = base2dec(x.c_str(), x.length());  //defined elsewhere; consistent in both
+
+    // remove leading "zeros" from quotient and store in 'x'
+    x.assign(quotient, quotient + pos);
+
+    return remainder;
+}
+
+I translated this to the following bit of C:
+static unsigned int divide_58(char *x, size_t &length)  {
+    const size_t const_length = length;
+    size_t pos = 0;
+    char *quotient = (char*) malloc(sizeof(char) * const_length);
+
+    for (size_t i = 0; i < const_length; ++i) {
+        const size_t j = i + 1 + length - const_length;
+        if (length < j)
+            break;
+
+        const unsigned int value = base2dec(x, j);  //defined elsewhere; consistent in both
+
+        quotient[pos] = (unsigned char)(value / 58);
+        if (pos != 0 || quotient[pos] != ascii[0])
+            pos++;
+
+        size_t len = 4;
+        char *temp_str = dec2base(value % 58, len);  //defined elsewhere; consistent in both
+        memcpy(x, temp_str, len);
+        free(temp_str);
+
+        memmove(x + len, x + j, length - j);
+        length -= j;
+        length += len;
+    }
+
+    // calculate remainder
+    const unsigned int remainder = base2dec(x, length);  //defined elsewhere; consistent in both
+
+    // remove leading "zeros" from quotient and store in 'x'
+    memcpy(x, quotient, pos);
+    free(quotient);
+    length = pos;
+
+    return remainder;
+}
+
+This works in almost all cases, but on my Linux testing environment (and none of my local machines) it produces the wrong answer, despite agreeing that the input is correct.
+Failing example: https://app.shippable.com/runs/57cf7ae56f908e0e00c5e451/1/console (build_ci -> make cpytest cov=true)
+Working example: https://travis-ci.org/gappleto97/p2p-project/jobs/158036360#L392
+I know that the standard is to provide the shortest example of the problem, but as near as I can tell this is the shortest example. Can y'all help me out?
+For the MCVE folks, you can verify this yourself via my git repo.
+git clone https://github.com/gappleto97/p2p-project
+cd p2p-project
+git checkout develop
+make cpytest
+git checkout c_issue
+rm -r build
+make cpytest
+
+The first call to make will have failing tests. The second will not. The second is using the C++ code provided here, the first is using the C code provided here. It's been bumped up to Python for ease of testing, but I've narrowed it down to this function. That will probably be useless though because I can only replicate the bug on Shippable.You have translated this C++ line:
+    x.replace(0, j, temp_str, len);
+
+into this C code:
+    memcpy(x, temp_str, len);
+    memmove(x + len, x + j, length - j);
+    length -= j;
+    length += len;
+
+That is not equivalent code.
+One thing is that you never add a zero-termination to x.
+Another thing is that the code produce completely different strings when j is less than 4.
+Look at this C++ code:
+#include <iostream>
+#include <string>
+#include <string.h>
+using namespace std;
+
+int main() {
+    string s = "abcdefgh";
+    char t[10] = "01234567";
+    cout << "Original: " << s << endl;
+
+    int j = 2;
+
+    // The c++ way
+    s.replace(0, j, t, 4);
+    cout << "C++: " << s << endl;
+
+    // Your C way
+    char x[10] = "abcdefgh";
+    size_t length = strlen(x);
+    memcpy(x, t, 4);
+    memmove(x + 4, x + j, length - j);
+    cout << "C  : " << x << endl;
+
+    return 0;
+}
+
+
+Output:
+Original: abcdefgh
+C++: 0123cdefgh
+C  : 012323efgh
+
+The same code with j = 6:
+
+Output:
+Original: abcdefgh
+C++: 0123gh
+C  : 0123ghgh
+
+Conclusion Your C code for C++ replace is not working.Creating random image CoreGraphics leaking memoryIn my program,
+I have a method which create random generated imaged, 
+Just notice with instruments that it׳s leaking memory but i׳m not sure why.
+Here is the part that leaking:
+int * getRandomImage(int width, int height) {
+int * bytes = new int[height * width]; //this line is pointed by instruments
+
+for (int i = 0; i < height; i++) {
+    for (int j = 0; j < width; j++) {
+        bytes[i * width + j] = arc4random();
+    }
+}
+
+    return bytes
+}
+
+
+
+
+
+-(void) loadRandomImage {
+const int height = 400;
+const int width = 400;
+int * bytes = getRandomImage(width, height);
+
+CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, bytes, width * height, NULL);
+
+CGColorSpaceRef colorSpaceRef = CGColorSpaceCreateDeviceRGB();
+int bitsPerComponent = 8;
+int bitsPerPixel = 32;
+int bytesPerRow = 4 * width;
+
+CGImageRef imageRef = CGImageCreate(width, height, bitsPerComponent, bitsPerPixel, bytesPerRow, colorSpaceRef, kCGBitmapByteOrderDefault, provider, NULL, NO, kCGRenderingIntentDefault);
+
+CGDataProviderRelease(provider);
+
+UIImage *newUIImage = [UIImage imageWithCGImage:imageRef];
+
+self.imageView.image = newUIImage;
+
+CGImageRelease(imageRef);
+}Grouping array of Strings CI have made an array of strings and I am trying to group a string array into categories.
+So far my code looks like this:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int
+main(int argc, char *argv[]) {
+    char *results[] = {"Canada", "Cycling", "Canada", "Swimming", "India", "Swimming", "New Mexico",
+                       "Cycling", "New Mexico", "Cycling", "New Mecico", "Swimming"};
+
+
+
+    int nelements, i, country_count;
+
+    nelements = sizeof(results) / sizeof(results[0]);
+
+    for (i = 0 ; i < nelements; i++) {
+        printf("%s\n", results[i]);
+    }
+
+    return 0;
+}
+
+Which prints out this:
+Canada
+Cycling
+Canada
+Swimming
+India
+Swimming
+New Mexico
+Cycling
+New Mexico
+Cycling
+New Mexico
+Swimming
+
+But I am trying to group the sports along with respective counts with the individual countries, which I want to look like this:
+Canada
+    Cycling  1
+    Swimming 1
+
+India
+    Swimming 1
+
+New Mexico
+    Cycling  2
+    Swimming 1
+
+I am thinking of categorizing the countries with every i+2 element in the array, and using strcmp to remove the duplicate country strings, but I am not sure how to do this with the counts of the sports along with each country. 
+I am just not sure how to go about this. Any sort of help would be appreciated.The solution depends on what kind of approach you want to take. Keeping a single character array (results* in your code) will not be to make your data dynamic. Essentially, you would want to use a dictionary data structure which stores (nested if required)  pair. In C I would have used structures in order to make it modular. 
+First of all, You would need a structure to store sports and their counts(say medal count)
+struct sport {
+  char *sport_name;
+  int medal_count;
+  //Any other details you want to store
+};
+
+Then, a Country can play multiple sports. Hence we need to make country structure.
+struct Country{
+  char *country_name;
+  struct sport* results;
+  //Any other details you want to store
+};
+
+Now let's create an array of country data.
+#define NO_OF_COUNTRIES 3  //You may fix this or make it dynamic
+struct Country country_data[NO_OF_COUNTRIES]; 
+
+You can fill data accordingly now. Hope this helps.Consider using a lists of cities and countries instead of an array of strings.
+The following code explain the simplest implementation with two structures and two methods for each - adding new element and searching element.
+Try this code and then learn it:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct city
+{
+    struct city * next;
+    char * cityName;
+    int counter;
+};
+
+struct country
+{
+    struct country * next;
+    char * coutryName;
+    struct city * cities;
+};
+
+struct country * findCountry(struct country * coutries, char * country)
+{
+    struct country * searchResult = NULL;
+    while (coutries != NULL)
+    {
+        if (strcmp(country, coutries->coutryName) == 0)
+        {
+            searchResult = coutries;
+            break;
+        }
+        coutries = coutries->next;
+    }
+    return searchResult;
+}
+
+struct country * addCountry(struct country * coutries, char * country)
+{
+    struct country * newCountry = malloc(sizeof(struct country));
+    newCountry->next = coutries;
+    newCountry->coutryName = country;
+    newCountry->cities = NULL;
+    return newCountry;
+}
+
+struct city * findCity(struct city * cities, char * city)
+{
+    struct city * searchResult = NULL;
+    while (cities != NULL)
+    {
+        if (strcmp(city, cities->cityName) == 0)
+        {
+            searchResult = cities;
+            break;
+        }
+        cities = cities->next;
+    }
+    return searchResult;
+}
+
+struct city * addCity(struct city * cities, char * city)
+{
+    struct city * newCity = malloc(sizeof(struct city));
+    newCity->cityName = city;
+    newCity->next = cities;
+    newCity->counter = 0;
+    return newCity;
+}
+
+int main(void) 
+{
+    char *results[] = { "Canada", "Cycling", "Canada", "Swimming", "India", "Swimming", "New Mexico",
+        "Cycling", "New Mexico", "Cycling", "New Mexico", "Swimming" };
+
+    struct country * countries = NULL;
+    int nelements = sizeof(results) / sizeof(results[0]);
+    // filling list of countries with sublists of cityes
+    int i;
+    for (i = 0; i < nelements; i+=2)
+    {
+        struct country * pCountry = findCountry(countries, results[i]);
+        if (!pCountry)
+        {
+            countries = addCountry(countries, results[i]);
+            pCountry = countries;
+        }
+        struct city * pCity = findCity(pCountry->cities, results[i+1]);
+        if (!pCity)
+        {
+            pCountry->cities = addCity(pCountry->cities, results[i + 1]);
+            pCity = pCountry->cities;
+        }
+        pCity->counter++;
+    }
+
+    // reading cities from all countries
+    struct country * pCountry = countries;
+    while (pCountry != NULL)
+    {
+        printf("%s\n",pCountry->coutryName);
+        struct city * pCity = pCountry->cities;
+        while (pCity != NULL)
+        {
+            printf("    %s %d\n", pCity->cityName, pCity->counter);
+            pCity = pCity->next;
+        }
+        printf("\n");
+        pCountry = pCountry->next;
+    }
+
+    return 0;
+}
+
+Note: in your code last "New Mexico" was like "New Mecico", in my code this mistype was fixed.
+UPDATE
+Note 2: Because I add elements in the beginning of the lists order of countries and cities is reverse to order of their first mention in the source array.
+If order is important you have two options:
+1) rewrite my code to add new items to the end of list (it is the long way)
+2) rewrite for-loop in the main just to read initial array from the end (it is the easiest way):
+// filling list of countries with sublists of cityes
+int i;
+for (i = nelements-2; i >=0 ; i -= 2)
+   {
+   . . .I would use a struct (if you are not familiar, I always remind myself when needed with myStruct.c) and with two arrays as data members, like this:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define COUNTRY_LENGTH 15
+#define MAX_SPORTS 5
+
+enum sport_name { CYCLING, SWIMMING };
+
+typedef struct Record {
+  char country[COUNTRY_LENGTH];
+  int sports[MAX_SPORTS];
+} Record;
+
+// return index of 'country' in 'array' if the 'country'
+// is found inside 'array', else -1
+int exists(char country[], Record* array, int size) {
+    int i;
+    for(i = 0; i < size; ++i)
+        if(!strcmp(array[i].country, country))
+            return i;
+    return -1;
+}
+
+int find_sport_index(char sport[]) {
+    if(!strcmp(sport, "Cycling"))
+        return CYCLING;
+    if(!strcmp(sport, "Swimming"))
+        return SWIMMING;
+    printf("I couldn't find a sport index for %s\n!!! Do something...Undefined Behavior!", sport);
+    return -1;
+}
+
+char* find_sport_string(int sport) {
+    if(sport == CYCLING)
+        return "Cycling";
+    if(sport == SWIMMING)
+        return "Swimming";
+    printf("I couldn't find a sport string for sport index %d\n!!! Do something...", sport);
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    // you had a typo, New Mecico, I corrected it..Also you could have used a struct here... ;)
+    char *results[] = {"Canada", "Cycling", "Canada", "Swimming", "India", "Swimming", "New Mexico",
+                       "Cycling", "New Mexico", "Cycling", "New Mexico", "Swimming"};
+
+
+
+    int nelements, i, j;
+
+    nelements = sizeof(results) / sizeof(results[0]);
+
+    const int records_size = nelements/2;
+
+    Record record[records_size];
+    for(i = 0; i < records_size; i++) {
+        for(j = 0; j < COUNTRY_LENGTH; j++) 
+            record[i].country[j] = 0;
+        for(j = 0; j < MAX_SPORTS; j++)
+            record[i].sports[j] = 0;
+    }
+
+    int country_index, records_count = 0;
+    for(i = 0; i < nelements; ++i) {
+        // results[i] is a country
+        if(i % 2 == 0) {
+            country_index = exists(results[i], record, records_size);
+            if(country_index == -1) {
+                country_index = records_count++;
+                strcpy(record[country_index].country, results[i]);
+            }
+        } else {
+            // result[i] is a sport
+            record[country_index].sports[find_sport_index(results[i])]++;
+        }
+    }    
+
+
+    for(i = 0; i < records_size; ++i) {
+        if(strlen(record[i].country)) {
+            printf("%s\n", record[i].country);
+            for(j = 0; j < MAX_SPORTS; j++) {
+                if(record[i].sports[j] != 0) {
+                    printf("    %s %d\n", find_sport_string(j), record[i].sports[j]);
+                }
+            }
+        }    
+    }
+
+    return 0;
+}
+
+Output:
+C02QT2UBFVH6-lm:~ gsamaras$ ./a.out 
+Canada
+    Cycling 1
+    Swimming 1
+India
+    Swimming 1
+New Mexico
+    Cycling 2
+    Swimming 1
+
+
+The idea is that:
+
+The struct Record holds the records in the Olympics, with relevant
+sports.
+Record.country holds the name of the country (and I assume that it
+be 14 characters at max, +1 for the NULL terminator, thus I
+defined it as 15).
+Record.sports is an array with size MAX_SPORTS- the size would be
+equal to all the sports in the Olympics, but I assumed it's 5. Every position of this array is a counter (of the medals every country got in a sport. For example, Record.sports[1] = 2 would indicate that this country has 2 medals in Swimming. But how I know it was Swimming? I decided apriori, as a programmer that the first counter is connected to Cycling, the second to Swimming and so on. I used an enum to make that more readable, instead of using magic numbers.
+(Note: You could use a list instead an array, but that would be an
+overkill for that application. But if you want to do it for fun (and because a bit less memory), you
+can use our List
+(C)).
+You define results[] in a strange way, since you should really
+have used a struct for that, but I worked with your code...So I
+needed an array of Records, and its size should be equal to the
+number of the countries, i.e. the half of the size of results[].
+Notice that because you defined results[] to contain implicit
+pairs of country-sport, a division by two is just enough to
+determine the size of the Records array.
+I loop over results[] to populate record[], by using a counter
+named i in the for-loop. When i is even, result[i]
+contains a country, else it contains a sport. I use the module
+operator (%) to determine that easily.
+If the country doesn't exist in record[], then I insert it, else I
+don't insert it again. In both cases I want to remember its index in
+record[], so that in the next iteration, that we will process the
+sport, we will now at which position of record[] we should look
+into and act accordingly.
+Now, when I process a sport, I want to increase the counter of that
+sport, but only for the corresponding country (remember that I have
+stored the country index I had processed in the previous iteration).
+Then I just print, that's it! :)Idea of this solution is in building map - table where rows correspond to countries and columns correspond to sport events (or sport names).
+Memory for the maximum possible map (size is nelements/2 x nelements/2) is allocated with calloc but actually it can be just int[6][6] if char *results[] is unchanged.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) 
+{
+    char *results[] = { "Canada", "Cycling", "Canada", "Swimming", "India", "Swimming", "New Mexico",
+        "Cycling", "New Mexico", "Cycling", "New Mexico", "Swimming" };
+    int nelements = sizeof(results) / sizeof(results[0]);
+    int i;
+    // making empty map
+    int ** map = calloc(nelements/2, sizeof(int*));
+    for (i = 0; i < nelements / 2; i++)
+        map[i] = calloc(nelements/2, sizeof(int));
+    char ** rowNames = calloc(nelements / 2, sizeof(char*));
+    int usedRows = 0;
+    char ** colNames = calloc(nelements / 2, sizeof(char*));
+    int usedCols = 0;
+
+    // filling the map
+    // the outer loop for countries
+    int c;
+    for (c = 0; c < nelements; c+=2) {
+        int row = -1;
+        // Find country in the map (loop for rows)
+        for (i = 0; i < usedRows; i++) 
+        {
+            if (strcmp(results[c], rowNames[i]) == 0)
+            {
+                row = i;
+                break;
+            }
+        }
+        // or add if it is new country
+        if (row < 0)
+        {
+            row = usedRows;
+            rowNames[usedRows] = results[c];
+            usedRows++;
+        }
+        // Find sport in the map (loop for columns)
+        int col = -1;
+        for (i = 0; i < usedCols; i++)
+        {
+            if (strcmp(results[c+1], colNames[i]) == 0)
+            {
+                col = i;
+                break;
+            }
+        }
+        // or add if it is new sport
+        if (col < 0)
+        {
+            col = usedCols;
+            colNames[usedCols] = results[c+1];
+            usedCols++;
+        }
+        // Just count sport event in the current country
+        map[row][col]++;
+    }
+
+    // print results from map
+    // the outer loop for countries (loop for rows in map)
+    for (c = 0; c < usedRows; c++) {
+        printf("%s\n", rowNames[c]);
+        // the inner loop for sport
+        for (i = 0; i < usedCols; i++)
+            if (map[c][i])
+                printf("   %s %d\n", colNames[i], map[c][i]);
+        printf("\n");
+    }
+
+    return 0;
+}
+
+So when map, as well as rowNames (with countries) and colNames (with sports) are filled we can output data in any way.There are a number of ways to approach this task, as you can see from the number of answers. One element you will need, for either the countries, or the events (but not both), is a simple lookup table containing either country entries or event entries to allow you to distinguish whether the values in results are country names or event names. A simple country lookup (made global here, but could be function scope as well) such as the following works:
+char *countries[] = { "Canada", "India", "New Mexico" }; /* countries lookup */
+
+Another shortcut you can take is recognizing that the pointers within results have function scope as defined, so there is no need to copy or allocate memory to hold them -- they already exist in readonly memory.
+One other struct element that helps is to keep a count of the events associated with the country, say eventcnt. That can be incremented each time an event is added under the country. You can use a country/events struct similar to:
+typedef struct {
+    char *country;
+    char *event[MAXE];
+    int eventcnt;
+} host;
+
+(the MAXE is a simple constant for the maximum events involved to allow you to use automatic storage with your array of structs. (it can easily be changed to allocate/reallocate storage on an as needed basis)
+You then need to simply loop through the results array, once, understanding that events always follow the country before them. Using several nested loops keeps the number of times you traverse results to one-time. Essentially, you loop over each pointer in results, determine if it points to a country name, if it is a country name, then either add it if it doesn't exists as one of your host.country values, or skip it if it does (no need to updated pointers to point to the last occurrence of the country name)
+Since nested loops are involved, a simple goto provides all the control you need to determine when you are dealing with country names of when you are dealing with event names and allows you to take the action needed in each case.
+Then it is just a matter of printing/using the results you wanted which are now contained in a array of struct with hidx (host index) containing the total number of unique hosts involved.
+Putting the pieces together, you could do something similar to the following:
+#include <stdio.h>
+#include <string.h>
+
+/* constants max(countries, events) */
+enum { MAXC = 8, MAXE = 16 };
+
+char *countries[] = { "Canada", "India", "New Mexico" }; /* countries lookup */
+
+typedef struct {
+    char *country;
+    char *event[MAXE];
+    int eventcnt;
+} host;
+
+int main (void) {
+
+    char *results[] = { "Canada", "Cycling", "Canada", "Swimming", 
+                        "India", "Swimming", "New Mexico", "Cycling", 
+                        "New Mexico", "Cycling", "New Mexico", "Swimming"};
+    host hosts[MAXC] = {{ .country = NULL }};
+    int hidx = 0, i, j, country_count, current = 0, nelements;
+
+    country_count = sizeof countries/sizeof *countries;
+    nelements = sizeof results / sizeof *results;
+
+    for (i = 0 ; i < nelements; i++) {          /* for each element */
+        for (j = 0; j < country_count; j++) {   /* check if country */
+            if (strcmp (results[i], countries[j]) == 0) { /* if so */
+                int k;
+                for (k = 0; k < hidx &&  /* check if already assigned */
+                    strcmp (hosts[k].country, countries[j]); k++) {}
+                if (!hosts[k].country) { /* if not, assign ptr, increment */
+                    hosts[hidx++].country = results[i];
+                    current = hidx - 1;;
+                }
+                goto nextc; /* skip event adding */
+            }
+        } /* results[i] is not a country, check if event exists for host */
+        if (hosts[current].eventcnt < MAXE) {   /* if it doesn't, add it */
+            int k;
+            for (k = 0; k < hosts[current].eventcnt; k++)
+                if (strcmp (results[i], hosts[current].event[k]) == 0)
+                    goto nextc;  /* already exists for host, skip add */
+            hosts[current].event[hosts[current].eventcnt++] = results[i];
+        }
+        nextc:;
+    }
+
+    for (i = 0; i < hidx; i++) {    /* output countries & events for each */
+        printf (" %s\n", hosts[i].country);
+        for (j = 0; j < hosts[i].eventcnt; j++)
+            printf ("     %s\n", hosts[i].event[j]);
+    }
+
+    return 0;
+}
+
+Example Use/Output
+$ ./bin/events
+ Canada
+     Cycling
+     Swimming
+ India
+     Swimming
+ New Mexico
+     Cycling
+     Swimming
+
+Look over all the answers. There are many good points contained. Let me know if you have any questions.I would enumerate both the sports and the locations, adding NUM_x as the last element, so the enumerations can be easily appended in the future...
+typedef enum _sport_t
+{
+  CYCLING,
+  SWIMMING,
+  NUM_SPORTS
+} sport_t;
+
+typedef enum _location_t
+{
+  CANADA,
+  INDIA,
+  NEW_MEXICO,
+  NUM_LOCATIONS
+} location_t;
+
+Now, you can define string arrays to use when you want to print out the names...
+char* sports_name[NUM_SPORTS] = {"Cycling", "Swimming"};
+char* location_name[NUM_LOCATIONS] = {"Canada", "India", "New Mexico"};
+
+This approach will reduce your storage a bit and increase efficiency since you will be comparing enumerations (integers) instead of strings when you categorize the list.
+You might also want to consider using a two dimensional boolean array of all locations and all sports, indicating whether said location has said sport.
+typedef enum _bool_t
+{
+  FALSE,
+  TRUE
+} bool_t;
+
+bool_t sports_array[NUM_LOCATIONS][NUM_SPORTS] =
+{ 
+  {TRUE,TRUE},  // Canada
+  {TRUE,FALSE}, // India
+  {TRUE,TRUE},  // New Mexico
+};
+
+So, your loops would look like this...
+location_t l;
+sport_t s;
+
+for (l = (location_t)0; l < NUM_LOCATIONS; l++)
+{
+  printf( " %s\n", location_name[l] );
+  for (s = (sport_t)0; s < NUM_SPORTS; s++)
+  {
+    if (sports_array[l,s])
+    {
+      printf( "     %s\n", sport_name[s] );
+    }
+  }
+}Given you array I can see that country name is available alternatively. If this is the format data is available in than you can follow the below code.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char *argv[])
+{
+   char *results[] = {"Canada", "Cycling", "Canada", "Swimming", "India","Swimming", "New Mexico",
+               "Cycling", "New Mexico", "Cycling", "New Mexico", "Swimming"};
+
+
+
+   int nelements, i, sport_count=0,country_change =0;
+   char country[50];char sport[50];
+   strcpy(country,results[0]);
+   printf("%s\n", country);
+   strcpy(sport,results[1]);
+   nelements = sizeof(results) / sizeof(results[0]);
+
+   for (i = 1 ; i < nelements; i++) 
+   {
+      if(((i%2)==0) && (strcmp(country,results[i])))
+      {
+         //sport_count++;
+         printf("\t%s %d\n", sport,sport_count);
+         country_change =1;
+         strcpy(country,results[i]);
+         printf("%s\n", country);
+      }
+      else if((i%2)==1)
+      {
+          if(country_change)
+          {
+             strcpy(sport,results[i]);
+             country_change = 0;
+             sport_count = 0;
+          }
+
+          if(!strcmp(sport,results[i]))
+          {
+              sport_count++;
+          }
+          else
+          {
+              printf("\t%s %d\n", sport,sport_count);
+              strcpy(sport,results[i]);
+              sport_count = 1;
+          }
+             //strcpy(country,results[i]);
+       }
+
+    }
+    printf("\t%s %d\n", sport,sport_count);
+
+ return 0;
+}
+
+Basically this is what I am trying to do here:
+
+Store the first index in a variable.
+Than in each even iteration check if the country name is equal to the stored name. If not update the name.
+In each odd iteration you can just print out the name.
+Sport name is stored in a variable and a int variable sports_count keeps the count.
+If new country arrives than print the name of sport first and than a mandatory update in the name of sport and relevant variables.
+Last sport name is printed outside the loop.
+Output
+
+Canada
+        Cycling 1
+        Swimming 1
+India
+        Swimming 1
+New Mexico
+        Cycling 2
+        Swimming 1Can you allow one of a few types of pointers as an argument without void*?In plain c, I have a situation where I would like to allow a function to accept multiple types of pointers.  To illustrate my situation, here could be one use case:
+void myfunction([int* or char*] value) {
+    *value = 0xdd;  // safe since value is at least as big as a char*
+}
+
+And here is another:
+#define MAGIC 0xabcdef0
+typedef struct {
+    int magic;
+    char* content;
+} MyStruct;
+
+void myfunction([int* or MyStruct*] value) {
+    if (*value != MAGIC) {
+        printf("Got an int\n");
+    } else {
+        printf("Got a MyStruct\n");
+    }
+}
+
+// example:
+int input1 = 0;
+MyStruct input2 = { MAGIC, "hello world" };
+myfunction(input1);  // "Got an int"
+myfunction(input2);  // "Got a MyStruct"
+
+Both of these situations could be made possible with a void* parameter type, but that would in effect allow any type of pointer to be passed in without a compile error.  Is there a way to restrict the function to accept only a specific subset of pointer types?If you can use features that are new in C11, the _Generic keyword can solve your problem:
+void myfunction(void *value) {
+    // ...
+}
+#define myfunction(x) myfunction( \
+    _Generic((x), char *: (x), int *: (x)) )As Houman pointed out, you can use a union to do the job, however, you still have the problem that you must identify the type that is set in the union type. You can solve that using an enum to identify the type inside your function.
+union myUnion {
+    int* intPointer,
+    MyStruct* myStructPointer
+};
+
+enum typeEnum {
+    INT,
+    MYSTRUCT
+};
+
+void myfunction(union myUnion union, enum typeEnum type) {
+    if (type == INT)
+         // you got an integer
+    else if (type == MYSTRUCT)
+         // you got a struct
+    // You can add future additions here
+ }You could do this:
+void myfunction(void *s)
+{
+    if ( *(int *)s == MAGIC )
+    {
+        MyStruct *p = s;
+        printf("%s\n", p->content);
+    }
+}
+
+However this design makes it easy to write buggy code that the compiler will not catch for you, so I would recommend coming up with a slightly different design (e.g. tagged unions).No, use void* and then cast.
+One could think that I can use a void* and then check about the casting inside the function, and if not the expected type, raise an error, but no, you cannot do that either, since void* loses all its type information.
+Damn I am writing just before going into the shower. I couldn't resist! BRB :) -- OK, turns out R..'s answer from the future is the correct one! ;)Determine `OSTYPE` during runtime in C programIn a C program, I need to find the OSTYPE during runtime, on the basis of which I will do some operations. 
+Here is the code 
+#include <stdlib.h>
+#include <string.h>
+
+int main () {
+    const char * ostype = getenv("OSTYPE");
+    if (strcasecmp(ostype, /* insert os name */) == 0) ... 
+    return 0;
+}
+
+But getenv returns NULL (and there is segmentation fault). When I do a echo $OSTYPE in the terminal it prints darwin15 . But when I do env | grep OSTYPE nothing gets printed, which means it is not in the list of environment variables. To make it work on my local machine I can go to the .bash_profile and export the OSTYPE  manually but that doesn't solve the problem if I want to run a generated executable on a new machine. 
+Why is OSTYPE available while running terminal, but apparently not there in the list of environment variables. How to get around this ?For the crash, you should check if the return was NULL or not before using it in strcmp or any function. From man 3 getenv:
+
+The getenv() function returns a pointer to the value  in  the 
+  environment, or NULL if there is no match.
+
+If you're at POSIX (most Unix's and somehow all Linux's), I agree with Paul's comment on uname.
+But actually you can check for OSTYPE at compile time with precompiler (with #ifdef's), here's a similar question on so: Determine OS during runtime
+Edit: uname
+Good point Jonathan. man 2 uname on my linux tells how to use  (and begin POSIX, macos has the same header, too):
+SYNOPSIS
+   #include <sys/utsname.h>
+
+   int uname(struct utsname *buf);
+
+DESCRIPTION
+       uname()  returns  system  information in the structure pointed to by buf.  The utsname struct is
+       defined in :
+       struct utsname {
+           char sysname[];    /* Operating system name (e.g., "Linux") */
+           char nodename[];   /* Name within "some implementation-defined
+                                 network" */
+           char release[];    /* Operating system release (e.g., "2.6.28") */
+           char version[];    /* Operating system version */
+           char machine[];    /* Hardware identifier */
+       #ifdef _GNU_SOURCE
+           char domainname[]; /* NIS or YP domain name */
+       #endif
+       };Program stops working after getc(stdin)printf("hello2");
+int i = 0;
+int done = 0;
+
+while (!done)
+{
+    char c;
+    printf("hello3");
+    c = getc(stdin);
+    printf("hello4");
+    if (isspace(c))
+    {
+         done = 1;
+         ungetc(c, stdin);
+         printf("hello5");
+    }
+}
+
+So my program is currently trying to read in input (and in this case specifically, an empty input). However, after I found that my program doesn't work, I tried debugging it via scattering printfs around and it seems to me that after c = getc(stdin), the program stops working? If my theory is right, what's wrong with using c = getc(stdin)?Did you try hitting enter after space? Unless you do specific arrangements, your terminal emulation or wherever you're running the program will not give you every keyboard char that's typed. It will wait until you hit enter, and let you work on the whole line that's written.Stdin will not flush input characters onto the input stream until the newline character '\n'. So getc(stdin) has nothing to read until you hit enter. If you want to read the console input without hitting enter, you can use getch() function in conio.h library available with Windows compilers. getch() reads a character from stdin without waiting for a newline.Understanding safe access of JNI argumentsI'm doing some research regarding how HotSpot performs garbage-collection and/or heap-compaction while JNI code is running.
+It appears to be common knowledge that objects could be moved at any time in Java.  I'm trying to understand, definitively if JNI is subject to effects garbage-collection.  There exist a number of JNI functions to explicitly prevent garbage-collection; such as GetPrimitiveArrayCritical.  It makes sense that such a function exists if the references are indeed volatile.  However, it makes no sense if they are not.
+There seems to be a substantial amount of conflicting information on this subject and I'm trying to sort it out.
+
+JNI code runs in a safepoint and can continue running, unless it calls
+  back into Java or calls some specific JVM methods, at which point it
+  may be stopped to prevent leaving the safepoint (thanks Nitsan for the
+  comments).
+What mechanism JVM use to block threads during stop-the-world pause
+
+The above makes me think that garbage-collection is going to run concurrently with JNI code.  That can't be safe, right?
+
+To implement local references, the Java VM creates a registry for each
+  transition of control from Java to a native method. A registry maps
+  nonmovable local references to Java objects, and keeps the objects
+  from being garbage collected. All Java objects passed to the native
+  method (including those that are returned as the results of JNI
+  function calls) are automatically added to the registry. The registry
+  is deleted after the native method returns, allowing all of its
+  entries to be garbage collected.
+https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/design.html#wp16789
+
+Okay, so the local references are nonmovable but that doesn't say anything about the compaction.
+
+The JVM must ensure that objects passed as parameters from Java™ to
+  the native method and any new objects created by the native code
+  remain reachable by the GC. To handle the GC requirements, the JVM
+  allocates a small region of specialized storage called a "local
+  reference root set".
+A local reference root set is created when:
+
+A thread is first attached to the JVM (the "outermost" root set of the thread).
+Each J2N transition occurs.
+
+The JVM initializes the root set created for a J2N transition with:
+
+A local reference to the caller's object or class.
+A local reference to each object passed as a parameter to the native method.
+
+New local references created in native code are added to this J2N root
+  set, unless you create a new "local frame" using the PushLocalFrame
+  JNI function.
+http://www.ibm.com/support/knowledgecenter/en/SSYKE2_5.0.0/com.ibm.java.doc.diagnostics.50/diag/understanding/jni_transitions_j2n.html
+
+Okay, so IBM stores the passed objects in the local reference root set but it doesn't discuss about memory compaction.  This just says that the objects won't be garbage-collected.
+
+The GC might, at any time, decide it needs to compact the
+  garbage-collected heap. Compaction involves physically moving objects
+  from one address to another. These objects might be referred to by a
+  JNI local or global reference. To allow compaction to occur safely,
+  JNI references are not direct pointers to the heap. At least one level
+  of indirection isolates the native code from object movement.
+If a native method needs to obtain direct addressability to the inside
+  of an object, the situation is more complicated. The requirement to
+  directly address, or pin, the heap is typical where there is a need
+  for fast, shared access to large primitive arrays. An example might
+  include a screen buffer. In these cases a JNI critical section can be
+  used, which imposes additional requirements on the programmer, as
+  specified in the JNI description for these functions. See the JNI
+  specification for details.
+
+GetPrimitiveArrayCritical returns the direct heap address of a Java™ array, disabling garbage collection until the corresponding
+  ReleasePrimitiveArrayCritical is called.
+GetStringCritical returns the direct heap address of a java.lang.String instance, disabling garbage collection until ReleaseStringCritical is called.
+
+http://www.ibm.com/support/knowledgecenter/SSYKE2_6.0.0/com.ibm.java.doc.diagnostics.60/diag/understanding/jni_copypin.html
+
+Okay, so IBM basically says that the JNI passed objects COULD be moved at any time!  How about HotSpot?
+
+GetArrayElements family of functions are documented to
+  either copy arrays, or pin them in place (and, in so doing, prevent a
+  compacting garbage collector from moving them). It is documented as a
+  safer, less-restrictive alternative to GetPrimitiveArrayCritical.
+  However, I'd like to know which VMs and/or garbage collectors (if any)
+  actually pin arrays instead of copying them.
+Which VMs or GCs support JNI pinning?
+
+Aleksandr seems to think that the only safe way to access the memory of passed objects is through Get<PrimitiveType>ArrayElements or GetPrimitiveArrayCritical
+Trent's answer was less than exciting.
+
+At least in current JVM's (i have not checked to see how far back this
+  was backported), CMS GC, since it's non-moving is not affected by JNI
+  critical sections (modulo that non stop-worl compaction can occur if
+  there is a concurrent mode failure -- in that case the allocating
+  thread must stall until the critical section is cleared -- this latter
+  kind of stall is likely to be much rarer than the slow-path direct
+  allocation in old gen pathology that you might see more frequently).
+  Note that direct allocation in old gen is not only slow in and of
+  itself (a first-order performance impact) but can in turn cause more
+  tenuring (because of so-called nepotism), as well as slower subsequent
+  scavenges because of more direty cards needing scanning (both of the
+  latter being second-rder effects).
+http://mail.openjdk.java.net/pipermail/hotspot-runtime-dev/2007-December/000074.html
+
+This email on the OpenJDK mailing list seems to say that the ConcurrentMarkAndSweep GC is non-moving.
+
+https://www.infoq.com/articles/G1-One-Garbage-Collector-To-Rule-Them-All
+
+This post about G1 mentions that it does compact the heap but not much specifically about moving data.
+
+Since the IBM documentation alludes to the fact that the objects could be compacted at any time; we need to figure out WHY the JNI HotSpot functions are actually safe at all. Right, because they must need to move to a safe state to prevent the concurrent memory effects if memory-compaction is indeed happening while the JNI code is running.
+Now, I've been following the HotSpot code the best I can.  Lets take a look at GetByteArrayElements.  It seems logical that the method must ensure that the pointer is correct before copying the elements.  Lets try to find out how.
+Here is the macro for GetByteArrayElements
+#ifndef USDT2
+#define DEFINE_GETSCALARARRAYELEMENTS(ElementTag,ElementType,Result, Tag) 
+JNI_QUICK_ENTRY(ElementType*,
+          jni_Get##Result##ArrayElements(JNIEnv *env, ElementType##Array array, jboolean *isCopy))
+  JNIWrapper("Get" XSTR(Result) "ArrayElements");
+  DTRACE_PROBE3(hotspot_jni, Get##Result##ArrayElements__entry, env, array, isCopy);
+  /* allocate an chunk of memory in c land */
+  typeArrayOop a = typeArrayOop(JNIHandles::resolve_non_null(array));
+  ElementType* result;
+  int len = a->length();
+  if (len == 0) {
+    result = (ElementType*)get_bad_address();
+  } else {
+    result = NEW_C_HEAP_ARRAY_RETURN_NULL(ElementType, len, mtInternal);
+    if (result != NULL) {                                    
+          memcpy(result, a->Tag##_at_addr(0), sizeof(ElementType)*len);
+      if (isCopy) {
+        *isCopy = JNI_TRUE;
+      }
+    }  
+  }
+  DTRACE_PROBE1(hotspot_jni, Get##Result##ArrayElements__return, result);
+  return result;
+JNI_END
+
+Here is the macro for JNI_QUICK_ENTRY
+#define JNI_QUICK_ENTRY(result_type, header)                         \
+extern "C" {                                                         \
+  result_type JNICALL header {                                \
+    JavaThread* thread=JavaThread::thread_from_jni_environment(env); \
+    assert( !VerifyJNIEnvThread || (thread == Thread::current()), "JNIEnv is only valid in same thread"); \
+    ThreadInVMfromNative __tiv(thread);                              \
+    debug_only(VMNativeEntryWrapper __vew;)                          \
+VM_QUICK_ENTRY_BASE(result_type, header, thread)
+
+I have followed every function in here and yet have to see any kind of mutex or memory synchronizer.  The only function I could not follow was __tiv which does not seem to have a definition anywhere I could find.
+
+Could someone explain to me why JNI interface methods such as GetByteArrayElements are safe?
+While we're at it, can anyone find where the JNI call transitions from VM back to Native when JNI_QUICK_ENTRY exits?How JNI methods work in HotSpot JVM
+
+Native methods may run concurrently with VM operations including GC. They are not stopped at safepoints.
+GC may move Java objects even if they are referenced from a running native method. jobject handle is just an index into a non-movable array of object references. Whenever an object is moved, the corresponding array slot is updated, though the index remains the same. That is, jobject handle remains valid.
+Every time a native method calls a JNI function, it checks if JVM is in the safepoint state. If it is (e.g. GC is running), JNI function blocks until safepoint operation is completed.
+During the execution of JNI functions like GetByteArrayElements, the corresponding thread is marked as _thread_in_vm. A safepoint cannot be reached while there are running threads in this state. E.g. if GC is requested during the execution of GetByteArrayElements, GC will be delayed until JNI function returns.
+Thread state transition magic is performed by the line you've noticed:
+ThreadInVMfromNative __tiv(thread). Here __tiv is just an instance of the class. Its only purpose is to automatically call ThreadInVMfromNative constructor and destructor.
+ThreadInVMfromNative constructor calls transition_from_native which checks for a  safepoint, and suspends current thread if needed. ~ThreadInVMfromNative destructor switches back to _thread_in_native state.
+GetPrimitiveArrayCritical and GetStringCritical are the only JNI functions that provide raw pointers to Java heap. They prevent GC from starting until the corresponding Release function is called.
+
+Thread state transition when calling a JNI function from native code
+
+state = _thread_in_native;
+Native method may run concurrently with GC
+JNI function is called
+state = _thread_in_native_trans;
+GC cannot start at this point
+If VM operation is in progress, block until it completes
+state = _thread_in_vm;
+Safe to access heapIt appears to be common knowledge that objects could be moved at any time.
+
+It may be common, but it isn't knowledge, and it isn't true. Objects passed to or held by JNI methods are not available for movement until the method returns, or the object is explicitly released, or the LocalFrame containing it is popped.
+
+If this was true, then every JNI interface method must require a lock or some kind of memory synchronization? 
+
+No, see above.Initialize malloc in zeros instead of using callocI want to create dynamic array in the heap using malloc.
+int *c = malloc(5 * sizeof(int));
+
+The problem is that it is not initialized by zero and I'd like avoid using calloc as much as I can since I don't know how safe it is.
+If I use calloc, is it going to do the same malloc job?You can use calloc(), it's safe or else why would it be implemented in the standard library and how? It will be presumably more efficient than malloc() + memset() for large allocations.malloc():
+malloc() takes one arguement: the amount of bytes to be allocated. The allocated bytes are uninitialized. Hence, their values could be anything from 0-255, or any combination of those numbers. Don't count on anything!
+Code Sample:
+int *mem = malloc(5 * sizeof(int));
+
+
+calloc():
+calloc() takes two arguements: the amount of elements to allocate memory for and the amount of memory that needs allocated for each element. It initializes each byte to zero.
+Code Sample:
+int *mem = calloc(5, sizeof(int));
+
+From The C programming Language ~ Brian W. Kernighan and Dennis M. Ritchie:
+
+void *calloc(size_t nobj, size_t size)
+  calloc returns a pointer to space for an array of nobj objects,
+  each of size size, or NULL if the request cannot be satisfied.
+The space is initialized to zero bytes.
+
+[Emphasis mine]
+
+Alternatively, you can initialize memory with memset()
+#include <string.h> // for memset()
+
+//allocate memory
+int *mem = malloc(5 * sizeof(int));
+
+//initialize memory to zeros
+memset(mem, 0, 5 * sizeof(int));You can use memset if you want to avoid using calloc for some reason.  you can do it like this:
+memset (c, 0, 5 * sizeof(int));
+
+Don't forget to check the return value from malloc.FFmpeg: Protocol not on whitelist 'file'!I want to read from an RTP stream, but when I specify "test.sdp" to avformat_open_input() I get this message:
+[rtp @ 03928900] Protocol not on whitelist 'file'!
+Failed: cannot open input.
+avformat_open_input() fail: Invalid data found when processing input
+
+Normally if I were using ffplay on the console, I would add the option -protocol_whitelist file,udp,rtp and it would work fine. 
+So I tried this:
+AVDictionary *d = NULL;           
+av_dict_set(&d, "protocol_whitelist", "file, udp, rtp", 0); 
+ret = avformat_open_input(&inFormatCtx, filename, NULL, &d);
+
+But the same message still pops up. Any ideas?This is awkward... 
+avformat_open_input failed because I have white spaces. Removing the whitespaces now work.
+av_dict_set(&d, "protocol_whitelist", "file,udp,rtp", 0);EDIT: This answer works up to some version. You should use the options parameter of avformat_open_input as described in bot1131357's answer
+
+I'm not totally sure about this, but I believe this options go into the AVFormatContext
+AVFormatContext* formatContext = avformat_alloc_context();
+formatContext->protocol_whitelist = "file,udp,rtp";
+if (avformat_open_input(&formatContext, uri.c_str(), NULL, NULL) != 0) {
+    return EXIT_FAILURE;
+}
+
+Take a look at the cvs log of this change:
+https://ffmpeg.org/pipermail/ffmpeg-cvslog/2016-March/098694.htmlInput to array of strings won't show?I'm in C and I'm supposed to have an input of numbers (don't know how many) formatted into one column without storing them into an array of integers. I can't figure out why my code won't read the input and out put it. Please help.
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    int i;
+    char *nums[400];
+
+    for (i=0; i<nums; i++) {
+        scanf(nums[i]);
+        printf( "%.*s", 3, nums[i] );
+    }
+    return 0;
+}You have an array of 400 pointers, but you've never initialized them. Instead, you could declare a 2-dimension array:
+char nums[400][4];
+
+Then you're trying to use nums as a limit to the for loop. What you actually want is the number of elements in nums, which is sizeof(nums)/sizeof(nums[0]); or you could define a macro that specifies the size of the array.
+Next, you left out the format string argument to scanf().
+#include <stdio.h>
+#include <stdlib.h>
+
+#declare SIZE 400
+
+int main()
+{
+
+  int i;
+  char *nums[SIZE][4];
+
+  for(i=0; i<SIZE; i++){
+
+    scanf("%3s", nums[i]);
+    printf( "%.*s", 3, nums[i] );    
+  }
+  return 0;
+}As Baramar correctly and thoroughly explained your main problems, I think I might have a different understanding of your problem. You want a given string of number, e.g.: 2134567896543245678 and print it out in a single column, neatly formated in rows of three digits each like that: 
+213
+456
+789
+654
+324
+567
+8
+
+without an intermittent array of integers.
+That could be done like e.g.: this
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BUFFER_SIZE 512
+
+int main()
+{
+
+  int res;
+  // for the scanf input, set all to '\0'
+  char buffer[BUFFER_SIZE + 1] = { '\0' }, *idx;
+  size_t len, i;
+
+  // restrict max-size to BUFFER_SIZE
+  res = scanf("%512s", buffer);
+  if (res != 1) {
+    exit(EXIT_FAILURE);
+  } else {
+    if (strcmp(buffer, "exit") == 0) {
+      exit(EXIT_SUCCESS);
+    }
+    // TODO: check if the buffer contains all digits
+    len = strlen(buffer);
+    idx = buffer;
+    for (i = len; i >= 3; i -= 3, idx += 3) {
+      printf("%.3s\n", idx);
+    }
+    // last entries, if any
+    if (*idx != '\0') {
+      printf("%s\n", idx);
+    }
+  }
+  exit(EXIT_SUCCESS);
+}
+
+If you get actual integers in a row like e.g.: 12 3123 23478 34 5456 567456 567 678 you can use something like that:
+EDIT
+After the comment by the OP to use floating points I changed the code to accept input of the form:
+24722.319352                51433.662233
+     56087.991042             49357.684934  67875.375848      68421.563197
+
+54521.615295
+
+22744.470483
+
+38097.001461    80878.250982
+92131.575748                7217.137271
+20750.671365 7620.695008 37118.391541   28655.609469    46885.110202    87114.202312
+46462.577299
+
+
+
+
+
+
+
+
+20557.716648
+
+And the code:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAXNUM 400
+int main()
+{
+  int res;
+  int i = 0, m;
+  // input and two temporary variables
+  double in, in1, in2;
+
+  for (m = 0; m < MAXNUM; m++) {
+    res = scanf("%lf", &in);
+    if (res != 1) {
+      break;
+    } else {
+      switch (i) {
+        case 0:
+          // set value of first temporary variable to input
+          in1 = in;
+          // increment indicator indicating position in output row
+          i++;
+          break;
+        case 1:
+          in2 = in;
+          i++;
+          break;
+        case 2:
+          // print the three numbers and a newline
+          fprintf(stdout, "%f %f %f\n", in1, in2, in);
+          // reset counter
+          i = 0;
+          break;
+      }
+    }
+  }
+  // if there are still numbers, print them
+  if (i != 0) {
+    if (i == 1) {
+      fprintf(stdout, "%f\n", in1);
+    } else {
+      fprintf(stdout, "%f %f\n", in1, in2);
+    }
+  }
+  exit(EXIT_SUCCESS);
+}
+
+Try it out with 
+ $ gcc-4.9 -O3 -g3  -W -Wall -Wextra  -std=c11 sc.c -o sc
+ $ ./sc < floatin 
+ 24722.319352 51433.662233 56087.991042
+ 49357.684934 67875.375848 68421.563197
+ 54521.615295 22744.470483 38097.001461
+ 80878.250982 92131.575748 7217.137271
+ 20750.671365 7620.695008 37118.391541
+ 28655.609469 46885.110202 87114.202312
+ 46462.577299 20557.716648
+
+If you enter less than 400 entries you need to end with EOF which can be triggered in most Unix shells with ctrl+d or set an entry to end the entries like e.g.: -1 if all you have is positive numbers and check for it to break out of the loop. If you submit a file like in the example above it works automatically.Fscanf that reads only a last word from a fileI'm trying to insert words from a file into a binary tree.The insert function works when not reading from a file also when I tried to print every read string after fscanf it it also works,but when I try to insert it into a tree only the last string from a file is read.Why does this happen?
+    while(1){
+
+    if(fscanf(f,"%s %d",string,&x)==EOF)
+          break;
+
+      tree=insert(tree,string,x);
+    }insert() doesn't make a copy of the string, it just stores the pointer you give it in the tree. So all the tree entries contain a pointer to the same string, which you're overwriting each time you call fscanf.
+The same problem happens with the x argument, you're passing the same pointer each time. You need to allocate a new int for each of the values as well.
+while (1) {
+    if (fscanf(f, "%s %d", string, x) == EOF) {
+        break;
+    }
+    char *new_str = malloc(strlen(string)+1);
+    strcpy(new_str, string);
+    int *new_int = malloc(sizeof(*x));
+    *new_int = *x;
+    tree = insert(tree, new_str, new_int);
+}Your code should look like this:
+while (fscanf(f, "%s %d", string, &val) == 2) {
+    char *copy = malloc(strlen(string) + 1);
+    if (copy == NULL)
+        break;
+    strcpy(copy, string);
+    insert(copy, val);
+}
+
+Note the error handling for fscanf, which checks if both fields could be read. Also note the & in front of val, which probably prevents a compiler warning. By the way, you should enable all available compiler warnings, so you don't have to search for the bugs yourself.Is a memcpy between differently aligned pointers UB?As far as I understand, the following piece of code exhibits undefined behaviour in C11:
+#include <string.h>
+
+struct aaaa { char bbbb; int cccc; };
+
+int main(void) {
+    unsigned char buffer[sizeof(struct aaaa)] = { 0 };
+    struct aaaa *pointer = &buffer[0];
+
+    return (*pointer).cccc;
+}
+
+According to N1570 section 6.5.3.2 clause 4,
+
+If an invalid value has been assigned to the pointer, the behavior of the unary * operator is undefined.
+
+which is accompanied by a footnote that clarifies that
+
+Among the invalid values for dereferencing a pointer by the unary * operator are a null pointer, an address inappropriately aligned for the type of object pointed to, and the address of an object after the end of its lifetime.
+
+It's unlikely that struct aaaa * and unsigned char * have the same alignment, so we assigned an invalid value to pointer, and using *pointer therefore causes UB.
+However, can I copy the structure?
+#include <string.h>
+
+struct aaaa { char bbbb; int cccc; };
+
+int main(void) {
+    unsigned char buffer[sizeof(struct aaaa)] = { 0 };
+    struct aaaa target;
+
+    memcpy(&target, buffer, sizeof(struct aaaa));
+
+    return target.cccc;
+}
+
+Here, we pass a struct aaaa * and unsigned char * to memcpy. While that seems just as bad as the first piece of code, I can't find any wording in C11 that rules that this code exhibits UB. Does this usage of memcpy cause undefined behaviour?No, memcpy doesn't make any assumptions about alignement. It is functionally equivalent to copying byte by byte.
+BTW, accessing an auto object through an lvalue of a different type that is not a character type leads to undefined behavior, regardless of alignment. This is a violation of the effective type rule, C11 6.5 p6 and p7.From what I understand, both cases are UB (but not because of the call to memcpy), because the compiler does not enforce alignment of start offsets of variables properly. You can enforce alignment with compiler-specific attributes to be sure, but this is of course a platform-specific solution.
+Assuming the start offsets are aligned (this is an assumption from practice), like compilers usually do it to gain perfomance:
+In your first example you assign at first buffer index 0. buffer is usually aligned correctly. cccc will be aligned, too, because the struct is not packed. It should not cause a problem in this case.
+In second example when using memcpy everything will copy properly, because (internally) it tries its best to do aligned copy for performance and when it is not possible, it copies byte-wise. And here again, all structures and buffers are aligned with the restrictions I mentioned above.
+What is the actual problem here?
+You would risk it (visibly in practice) if you assign &buffer[1] (given, it is usually not aligned). An access to cccc will load a word from unaligned address. On some architectures it causes the dreaded SIGBUS. x86 detects unaligned addressing and slows down a bit (perhaps), but does not crash.Mersenne primes using Lucas-Lehmer primality testHere is the code, where limit = 8:
+#include <stdio.h>
+#include <math.h> // pow(x, exp)
+
+//----------------------------------------------------------
+
+char isMersenneLucasLehmer(unsigned int prime)
+{
+    unsigned int i, termN = 4;
+    unsigned long mersenne;
+    unsigned int limit;
+    int res;
+
+    mersenne = (unsigned long) pow(2, (double)prime) - 1;
+    if (prime % 2 == 0)
+    {
+        return prime == 2;
+    }
+    else 
+    {
+        res = (int) sqrt((double) prime);
+        for (i = 3; i <= res; i += 2)
+        {
+            if (prime % i == 0)
+            {
+                return 0;  
+            }
+        }
+
+        limit = prime - 2;
+        for (i = 1; i <= limit; ++i)
+        {
+            termN = (termN * termN - 2) % mersenne;
+        }
+    }
+    return termN == 0;
+}
+//----------------------------------------------------------
+
+/*
+    Function: findMersenneLucasLehmer()
+
+*/
+void findMersenneLucasLehmer(unsigned int limit)
+{
+    unsigned int i, current = 0;
+    unsigned long mersenne, bitsInLong = 64;
+
+    for (i = 2; i <= bitsInLong; i++)
+    {
+        if (current >= limit)
+        {
+            break;
+        }
+
+        if (isMersenneLucasLehmer(i))   
+        {
+            mersenne = (unsigned long) pow(2, (double)i) - 1;
+            printf("current = %lu, mersenne = %lu, index = %u\n", current, mersenne, i);
+            ++current;
+        } 
+    }
+}
+//----------------------------------------------------------
+
+int main()
+{
+    unsigned int limit = 8;
+    findMersenneLucasLehmer(limit);
+    return 0;
+}
+
+Output:
+current = 0, mersenne = 3, index = 2
+current = 1, mersenne = 7, index = 3
+current = 2, mersenne = 31, index = 5
+current = 3, mersenne = 127, index = 7
+current = 4, mersenne = 8191, index = 13
+
+It is only returning the first 5 instead of 8 and I can't figure out why.
+
+Update:
+it is skipping all the indexes from 13 and on. I suspect that the error is in somewhere in the last lines of isMersenneLucasLehmer(unsigned int). I've been staring for too long and couldn't find it.Likely integer overflow at termN * termN. In general you should represent values that could be very large numbers as doubles, and avoid casting between different numeric types, especially between integers and floats, whenever possible.Change this:
+unsigned int termN = 4;
+
+to this:
+unsigned long int termN = 4;
+
+mostly because you later do termN * termN which is likely to cause an overflow when a type of unsigned int.
+Output:
+current = 0, mersenne = 3, index = 2
+current = 1, mersenne = 7, index = 3
+current = 2, mersenne = 31, index = 5
+current = 3, mersenne = 127, index = 7
+current = 4, mersenne = 8191, index = 13
+current = 5, mersenne = 131071, index = 17
+current = 6, mersenne = 524287, index = 19
+current = 7, mersenne = 2147483647, index = 31
+
+
+It would be nice to print your types as you ought to:
+C02QT2UBFVH6-lm:~ gsamaras$ gcc -Wall main.c
+main.c:58:67: warning: format specifies type 'unsigned long' but the argument has type 'unsigned int' [-Wformat]
+            printf("current = %lu, mersenne = %lu, index = %u\n", current, mersenne, i);
+                              ~~~                                 ^~~~~~~
+                              %u
+
+So change %lu to %u.
+
+How did I start debugging?
+By using a print statement in the start of your loop, like this:
+for (i = 2; i <= bitsInLong; i++)
+{
+    printf("Loop i = %u, current = %u\n", i, current);
+    ...
+
+You will see this:
+current = 4, mersenne = 8191, index = 13
+Loop i = 14, current = 5
+...
+Loop i = 63, current = 5
+Loop i = 64, current = 5
+
+which means that you don't see 8 Mersenne numbers, because you are ending your loop, before your function fins 8 of them!The issue is in the line:
+termN = (termN * termN - 2) % mersenne;
+
+You declared termN as an unsigned int (32 bit, in your environment) but that product can become so big not to be representable by this type and the resulting overflow cause the loop to diverge.
+The solution is to use a type with a bigger range, like unsigned long long int (64 bit).
+See the example at Ideone.com.Let's push this one number further and toss all that floating point code.  Although the next mersenne prime will fit into 64 bits, the issue is the termN * termN expression which will overflow before the modulus can reign it in.  If we had true modular exponentiation, we might avoid this problem.  Instead, we'll use the emulated 128 bit type in GCC/clang while computing that value:
+#include <stdio.h>
+#include <stdbool.h>
+
+typedef unsigned __int128 uint128_t;
+
+bool isPrime(unsigned number)
+{
+    if (number % 2 == 0)
+    {
+        return number == 2;
+    }
+
+    for (unsigned i = 3; i * i <= number; i += 2)
+    {
+        if (number % i == 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool isMersenneExponent(unsigned exponent)
+{
+    if (exponent == 2)
+    {
+        return true;
+    }
+
+    if (!isPrime(exponent))
+    {
+        return false;
+    }
+
+    unsigned long termN = 4, mersenne = (1L << exponent) - 1;
+
+    unsigned limit = exponent - 1;
+
+    for (unsigned i = 1; i < limit; i++)
+    {
+        termN = (((uint128_t) termN * termN) % mersenne) - 2;
+    }
+
+    return termN == 0;
+}
+
+void findMersennePrime(unsigned limit)
+{
+    unsigned bit_limit = sizeof(unsigned long) * 8;
+
+    for (unsigned current = 0, i = 2; current < limit && i < bit_limit; i++)
+    {
+        if (isMersenneExponent(i)) 
+        {
+            unsigned long mersenne = (1L << i) - 1;
+            printf("current = %u, mersenne = %lu, index = %u\n", current++, mersenne, i);
+        }
+    }
+}
+
+int main()
+{
+    unsigned limit = 9;
+    findMersennePrime(limit);
+    return 0;
+}
+
+The i * i in isPrime() is a slight inefficiency but since the exponent primes are tiny, it hardly matters.
+OUTPUT
+current = 0, mersenne = 3, index = 2
+current = 1, mersenne = 7, index = 3
+current = 2, mersenne = 31, index = 5
+current = 3, mersenne = 127, index = 7
+current = 4, mersenne = 8191, index = 13
+current = 5, mersenne = 131071, index = 17
+current = 6, mersenne = 524287, index = 19
+current = 7, mersenne = 2147483647, index = 31
+current = 8, mersenne = 2305843009213693951, index = 61Why does srand(time(NULL)) gives me segmentation fault on main?Need some help here.
+I want to understand what's happening in this code.
+I'm trying to generate random numbers as tickets to the TCP_t struct created inside ccreate function.
+The problem is, everytime I executed this code WITHOUT the srand(time(NULL)) it returned the same sequence of "random" numbers over and over, for example:
+TID: 0 | TICKET : 103
+TID: 1 | TICKET : 198
+
+So I seeded it with time, to generate really random numbers.
+When I put the seed inside the newTicket function, it brings different numbers in every execution, but the same numbers for every thread. Here is an example of output:
+Execution 1:
+TID: 0 | TICKET : 148
+TID: 1 | TICKET : 148
+
+Execution 2:
+TID: 0 | TICKET : 96
+TID: 1 | TICKET : 96
+
+So, after some research, I found out I shouldn't seed it everytime I call rand but only once, in the beginning of the program. Now, after putting the seed inside the main function, it gives me segmentation fault, and I have NO IDEA why.
+This might be a stupid question, but I really want to understand what's happening.
+Is the seed screwing anything, somehow?
+Am I missing something?
+Should I generate random number in another way? 
+#include <ucontext.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+
+#define MAX_TICKET 255
+#define STACK_SIZE 32000
+
+typedef struct s_TCB {
+  int threadId;
+  int ticket;
+  ucontext_t context;
+} TCB_t;
+
+void test();
+int newTicket();
+int newThreadId();
+int ccreate (void* (*start)(void*), void *arg);
+int threadId = 0;
+
+int main(){
+  srand(time(NULL)); //<<<============== HERE = SEGMENTATION FAULT
+  ccreate((void*)&test, 0);
+  ccreate((void*)&test, 0);
+}
+
+int ccreate (void* (*start)(void*), void *arg){
+    if(start == NULL) return -1;
+
+    ucontext_t threadContext;
+    getcontext(&threadContext);
+    makecontext(&threadContext, (void*)start, 0);
+    threadContext.uc_stack.ss_sp = malloc(STACK_SIZE);
+    threadContext.uc_stack.ss_size = STACK_SIZE;
+
+    TCB_t * newThread = malloc(sizeof(TCB_t));
+    if (newThread == NULL) return -1;
+
+    int threadThreadId = newThreadId();
+    newThread->threadId = threadThreadId;
+    newThread->ticket = newTicket();
+
+    printf("TID: %d | TICKET : %d\n", newThread->threadId, newThread->ticket);
+
+    return threadThreadId;
+}
+
+int newThreadId(){
+  int newThreadId = threadId;
+  threadId++;
+  return newThreadId;
+}
+
+int newTicket(){
+  //srand(time(NULL)); //<<<============== HERE = IT PARTIALLY WORKS
+  return (rand() % (MAX_TICKET+1));
+}
+
+void test(){
+  printf("this is a test function");
+}
+
+Thanks to everyone who lends me a hand here.
+And sorry if the code is too ugly to read. Tried to simplify it as much as I could.The problem is not with srand(time(NULL)), but with makecontext.
+You can run your code through a sanatizer to confirm:    
+gcc-6 -fsanitize=undefined -fsanitize=address -fsanitize=leak -fsanitize-recover=all -fuse-ld=gold -o main main.c
+./main 
+ASAN:DEADLYSIGNAL
+=================================================================
+==8841==ERROR: AddressSanitizer: SEGV on unknown address 0x7fc342ade618 (pc 0x7fc340aad235 bp 0x7ffd1b945950 sp 0x7ffd1b9454f8 T0)
+    #0 0x7fc340aad234 in makecontext (/lib/x86_64-linux-gnu/libc.so.6+0x47234)
+    #1 0x400d2f in ccreate (/home/malko/Desktop/main+0x400d2f)
+    #2 0x400c19 in main (/home/malko/Desktop/main+0x400c19)
+    #3 0x7fc340a87f44 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21f44)
+    #4 0x400b28  (/home/malko/Desktop/main+0x400b28)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: SEGV (/lib/x86_64-linux-gnu/libc.so.6+0x47234) in makecontext
+==8841==ABORTING
+
+You can solve the problem by setting a stack size before making the context:  
+char stack[20000];
+threadContext.uc_stack.ss_sp = stack;
+threadContext.uc_stack.ss_size = sizeof(stack);
+makecontext(&threadContext, (void*)start, 0);
+
+
+Unrelated, but make sure you also free that malloc'd memory in your sample code.no symbols (just question marks) in stack trace in remote gdbI have a relatively simple application (that links in another simple library) that refuses to let me remotely debug it with gdb.  I've checked that gdb and gdbserver versions match.  It's actually even the same OS (ubuntu) on both machines.  It seems to be happily loading symbols from the executable.  So I'm at a bit of a loss for what could be wrong.  Any suggestions appreciated.  Here is the transcript from gdb:
+dev:/fast/git/archive/foo$ gdb /fast/git/foo 
+GNU gdb (Ubuntu 7.11.1-0ubuntu1~16.04) 7.11.1
+Copyright (C) 2016 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from /fast/git/foo...done.
+(gdb) target remote test1:5000
+Remote debugging using test1:5000
+Reading /lib64/ld-linux-x86-64.so.2 from remote target...
+warning: File transfers from remote targets can be slow. Use "set sysroot" to access files locally instead.
+Reading /lib64/ld-linux-x86-64.so.2 from remote target...
+Reading symbols from target:/lib64/ld-linux-x86-64.so.2...Reading /lib64/ld-2.23.so from remote target...
+Reading /lib64/.debug/ld-2.23.so from remote target...
+(no debugging symbols found)...done.
+0x00007ffff7dd7cc0 in ?? () from target:/lib64/ld-linux-x86-64.so.2
+(gdb) bt
+#0  0x00007ffff7dd7cc0 in ?? () from target:/lib64/ld-linux-x86-64.so.2
+#1  0x0000000000000003 in ?? ()
+#2  0x00007fffffffce02 in ?? ()
+#3  0x00007fffffffce2f in ?? ()
+#4  0x00007fffffffce32 in ?? ()
+#5  0x0000000000000000 in ?? ()
+
+Ah, so interesting. I'm still not sure why, but it only prints that (bogus stack trace) on connect. If I then "continue," it will happily print the right symbols if I trigger a break.
+Odd...maybe this is partly user error, but I expected it to start running and break on the start on main when I connected.I'm at a bit of a loss for what could be wrong
+
+It could be that there is nothing wrong at all.
+Here is what I get on a local machine:
+gdbserver :0 /bin/date
+Process /bin/date created; pid = 132826
+Listening on port 57966
+Remote debugging from host 127.0.0.1
+
+In a separate window:
+gdb -q /bin/date
+(gdb) target remote localhost:57966
+Remote debugging using localhost:57966
+Loading symbols for shared libraries.
+Loading symbols for shared libraries.
+0x00007ffff7ddb2d0 in _start () at rtld.c:871
+871 rtld.c: No such file or directory.
+(gdb) bt
+#0  0x00007ffff7ddb2d0 in _start () at rtld.c:871
+#1  0x0000000000000001 in ?? ()
+#2  0x00007fffffffe157 in ?? ()
+#3  0x0000000000000000 in ?? ()
+
+What's happening here is that gdbserver stopped the inferior (being debugged) process very early on. Before the loader zeroed out stack, and before entering main.
+The symbols for main executable should already be loaded, and you should be able to set breakpoints on them. Set a breakpoint on main, and just continue from there, and you should soon see your breakpoint getting hit.
+Update:
+
+I expected it to start running and break on the start on main when I connected.
+
+Your expectation is incorrect.
+In a typical dynamically-linked binary, there are 1000s of instructions between _start and getting to main. Sometimes these instructions are the ones where a crash happens. If GDB automatically continued to main without giving you a chance to set breakpoints or watchpoints, then debugging such crashes would be much more difficult than it is now.A few ideas:
+Make sure the remote program and shared libraries are compiled with -g to add debug symbols.  The (no debugging symbols found) message may mean that the debug symbols are missing from the whole executable. 
+Make sure the local and remote program are the same image. You can do a 'sum' on each.  This may be the problem as the #1  0x0000000000000003 in ?? () line looks to be corrupt. 
+Are you able to manually debug the target on the remote box?  If so, check for symbols to see if it something about the remote/local debug session.  You can check for debug symbols by doing a list <function> 
+The address ranges are often mapped the same on local system versus remote.  You can disassemble an address on a local debug session and see what function/method it maps to.  This can be helpful if the remote program is crashing, at least you can get an idea of where the trouble is.When debugging remote, gdb client does not know where to load symbols from. You have two options:
+1. specify executable when starting gdb
+
+gdb <executable>
+(gdb) target remote <IP>:<port>
+(gdb) load <executable>
+ gdb should know symbols now
+(gdb) b main
+(gdb) mon reset
+(gdb) contnue
+ it should break at main
+(gdb) bt
+
+2. use file command to tell about the symbols.
+
+gdb
+(gdb) target remote <IP>:<port>
+(gdb) load <executable>
+(gdb) file <executable>
+ gdb should know symbols now
+(gdb) b main
+(gdb) mon reset
+(gdb) contnue
+ it should break at main
+(gdb) btAutomically Register Unit Tests in CConsider this minimal framework for running unit tests:
+#include <stdio.h>
+
+#define TEST(name) int test_##name()
+#define RUN_TEST(name) \
+    do {printf("%s\t%s\n", #name, test_##name() ? "OK" : "FAIL");} while(0)
+#define ASSERT_EQ(left, right) \
+    do {return (left) == (right);} while(0)
+
+TEST(addition) {
+    ASSERT_EQ(1 + 2, 3);
+}
+
+TEST(mult_fail) {
+    ASSERT_EQ(42, 6 * 9);
+}
+
+int main() {
+    RUN_TEST(addition);
+    RUN_TEST(mult_fail);
+}
+
+It is used like so:
+> gcc test_runner.c && ./a.out
+addition        OK
+mult_fail       FAIL
+
+How can it be made so that the TEST macro automatically registers the tests? I want the main function to contain a single RUN_ALL_TESTS statement without having to refer to all the tests by name.
+I know this can easily be done in C++, but I would prefer to see a purely C solution.Since you are starting with a macro-based approach, you might be interested in a solution built around X macros.  It would be a bit ugly, and a lot idiosyncratic, but it could do what you want:
+#include <stdio.h>
+
+// Test definitions
+#define TESTS \
+  X(addition,  ASSERT_EQ(1 + 2, 3) ) \
+  X(mult_fail, ASSERT_EQ(42, 6 * 9))
+
+// Helper macros    
+#define ASSERT_EQ(left, right) \
+    do {return (left) == (right);} while(0)
+
+// declare test functions
+#define X(name, body) int test_##name(void) { body; }
+TESTS
+#undef X
+
+int main(void) {
+    // run tests
+    #define X(name, ignored) \
+      printf("%s\t%s\n", #name, test_##name() ? "OK" : "FAIL");
+    TESTS
+    #undef X
+}
+
+To add, remove, or modify tests, you just modify the definition of macro TESTS; the preprocessor generates everything else you need from that.There are some quirky ways to enumerate functions in an executable file (kind of "reflection" in pure c) or clever placement of function pointers in a special data section, etc. 
+A common advice is not to reinvent the wheel.  Google for existing unit test frameworks, pick one, use it, enjoy.How to merge Gtk+ builderI'm building a GTK+ gui and I'm trying to use the GtkBuilder to do it.
+There is a main window in which there is a notebook, a menu and two buttons.
+I want to fill the notebook with tabs when I click on a button.
+So I created the main window from a file with a GtkBuilder, and then I try to add each tab to the builder.
+For now, I did this (the unindented code are debug print):
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <string.h>
+
+#include <gtk/gtk.h>
+
+#include "main.h"
+
+GtkBuilder* build;
+int i;
+
+#define TAB\
+  "<interface>\
+    <object class=\"GtkNotebook\" id=\"note\">\
+      <property name=\"scrollable\">t</property>\
+      <property name=\"show-border\">t</property>\
+      <property name=\"show-tabs\">t</property>\
+      <child>\
+        <object class=\"GtkLabel\" id=\"tab%d\">\
+          <property name=\"label\">Content%d</property>\
+        </object>\
+      </child>\
+      <child type=\"tab\">\
+        <object class=\"GtkLabel\" id=\"labTab%d\">\
+          <property name=\"label\">Label%d</property>\
+        </object>\
+      </child>\
+    </object>\
+  </interface>"
+
+int main(int argc, char** argv) {
+  GtkWidget* window;
+//  GtkWidget* item;
+  GError* error=NULL;
+  GtkAccelGroup* accel_group;
+
+  i=0;
+
+  gtk_init(&argc, &argv);
+
+  build=gtk_builder_new();
+  if (gtk_builder_add_from_file(build, "gui.ui", &error)==0)
+    printf("erreur %s\n", error->message);
+
+  gtk_builder_add_callback_symbol(build, "quit", func);
+  gtk_builder_add_callback_symbol(build, "add", add);
+
+  gtk_builder_connect_signals(build, NULL);
+
+  window=(GtkWidget*)gtk_builder_get_object(build, "main");
+  gtk_window_maximize(GTK_WINDOW(window));
+
+  gtk_widget_show_all(window);
+
+  gtk_main();
+
+
+  return EXIT_SUCCESS;
+}
+
+void add() {
+  char* str;
+  GtkWidget* window;
+  GError* error=NULL;
+  FILE* file=NULL;
+
+printf("in add 1\n");
+  if ((str=malloc(sizeof(TAB)+20))==NULL) {
+    perror("malloc");
+    exit(EXIT_FAILURE);
+  }
+printf("in add 2\n");
+
+  snprintf(str, sizeof(TAB)+20, TAB, i, i, i, i);
+printf("in add 3, str : %s\n", str);
+
+  if ((file=fopen("tmp.ui", "w"))==NULL) {
+    free(str);
+    perror("fopen");
+    exit(EXIT_FAILURE);
+  }
+
+  fprintf(file, TAB, i, i, i, i);
+
+  fclose(file);
+
+/*  if (gtk_builder_add_from_file(build, "tmp.ui", &error)==0)
+    printf("erreur %s\n", error->message);*/
+  if (gtk_builder_add_from_string(build, str, sizeof(str), &error)==0)
+    printf("erreur %s\n", error->message);
+printf("in add 4\n");
+
+  if ((window=(GtkWidget*)gtk_builder_get_object(build, "main"))==NULL)
+    printf("Can't find\n");
+  else
+    gtk_widget_show_all(window);
+
+  sprintf(str, "tab%d", i);
+  if ((window=(GtkWidget*)gtk_builder_get_object(build, str))==NULL)
+    printf("in add, Does not exist (%s)\n", str);
+  else
+    printf("in add, Exist (%s)\n", str);
+
+  remove("tmp.ui");
+  free(str);
+  ++i;
+//  free(error);
+}
+
+Here is my builder definition:
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <!-- Main window -->
+  <object class="GtkWindow" id="main">
+    <property name="title">Test Xml</property>
+    <property name="window-position">GTK_WIN_POS_CENTER</property>
+    <property name="default-width">1024</property>
+    <property name="default-height">512</property>
+    <signal name="delete-event" handler="quit"/>
+
+    <child>
+      <object class="GtkBox" id="mainBox">
+        <property name="orientation">GTK_ORIENTATION_VERTICAL</property>
+        <property name="spacing">5</property>
+
+        <!-- Menu -->
+        <child>
+          <object class="GtkMenuBar" id="menuBar">
+            <child>
+
+              <!-- Menu fichier -->
+              <object class="GtkMenuItem" id="m1">
+                <property name="label">_Fichier</property>
+                <property name="use_underline">True</property>
+                <child type="submenu">
+                  <object class="GtkMenu" id="menu">
+                    <property name="accel-group">accel_group</property>
+                    <child>
+
+                      <!-- Item Quitter -->
+                      <object class="GtkMenuItem" id="i1">
+                        <property name="accel-path">&lt;Test&gt;/FILE/QUIT</property>
+                        <property name="label">_Quitter</property>
+                        <property name="use_underline">True</property>
+                        <signal name="activate" handler="quit"/>
+                      </object>
+                      <!-- End Item Quitter -->
+
+                    </child>
+                  </object>
+                </child>
+              </object>
+              <!-- End Menu fichier -->
+
+            </child>
+          </object>
+        </child>
+        <!-- End Menu -->
+
+        <!-- Frame -->
+        <child>
+          <object class="GtkFrame" id="mainframe">
+            <property name="expand">t</property>
+
+            <!-- Note book -->
+            <child>
+              <object class="GtkNotebook" id="note">
+                <property name="scrollable">t</property>
+                <property name="show-border">t</property>
+                <property name="show-tabs">t</property>
+              </object>
+            </child>
+            <!-- Note book -->
+          </object>
+        </child>
+        <!-- End Frame -->
+
+        <!-- Bottom box -->
+        <child>
+          <object class="GtkBox" id="bottomBox">
+            <property name="orientation">GTK_ORIENTATION_HORIZONTAL</property>
+            <property name="spacing">5</property>
+
+            <!-- Buttons -->
+            <child>
+              <object class="GtkButton" id="boutonPlus">
+                <property name="label">_Ajouter</property>
+                <property name="use-underline">t</property>
+                <signal name="activate" handler="add"/>
+              </object>
+            </child>
+            <child>
+              <object class="GtkButton" id="boutonMoins">
+                <property name="label">_Enlever</property>
+                <property name="use-underline">t</property>
+              </object>
+            </child>
+            <!-- End buttons -->
+          </object>
+        </child>
+        <!-- End Bottom box -->
+      </object>
+    </child>
+  </object>
+</interface>
+
+And here is the output:
+in add 1
+in add 2
+in add 3, str : <interface>
+    <object class="GtkNotebook" id="note">
+      <property name="scrollable">t</property>
+      <property name="show-border">t</property>
+      <property name="show-tabs">t</property>
+      <child>
+        <object class="GtkLabel" id="tab0">
+          <property name="label">Content0</property>
+        </object>
+      </child>
+      <child type="tab">
+        <object class="GtkLabel" id="labTab0">
+          <property name="label">Label0</property>
+        </object>
+      </child>
+    </object>
+  </interface>
+in add 4
+in add, Does not exist (tab0)
+
+As we can see, the tab is not add in the builder, but it seems there is no error when I add it.
+
+In the documentation it's said that, in case we want to merge some ui definitions we must use gtk_builder_new(), and then use gtk_builder_add_from_...(). So I did it, and in my add function, I try to add tab from string or from file just to see the problem was because I start to add from file and then from string, but it does not.
+In the documentation, I didn't find anything about what it's needed to do the merge. So, to add the tab, I tried with/without the <interface> and the nodebook definition. But it didn't change anything.
+
+Is there some documentations about merging ui definitions with a GtkBulder, or can someone explain me what I'm doing wrong ?Two main functions in a C applicationI'm actually put in a big project. My first step to understand the code was to search the main function so that I have a vision of the architecture.
+What I discovered is that there is more than one main function. It's true that they are in different folders, but I don't understand how this application succeed to build. What I know is that the linker expects one main function (Entry point).
+I believe it's too hard to understand the build process of the application, so I'm asking because for sure some of you have encountered this.
+1 - Should I have theoretical background to understand this?  If so, please suggest me articles, books, what ever you want.
+2 - When do we have to use several main functions in one application?You can't have multiple main functions for a single executable. There are several possibilities.
+If doing a build builds only a single application, then only one of the main functions will be compiled. (Or none, if there's an option to build a library rather than an executable.) There are probably options that determine which one to build, depending on which variant of the application you want, the target system, or something else.
+Or perhaps the application consists of multiple executables, with one main function for each one.
+If running the build doesn't take too long, a trick I've used to determine which of several source files is actually compiled is to temporarily add #error directives, like:
+#error "TEMPORARY: This is /full/path/to/source.cpp"
+
+The resulting error message will tell you which source file was actually compiled. (You can also use #warning directives if your compiler supports them.)Should i have theorical background to undestand this, suggest me articles book what ever you want
+
+You need to have some understanding of what a build means but, more importantly, you have to understand the build process in your specific environment. You need to have an understanding of:
+
+The list of build targets (executables and shared libraries)
+The compiler settings used by them (you could be building DLLs for VS 2010 as well as VS 2012).
+
+
+When do we have to use several main functions in one application?
+
+
+When your build system builds multiple executables, you will need multiple main functions.
+When your build system chooses file1.c or file2.c for building an executable depending on some settings, you might find main functions in file1.c as well file2.c. This will be a rather poor way to organize code but it is possible.Trying to link an executable with multiple definitions for the same identifier (aka main in this case) will fail as the linker cannot select one or the other.
+There's one possibility, though that allows you to have multiple main entry points, but assuring you only select one in the building process.
+I'll illustrate this with a simple example: suppose you have a library (a .a static library) that has a module that includes a main definition.  As library modules are selected at link time depending on the actual need of the identifiers at the time the library is linked, you can have a main definition in a module to supply when you don't have one, or that module is not linked in case you have a proper definition of it.  This is exploited in some standard libraries like -ll (flex has a definition of main that calls the yylex() function), -ly (bison has a main definition that call the yyparse() routine)  These modules are included if you don't have done it before.
+But beware, as if you link your main function after the library -ll, for example, it will be included (as main was not resolved at the time he library was included, and then you included the second, duplicated entry, making the ld linker to complaint)

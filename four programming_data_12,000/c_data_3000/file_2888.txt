@@ -1,0 +1,4822 @@
+Disallow input at certain timesI have got a text based game in c that uses scanf.
+There are a few times when the player is supposed to type in things, however, while he isn't, the cursor stays in the game, letting the user type in anything he wants, which ruins future scanfs and the story. 
+Is there a way to disallow input unless there is a scanf waiting for a response?I think it would be helpful to step back and think about all the moving parts that exist in the execution environment of your program.
+When executed, your program becomes a distinct process running in the multitasking environment of the OS. The terminal is a separate process with an associated GUI window, and which may be running locally or remotely (e.g. someone could theoretically run your game from a remote location by connecting over a network via ssh). The user interacts with the terminal program through their keyboard and screen.
+Now, it is actually the terminal process (working closely with the OS kernel) that is responsible for most of the nuances of user input. It is the terminal that prints just-typed characters to its GUI window as soon as it receives them, and it is the terminal that maintains an input buffer of characters that have been typed but that have not yet been read by a foreground process.
+Conveniently, terminals allow their behavior to be controlled by a set of configuration settings, and these settings can be changed programmatically during the run-time of the connected program. The C-level API that we can use to read and write these settings is called termios.
+There's a great article on terminals I highly recommend: The TTY demystified. For the purposes of this question, the section Configuring the TTY device is most useful. It doesn't demonstrate the termios library directly, but shows how to use the stty utility which uses the termios library internally.
+(Note that, although the links I've been giving so far are focused on Linux, they are applicable to all Unix-like systems, which includes Mac OS X.)
+
+Unfortunately there's no way to completely "disallow" input with a single switch, but we can achieve the same effect by toggling a couple of terminal settings and manually discarding buffered input at the right times.
+The two terminal settings we need to concern ourselves with are ECHO and ICANON. Both settings are normally on by default.
+By turning off ECHO, we can prevent the terminal from printing just-typed characters to the terminal window when it receives them. Hence, while the program is running, any characters the user types will seem to be ignored completely, although they will still be buffered internally by the terminal.
+By turning off ICANON, we ensure that the terminal will not wait for an enter keypress to submit a complete line of input before returning input to the program, e.g. when the program makes a read() call. Rather, it will return whatever characters it currently has buffered in its internal input buffer, thereby making it possible for us to discard them immediately and carry on with execution.
+The full process will look like this:
+1: Disable input, meaning turn off ECHO and ICANON.
+2: Run some gameplay with output, not requiring any user input.
+3: Enable input, meaning discard any buffered terminal input and then turn on ECHO and ICANON.
+4: Read user input.
+5: Repeat from step 1. Subsequent gameplay can now make use of the latest user input.
+There is a complication in step 3 related to discarding buffered input. We can implement this discarding operation by simply reading input from stdin via read() with a fixed-length buffer until there's no more input to be read. But if there's no input ready to be read at all for the discarding operation, then the first call would block until the user types something. We need to prevent this blocking.
+I believe there are two ways this could be done. There's such a thing called a non-blocking read, which can be set up with termios or fcntl() (or by opening a second file descriptor to the same endpoint with the O_NONBLOCK flag, I think) which would cause read() to return immediately with errno set to EAGAIN if it would block. The second way is to poll the file descriptor with poll() or select() to determine if there's data ready to be read; if not, we can avoid the read() call completely.
+Here's a working solution that uses select() to avoid blocking:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#include <unistd.h>
+#include <termios.h>
+
+struct termios g_terminalSettings; // global to track and change terminal settings
+
+void disableInput(void);
+void enableInput(void);
+
+void discardInputBuffer(void);
+void discardInputLine(void);
+
+void setTermiosBit(int fd, tcflag_t bit, int onElseOff );
+void turnEchoOff(void);
+void turnEchoOn(void);
+void turnCanonOff(void);
+void turnCanonOn(void);
+
+int main(void) {
+
+    // prevent input immediately
+    disableInput();
+
+    printf("welcome to the game\n");
+
+    // infinite game loop
+    int line = 1;
+    int quit = 0;
+    while (1) {
+
+        // print dialogue
+        for (int i = 0; i < 3; ++i) {
+            printf("line of dialogue %d\n",line++);
+            sleep(1);
+        } // end for
+
+        // input loop
+        enableInput();
+        int input;
+        while (1) {
+            printf("choose a number in 1:3 (-1 to quit)\n");
+            int ret = scanf("%d",&input);
+            discardInputLine(); // clear any trailing garbage (can do this immediately for all cases)
+            if (ret == EOF) {
+                if (ferror(stdin)) { fprintf(stderr, "[error] scanf() failed: %s", strerror(errno) ); exit(1); }
+                printf("end of input\n");
+                quit = 1;
+                break;
+            } else if (ret == 0) { // invalid syntax
+                printf("invalid input\n");
+            } else if (input == -1) { // quit code
+                quit = 1;
+                break;
+            } else if (!(input >= 1 && input <= 3)) { // invalid value
+                printf("number is out-of-range\n");
+            } else { // valid
+                printf("you entered %d\n",input);
+                break;
+            } // end if
+        } // end while
+        if (quit) break;
+        disableInput();
+
+    } // end while
+
+    printf("goodbye\n");
+
+    return 0;
+
+} // end main()
+
+void disableInput(void) {
+    turnEchoOff(); // so the terminal won't display all the crap the user decides to type during gameplay
+    turnCanonOff(); // so the terminal will return crap characters immediately, so we can clear them later without waiting for a LF
+} // end disableInput()
+
+void enableInput(void) {
+    discardInputBuffer(); // clear all crap characters before enabling input
+    turnCanonOn(); // so the user can type and edit a full line of input before submitting it
+    turnEchoOn(); // so the user can see what he's doing as he's typing
+} // end enableInput()
+
+void turnEchoOff(void) { setTermiosBit(0,ECHO,0); }
+void turnEchoOn(void) { setTermiosBit(0,ECHO,1); }
+
+void turnCanonOff(void) { setTermiosBit(0,ICANON,0); }
+void turnCanonOn(void) { setTermiosBit(0,ICANON,1); }
+
+void setTermiosBit(int fd, tcflag_t bit, int onElseOff ) {
+    static int first = 1;
+    if (first) {
+        first = 0;
+        tcgetattr(fd,&g_terminalSettings);
+    } // end if
+    if (onElseOff)
+        g_terminalSettings.c_lflag |= bit;
+    else
+        g_terminalSettings.c_lflag &= ~bit;
+    tcsetattr(fd,TCSANOW,&g_terminalSettings);
+} // end setTermiosBit()
+
+void discardInputBuffer(void) {
+    struct timeval tv;
+    fd_set rfds;
+    while (1) {
+        // poll stdin to see if there's anything on it
+        FD_ZERO(&rfds);
+        FD_SET(0,&rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        if (select(1,&rfds,0,0,&tv) == -1) { fprintf(stderr, "[error] select() failed: %s", strerror(errno) ); exit(1); }
+        if (!FD_ISSET(0,&rfds)) break; // can break if the input buffer is clean
+        // select() doesn't tell us how many characters are ready to be read; just grab a big chunk of whatever is there
+        char buf[500];
+        ssize_t numRead = read(0,buf,500);
+        if (numRead == -1) { fprintf(stderr, "[error] read() failed: %s", strerror(errno) ); exit(1); }
+        printf("[debug] cleared %d chars\n",numRead);
+    } // end while
+} // end discardInputBuffer()
+
+void discardInputLine(void) {
+    // assumes the input line has already been submitted and is sitting in the input buffer
+    int c;
+    while ((c = getchar()) != EOF && c != '\n');
+} // end discardInputLine()
+
+I should clarify that the discardInputLine() feature I included is completely separate from the discarding of the input buffer, which is implemented in discardInputBuffer() and called by enableInput(). Discarding of the input buffer is an essential step in the solution of temporarily disallowing user input, while discarding the remainder of the input line that is left unread by scanf() is not exactly essential. But I think it does make sense to prevent residual line input from being scanned on subsequent iterations of the input loop. It's also necessary to prevent infinite loops if the user entered invalid input, so for that reason we can probably call it essential.
+Here's a demo of me playing around with the input:
+welcome to the game
+line of dialogue 1
+line of dialogue 2
+line of dialogue 3
+[debug] cleared 12 chars
+choose a number in 1:3 (-1 to quit)
+0
+number is out-of-range
+choose a number in 1:3 (-1 to quit)
+4
+number is out-of-range
+choose a number in 1:3 (-1 to quit)
+asdf
+invalid input
+choose a number in 1:3 (-1 to quit)
+asdf 1 2 3
+invalid input
+choose a number in 1:3 (-1 to quit)
+0 1
+number is out-of-range
+choose a number in 1:3 (-1 to quit)
+1 4
+you entered 1
+line of dialogue 4
+line of dialogue 5
+line of dialogue 6
+choose a number in 1:3 (-1 to quit)
+2
+you entered 2
+line of dialogue 7
+line of dialogue 8
+line of dialogue 9
+[debug] cleared 256 chars
+[debug] cleared 256 chars
+[debug] cleared 256 chars
+[debug] cleared 256 chars
+[debug] cleared 256 chars
+[debug] cleared 256 chars
+[debug] cleared 256 chars
+[debug] cleared 238 chars
+choose a number in 1:3 (-1 to quit)
+-1
+goodbye
+
+During the first triplet of dialogue I typed 12 random characters which were discarded afterward. Then I demonstrated various types of invalid input and how the program responds to them. During the second triplet of dialogue I didn't type anything, so no characters were discarded. During the final triplet of dialogue I quickly pasted a large block of text into my terminal several times (using a mouse right-click, which is a quick and easy shortcut for pasting into my particular terminal), and you can see it discarded all of it properly, taking several iterations of the select()/read() loop to complete.On Linux and HP-UX machines, use 
+to disable display of inputs from keyboard on terminal
+stty -echo 
+
+to enable display of inputs from keyboard on terminal
+stty echoallocated memory after reasignment of pointerI have two pointers:
+1.
+double *a, *b;
+a = (double *) malloc (N*sizeof (double));
+b = (double *) malloc (N*sizeof (double));
+
+that point to huge memory space that I allocate using malloc. and assign values.
+then if I do,
+a=b;
+
+a points to array b was pointing to.
+What happens to memory allocated to a? Is following better alternative:
+free(a);
+a=b;
+free(b);
+
+or only
+a=b;
+free(b);
+
+or     a=b;
+    free(a);
+or is it illegal?
+
+Is it different if a is global and b is local?What you're doing causes the memory that you allocated for a to be leaked. That means you loose the information where it is stored in memory because you overwrite the pointer with b. If you want to assign the pointers like you do, the solution you yourself proposed 
+free(a);
+a=b;
+free(b);
+
+would work. But keep in mind that after freeing b, a points to an invalid location, because you free'd the memory. So accessing a[0] will crash the program.In your example a=b creates a memory leak. Block of memory previously pointed to by a becomes impossible to free, because your program no longer has a pointer to it. This may not lead to an immediate problem, but over time your program runs out of memory, and mallocs start returning NULL.
+Calling free(a) prior to reassignment fixes this problem. Once you assign a=b, you need to be careful with using a after calling free(b), because a becomes a dangling pointer.
+
+
+Is it different if a is global and b is local?
+
+Scope of the pointer does not matter here. The pointer has to be considered independently of the block of memory to which the pointer is pointing. The block is allocated in dynamic memory; the pointer to the block could be anywhere - static, automatic, or dynamic.When you do a=b, a points to the array being pointed to by b. Then, the only memory you would want to free is the array initially pointed to by a. For doing that,
+free(a);
+a=b;
+
+Here, you are freeing the memory being pointer to by a and making a point to the memory being pointed to by b. If you first do a=b, you have a pointing to the array pointed to by b, but are left with no way to access the memory that was earlier being pointed to by a. So, you should free a first. Moreover, if you free b later, all you would be left is with a and b both pointing to NULL.Tic Tac Toe C program not executing correctlyI wrote two functions for the two players. And one function to check winning conditions. The program executes correctly except it doesn't detect when someone wins. So there must be some problem with the check function.   
+#include<stdio.h>
+int P1(int, char []), P2(int, char []), check( int, char []);
+int main()
+{
+    char a[10]= "---------" ;
+    int flag= 3, p, q;
+    while( flag== 3)
+    {   
+        P1( p, a);  
+        check( flag, a); 
+        if( flag== 1)
+        {   printf("P1 WINS");}
+        else
+        {
+            P2( q, a);
+            check( flag, a);
+            if( flag== 2)
+            {printf("P2 WINS");}
+        }
+    }
+return 0;}
+
+int P1(int p, char a[10])
+{
+    printf("P1: Which position?\n");
+    scanf("%d", &p);
+    a[p-1]= 'X';
+    printf("%c %c %c\n%c %c %c\n%c %c %c\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);return 0;
+}
+
+int P2(int q, char a[10])
+{   
+    printf("P2: Which position?\n");
+    scanf("%d", &q);
+    a[q-1]= '0';
+    printf("%c %c %c\n%c %c %c\n%c %c %c\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);return 0;
+}
+
+int check( int flag, char a[10])//isme galti hai
+{
+    if( a[0]==a[1]==a[2]=='X' ||
+        a[3]==a[4]==a[5]=='X' ||
+        a[6]==a[7]==a[8]=='X' ||
+        a[0]==a[3]==a[6]=='X' ||
+        a[1]==a[4]==a[7]=='X' ||
+        a[2]==a[5]==a[8]=='X' ||
+        a[0]==a[4]==a[8]=='X' ||
+        a[2]==a[4]==a[6]=='X' )
+
+    {
+        flag= 1;
+    }
+
+    else 
+
+    {
+        if( a[0]==a[1]==a[2]=='0' ||
+            a[3]==a[4]==a[5]=='0' ||
+                a[6]==a[7]==a[8]=='0' ||
+                a[0]==a[3]==a[6]=='0' ||
+                a[1]==a[4]==a[7]=='0' ||
+                a[2]==a[5]==a[8]=='0' ||
+                a[0]==a[4]==a[8]=='0' ||
+                a[2]==a[4]==a[6]=='0' )
+
+        {
+            flag= 2;
+        }
+    }
+}
+
+After returning the value of flag as pointed out, its still not working.
+   #include<stdio.h>
+int P1(int, char []), P2(int, char []), check( int, char []);
+int main()
+{
+    char a[10]= "---------" ;
+    int flag= 3, p, q;
+    while( flag== 3)
+    {   
+        P1( p, a);  
+        flag= check( flag, a); 
+        if( flag== 1)
+        {   printf("P1 WINS");}
+        else
+        {
+            P2( q, a);
+            flag= check( flag, a);
+            if( flag== 2)
+            {printf("P2 WINS");}
+        }
+    }
+return 0;}
+
+int P1(int p, char a[10])
+{
+    printf("P1: Which position?\n");
+    scanf("%d", &p);
+    a[p-1]= 'X';
+    printf("%c %c %c\n%c %c %c\n%c %c %c\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);return 0;
+}
+
+int P2(int q, char a[10])
+{   
+    printf("P2: Which position?\n");
+    scanf("%d", &q);
+    a[q-1]= '0';
+    printf("%c %c %c\n%c %c %c\n%c %c %c\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);return 0;
+}
+
+int check( int flag, char a[10])//isme galti hai
+{   
+    if( a[0]==a[1]==a[2]=='X' ||
+        a[3]==a[4]==a[5]=='X' ||
+        a[6]==a[7]==a[8]=='X' ||
+        a[0]==a[3]==a[6]=='X' ||
+        a[1]==a[4]==a[7]=='X' ||
+        a[2]==a[5]==a[8]=='X' ||
+        a[0]==a[4]==a[8]=='X' ||
+        a[2]==a[4]==a[6]=='X' )
+
+    {
+        flag= 1;
+    }
+
+    else 
+
+    {
+        if( a[0]==a[1]==a[2]=='0' ||
+            a[3]==a[4]==a[5]=='0' ||
+                a[6]==a[7]==a[8]=='0' ||
+                a[0]==a[3]==a[6]=='0' ||
+                a[1]==a[4]==a[7]=='0' ||
+                a[2]==a[5]==a[8]=='0' ||
+                a[0]==a[4]==a[8]=='0' ||
+                a[2]==a[4]==a[6]=='0' )
+
+        {
+            flag= 2;
+        }
+    }
+    return flag;
+}
+
+If have tried replacing the characters with numbers and instead of 0 and X used 8 and 9 but that didn't execute correctly.The conditional statements in your check function had some issues, also. Sorry about that. I made some corrections to your code and tested it, works ok.
+#include<stdio.h>
+int P1(int, char []), P2(int, char []), check( int, char []);
+int main()
+{
+    char a[10]= "---------" ;
+    int flag= 3, p, q;
+    while( flag== 3)
+    {   
+        P1( p, a);  
+        flag= check( flag, a); 
+        if( flag== 1)
+        {   printf("P1 WINS");}
+        else
+        {
+            P2( q, a);
+            flag= check( flag, a);
+            if( flag== 2)
+            {printf("P2 WINS");}
+        }
+    }
+return 0;}
+
+int P1(int p, char a[10])
+{
+    printf("P1: Which position?\n");
+    scanf("%d", &p);
+    a[p-1]= 'X';
+    printf("%c %c %c\n%c %c %c\n%c %c %c\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);return 0;
+}
+
+int P2(int q, char a[10])
+{   
+    printf("P2: Which position?\n");
+    scanf("%d", &q);
+    a[q-1]= '0';
+    printf("%c %c %c\n%c %c %c\n%c %c %c\n", a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);return 0;
+}
+
+int check( int flag, char a[10])//isme galti hai
+{   
+    if( 
+    (a[0]== 'X' && a[1]== 'X' && a[2]=='X') ||
+    (a[3]== 'X' && a[4]== 'X' && a[5]=='X') ||
+    (a[6]== 'X' && a[7]== 'X' && a[8]=='X') ||
+    (a[0]== 'X' && a[3]== 'X' && a[6]=='X') ||
+    (a[1]== 'X' && a[4]== 'X' && a[7]=='X') ||
+    (a[2]== 'X' && a[5]== 'X' && a[8]=='X') ||
+    (a[0]== 'X' && a[4]== 'X' && a[8]=='X') ||
+    (a[2]== 'X' && a[4]== 'X' && a[6]=='X'))
+    {
+        flag= 1;
+    }
+
+    else 
+
+    {
+        if( 
+    (a[0]== '0' && a[1]== '0' && a[2]=='0') ||
+    (a[3]== '0' && a[4]== '0' && a[5]=='0') ||
+    (a[6]== '0' && a[7]== '0' && a[8]=='0') ||
+    (a[0]== '0' && a[3]== '0' && a[6]=='0') ||
+    (a[1]== '0' && a[4]== '0' && a[7]=='0') ||
+    (a[2]== '0' && a[5]== '0' && a[8]=='0') ||
+    (a[0]== '0' && a[4]== '0' && a[8]=='0') ||
+    (a[2]== '0' && a[4]== '0' && a[6]=='0'))
+
+        {
+            flag= 2;
+        }
+    }
+    return flag;
+}
+
+ETA: look at this code, before you try and compile and run it, what do you expect the outcome to be?
+int main(void)
+{
+    int a = 0;
+    int b = 0;
+
+    if (a == b == 0)
+        fprintf(stdout, "Both are zero.\n");
+    else
+        fprintf(stdout, "both are not zero.\n");
+
+    exit(EXIT_FAILURE);
+}
+
+Think of it like this - the condition is evaluated to either true (1) or false (0)...do it backwards in your head:
+if (a == b == 0)
+
+Now, if we assign both a and b with values of 0:
+int a = 0, b = 0;
+
+The condition will be evaluated thus:
+b == 0
+
+first, the b == 0 part, which is true, we know b == 0 because we assigned it with that value...byut now what is the expression after that first condition is resolved?
+if (a == 1)
+
+Because b == 0 evaluates are true (1), you see?
+You can do assignments in this fashion:
+int a = b = 0;
+
+but not conditional expressions because of how they're resolved.
+Hope this helps.C for loop not working properly without printfI would like to list all permutations of n numbers. Until now everything seems normal but I encountered a very strange behaviour. With this code:
+int **liste_permutations(int n){
+    int i, fact = factorielle(n);
+    int **tab=malloc(sizeof(int*)*fact);
+    for(i=0; i<fact; ++i)
+    {
+            tab[i] = malloc(sizeof(int)*n);
+    }
+    for(i=0;i<n;++i)
+    {
+            tab[0][i] = n-i;
+    }
+
+    for(i=1;i<fact;++i)
+    {
+            tab[i] = next_permutation(tab[i-1], n);
+    printf(" ");
+    }
+    return tab;}
+
+The output of this main()
+    int **tab;
+    tab = liste_permutations(3);
+    for(i=0; i<factorielle(3); ++i)
+    {
+
+            for(j=0; j<3; ++j)
+            {
+                    printf("%d", tab[i][j]);
+            }
+            printf("\n");
+    }
+
+is
+          321
+   231
+   213
+   312
+   132
+   123
+
+but if I change it to 
+int **liste_permutations(int n){
+    int i, fact = factorielle(n);
+    int **tab=malloc(sizeof(int*)*fact);
+    for(i=0; i<fact; ++i)
+    {
+            tab[i] = malloc(sizeof(int)*n);
+    }
+    for(i=0;i<n;++i)
+    {
+            tab[0][i] = n-i;
+    }
+
+    for(i=1;i<fact;++i)
+    {
+            tab[i] = next_permutation(tab[i-1], n);
+    }
+    return tab;}
+
+the output of the main is :
+321
+231
+321
+231
+321
+231
+
+And if I try to do this with n=5 for exemple, the output is blank (probably because it try to output 125 " ")
+here is the next_permutation code : 
+int *next_permutation(int *t, int n){
+    //printf("n = %d\n", n);
+    int i, max, count;
+    for(i=0;(i<n) && (max !=i); ++i)
+    {
+            if(t[i] == n)
+            {
+                    max = i;
+
+            }
+            if(t[i] == (t[i-1]+1))
+            {
+                    ++count;
+                    if(count == (n-1))
+                    {
+                            return NULL;
+                    }
+            }
+
+    }
+    //printf("max = %d\n", max);
+    if(n==1)
+    {
+            //printf("n=1\n");
+            return NULL;
+    }
+    int *next = malloc(n);
+    if(max == n-1)
+    {
+            //printf("max == n-1\n");
+            int *s;
+            s = malloc(sizeof(int));
+            for(i=0; i<(n-1);++i)
+            {
+                    s[i]=t[i];
+            }
+            for(i=0; i<n-1; ++i)
+            {
+                    //printf("%d", s[i]);
+            }
+            //printf("\n");
+            s = next_permutation(s, n-1);
+            if(s == NULL)
+            {
+                    //printf("NUUUUUUl");
+            //        next = NULL;
+                    return NULL;
+            }
+            //printf("reprise en n = %d\n", n);
+            for(i=1;i<n;++i)
+            {
+                    next[i] = s[i-1];
+            }
+            //printf("\n");
+            free(s);
+            next[0]=n;
+            return next;
+    }
+    else
+    {
+            //printf("max != n-1\n");
+
+            for(i=0; i<n; ++i)
+            {
+                    next[i] = t[i];
+            }
+            int tmp = next[max];
+            next[max] = next[max+1];
+            next[max+1] = tmp;
+            for(i=0;i<n;++i)
+            {
+                    //printf("%d", next[i]);
+            }
+            //printf("\n");
+            return next;
+    }}
+
+EDIT : modified what the 2 first comment said, but I still have the sam issue. 
+EDIT2 : Thank you to every body who helped me ! espescially to mweerden who showed me the right path (it was because count was uninitialized) !tab[i] = malloc(sizeof(int*)*n);
+
+tab[i] wants an array of ints (not an array of int*s)
+Change to
+tab[i] = malloc(sizeof(int)*n);
+
+Also
+int *s;
+for(i=0; i<(n-1);++i)
+{
+    s[i]=t[i];
+}
+
+You don't reserve space for s (used uninitialized)The reason the printf statement has this effect is because you are using a variable max that hasn't been initialised:
+int i, max, count;
+for(i=0;(i<n) && (max !=i); ++i)
+
+When you don't initialise it, its value will be whatever was left there by other code when that piece of memory was last used. If you don't have the printf statement, the value will be whatever the last call to next_permutation left there. If the printf is there, the value will be some value that is left by the call to printf. Except for the first call to next_permutation, there the value is a leftover from malloc.You have a number of things wrong here. You start well:
+int **tab=malloc(sizeof(int*)*fact);
+
+But this is wrong:
+for(i=0; i<fact; ++i)
+{
+    tab[i] = malloc(sizeof(int*)*n);
+}
+
+It should be:
+    tab[i] = malloc(sizeof(int)*n); // int, not int *
+
+Then, your next_permutation loop:
+for(i=1;i<fact;++i)
+{
+    tab[i] = next_permutation(tab[i-1], n);
+    printf(" ");
+}
+
+You've already assigned to tab[i] above - and here you do it again?
+Also, in next_permutation itself, you have the following line:
+    if(t[i] == (t[i-1]+1))
+
+The problem is that i can be 0 - indexing t[-1] is NOT what you want to do!Jagged arrays in C [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I came across this code while looking for jagged arrays in C. I am finding it difficult to understand the need for typecasting the calloc function since calloc() and malloc() return pointers. 
+int rowNum,colNum,i,j;
+int** table;
+scanf("%d",&rowNum);
+
+Why are we using a pointer to a pointer and what does the line below return?
+table = (int**)calloc(rowNum+1,sizeof(int*));
+for(i=0;i<rowNum;i++)
+{
+
+printf("The size of %d row",i+1);
+scanf("%d",&colNum);
+table[i] = (int*) calloc(colNum+1,sizeof(int));
+
+What's happening in the above line? Is the pointer pointing to the base element of the ith row?
+for(j=1;j<=colNum;j++)
+    {
+    //reading the elements in the row
+    scanf("%d",&table[i][j]);.
+    }
+    table[i][0] = colNum;
+
+    printf("The size of row [%d]= %d",i+1,table[i][0]);
+    }
+
+What is table pointing to here?Table is pointing to the first element of dynamic array of pointers. And then we make each of those pointers point to an array of integers inside the for loop.
+How this is different from a 2 Dim array is because in a matrix all rows have the same number of columns.
+Our requirement is to obtain a jagged array. Take an array A of 5 columns and another array B of 4 columns if you combine both together in different rows you get a jagged array.
+Now since we must assign like
+table=calloc(rowNum+1,sizeof(int*));
+//allocate an array of rowNum pointers and save to table
+...
+table[i] = calloc(colNum+1,sizeof(int));
+//Yes it is pointing to the first element of the i-th row
+
+In other words each table[i] represents each row which has variable number of columns(here as given by user).
+I guess these links can help you out
+
+Why use double pointer? or Why use pointers to pointers?
+http://www.sanfoundry.com/c-tutorials-double-pointer/
+Multi-Dimensional Arrays in C: are they jagged?how to find how many time a digit 0-9 appears in an integer [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+i need some help with a code, as the heahline is saying i need to find how many times a digit 0-9 appears in an integer and print it like so:
+300
+in a base of 10
+0:2
+1:0
+2:0
+3:1
+4:0
+5:0
+6:0
+7:0
+8:0
+9:0
+i have try'ed
+#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+
+{
+
+int num, div=1, rem, count=0, i;
+printf("Enter Number: ");
+scanf("%d", &num);
+div = num;
+for(i=1; i<=10; i++)
+{
+    div = num;
+    while(div!< 0)
+    {
+    rem = div % 10;
+    div = div / 10;
+
+
+    if(i == rem)
+    {
+        count++;
+    }
+
+
+    if(i == rem && count >= 2)
+        {
+            printf("\n%d is present %d times", i, count);
+        }
+    }
+}
+return 0;
+}
+
+it returns the right answer but not the way i need. thanks for the help!This code will give you count of number of each digit
+#include <stdlib.h>
+int main()
+{
+int num, div=1, rem,j,  i;
+printf("Enter Number: ");
+scanf("%d", &num);    //3002
+div = num;
+int count[10]={0,0,0,0,0,0,0,0,0,0};
+while(div>0)
+{
+
+rem=div%10;
+div=div/10;
+printf("%d \n",rem);
+
+for(i=0; i<=9; i++)
+{
+
+if(rem==i)
+{
+count[i]=count[i]+1;
+}
+}
+}
+for(j=0;j<=9;j++)
+{
+printf("%d",count[j]);}
+return 0;
+ }
+
+If you enter number 3002, it will give output as 2011000000, indicating 2 0's, 1 two and 1 three.C Sprintf Format Error [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I'm trying to format the given string and printf it. Bu it doesnt work. It gives error Any idea?
+  char* query_buffer;
+
+  sprintf(query_buffer,"%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x;%u.%u.%u.%u;%d\n",
+      node_config->mac_address.addr[0], node_config->mac_address.addr[1], node_config->mac_address.addr[2], node_config->mac_address.addr[3],
+      node_config->mac_address.addr[4], node_config->mac_address.addr[5], node_config->mac_address.addr[6], node_config->mac_address.addr[7],
+      ip64_addr->u8[0], ip64_addr->u8[1], ip64_addr->u8[2], ip64_addr->u8[3],
+      node_config->coap_port);
+
+  printf("%s\n",query_buffer);
+
+If I try below printf it works. I couldnt understand what is different between doing these two.
+  printf("%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x;%u.%u.%u.%u;%d\n",
+  node_config->mac_address.addr[0], node_config->mac_address.addr[1], node_config->mac_address.addr[2], node_config->mac_address.addr[3],
+  node_config->mac_address.addr[4], node_config->mac_address.addr[5], node_config->mac_address.addr[6], node_config->mac_address.addr[7],
+  ip64_addr->u8[0], ip64_addr->u8[1], ip64_addr->u8[2], ip64_addr->u8[3],
+  node_config->coap_port);The line char* query_buffer; declares a pointer to a char but it the memory it points to might not be declared. So you can get a segmentation fault when you call sprintf to access that memory. Try declaring query_buffer like char *query_buffer = (char*)malloc(256);. That will create a pointer and declare 256 bytes at where it points to.allocating memory for a 3D array in C using pointers?I have the following piece of code in C:
+double ***grid
+grid = calloc(nx, sizeof(double**))
+for (int i = 0; i < nx; ++i) {
+    grid[i] = calloc(ny,sizeof(double*));
+    for (int j = 0; j < ny; ++j) {
+        grid[i][j] = calloc(nz,sizeof(double));
+    }
+}
+
+What I don't understand is that why can't we write grid[i]=calloc(ny,sizeof(double**))? Isn't it true that each member of grid is a "pointer to pointer"? Also shouldn't we have grid[i][j] = calloc(nz,sizeof(double*))?
+The code works fine when I use grid[i][j][k]in its current form but I'm confused about why. I'm new to C, so I'd appreciate all forms of explanation.
+EDIT: one line was missing: grid = calloc(nx, sizeof(double**))First you're missing the first alloc: grid = calloc(nx, sizeof(double **)); but I'm not sure this is the point since the code does not even compile (missing semicolon after grid declaration so it must have been allocated somewhere else)
+Then to answer your question, allocation returns a pointer on the object, which adds an extra *, but you have to specify the size of the element for calloc to make the calculations (ny*sizeof(object))
+grid[i]=calloc(ny,sizeof(double**))
+
+would work, because size of pointer on pointer of double is the same as pointer of double, but it is not perfect.
+if you have an array of int that you allocate like this:
+int *array = calloc(ny,sizeof(int *))
+
+it will work all right on most platforms, but if you are on a 64-bit architecture with a standard 32-bit int (windows 64-bit box for instance, gcc 64 bit compiler), since pointers are 64 bit, it will allocate twice as much memory as you really need. The correct syntax in that case is:
+int *array = calloc(ny,sizeof(int))
+
+because the element is an int, and it returns a pointer on int (int *)
+So, now, recurrently, when you're adding a star on the left, you add a star on the right:
+int **array = calloc(ny,sizeof(int *))
+int ***array = calloc(ny,sizeof(int **))
+
+and so on...
+Small personal story: Some nasty crashes were encountered when migrating from 32-bit to 64-bit back in the days when people used to use:
+int **array = calloc(ny,sizeof(int))   // WRONG!!
+
+which worked while everything was 32-bit. When sizeof(int *) was increased to 8 bytes because of 64 bit arch, only half of the size was allocated, which could result in very funny bugs.SSLSocket setsockopt returns 10042 and WSAIoctl 10045I want to create a secure socket connection,but I've got some errors.
+here is the code:
+int main(int argc,char *argv[])
+{
+    WSADATA wd;
+    SOCKET s;
+    SSLVALIDATECERTHOOK hook;
+    int secopt=SO_SEC_SSL;
+
+    WSAStartup(MAKEWORD(2,2),&wd);
+    s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    setsockopt(s,SOL_SOCKET,SO_SECURE,&secopt,sizeof(secopt));
+    hook.HookFunc=SSLValCert;
+    hook.pvArg=NULL;
+    WSAIoctl(s,SO_SSL_SET_VALIDATE_CERT_HOOK,&hook,sizeof(hook),NULL,0,NULL,NULL,NULL);
+    /* Some code goes here */
+    closesocket(s);
+    WSACleanup();
+}
+
+int CALLBACK SSLValCert(DWORD dwType,LPVOID pvArg,DWORD dwChainLen,LPBLOB pCertChain,DWORD dwFlags)
+{
+    return SSL_ERR_OKAY;
+}
+
+In this code setsockopt return 10042 and WSAIoctl return 10045.10042 is WSAENOPROTOOPT and 10045 is WSAEOPNOTSUPP.  They mean the feature you are trying to use is not supported.
+If you read the documentation more carefully, you would see that SO_SECURE is only supported on WinCE.  On Windows, if you want the socket to manage security for you, you need to use Winsock Secure Socket Extensions instead.
+Otherwise, use an SSL/TLS library that runs on top of a standard socket, such as Microsoft’s SChannel, or a 3rd party library like OpenSSL.Cast warning when working with structuresI'm revisiting C after a long time and am puzzled by a warning generated by the compiler. Here's the relevant code:
+struct Unit 
+{
+    char str1[100];
+    char str2[100];
+    short expected;
+};
+
+int main()
+{
+    struct Unit arr[] = 
+    {
+        {NULL, NULL, 0},
+        {NULL, "string", -1},
+        {"string", NULL, 1},
+        {"string", "string", 0},
+        {"string1", "string2", -1},
+        {"string2", "string1", 1},
+        {"str", "string", -1},
+        {"string", "str", 1}
+    };
+
+    printf("%d\n", arr[0].expected);
+    return 0;
+}
+
+When compiled, I get:
+my_strcmp.c: In function ‘main’:
+my_strcmp.c:64:9: warning: initialization makes integer from pointer without a cast [enabled by default]
+         {NULL, NULL, 0},
+         ^
+my_strcmp.c:64:9: warning: (near initialization for ‘arr[0].str1[0]’) [enabled by default]
+my_strcmp.c:64:9: warning: initialization makes integer from pointer without a cast [enabled by default]
+my_strcmp.c:64:9: warning: (near initialization for ‘arr[0].str1[1]’) [enabled by default]
+my_strcmp.c:65:9: warning: initialization makes integer from pointer without a cast [enabled by default]
+         {NULL, "string", -1},
+         ^
+my_strcmp.c:65:9: warning: (near initialization for ‘arr[1].str1[0]’) [enabled by default]
+my_strcmp.c:65:9: warning: initialization makes integer from pointer without a cast [enabled by default]
+my_strcmp.c:65:9: warning: (near initialization for ‘arr[1].str1[1]’) [enabled by default]
+my_strcmp.c:66:9: warning: initialization makes integer from pointer without a cast [enabled by default]
+         {"string", NULL, 1},
+         ^
+my_strcmp.c:66:9: warning: (near initialization for ‘arr[2].str2[0]’) [enabled by default]
+
+I don't get it; where am I making integer from pointer? Please help.I am assuming that line 64, 65 and 66 are the ones where you initialize the structure using NULL. That will not work because NULL is a pointer, and you can't initialize an array with a pointer.
+The only solution I can see is to either turn the string arrays in the structure to pointers, or to initialize the "unused" strings to the empty string "".Finding Variables of a C File using GrepFor example let's say i have this code
+#include <stdio.h>
+
+int main(void)
+{
+    int x = 99;
+    int *p1, *p2;
+    char y[10] = "a"
+    // some code
+    // some code
+
+    return 0;
+
+}
+
+So in This Code, there are two Variables primary of type int and char . Now, Let's say i make a code of atleast 400 - 500 lines in which i have initialised 20-30 variable. Now, i want to make a bash script to find what are the variables in this code. I begin with this way cat code.c | grep int this would print int main void() Function in the above given scenario and also print int x =99 and //some code statement, But i want to strictly print those lines int x=99; and int *p1, *p2 Not Every line.
+So now, here in above question i have a Variable data-type char too, Now How do i construct my Bash script in a Way that after cat i grep only particular data-type like int char double float, Is there any OR Method for it? Or are there any easier way than cat and Grep to perform the same??
+So my Final output shall be int x=99; int *p1, *p2 , char y[10] = "a" :)
+Would be looking forward to the responses.You can take a approach with grep to find lines that begin with whitespace followed by int or char using a basic regular expression with something as simple as:
+$ grep '^[ ][ ]*\(int\|char\)' yourfile.c
+int x = 99;
+int *p1, *p2;
+char y[10] = "a"
+
+If you have initial tab characters, (or mixed spaces and tabs), you can use a Perl Compatible Regular Expression:
+$ grep -P '^[ \t]+(int|char)' yourfile.c
+int x = 99;
+int *p1, *p2;
+char y[10] = "a"
+
+I don't know if this is exactly what you are looking for, and if not, let me know. There are other c-code scanners that will pull variables, functions, etc out and summarize,  e.g. cproto is one I have used and liked a lot. There are a number of others on sourceforge you may want to check as well.
+Explanation (from comment)
+Given the example, it was clear that only int, char, etc.. were wanted AFTER whitespace (e.g. to miss the int main () declaration). With that in mind we set up grep with the basic regular expression to require at least 1 (space using BRE) or if mixed tab and space are possible (using PCRE) before the search term. To handle spaces only, with a BRE:
+grep '^[ ][ ]*
+
+or if dealing with mixed spaces and tabs, a PCRE of
+grep -P `^[ \t]+
+
+Which anchors the search ^ at the beginning of the line and, with the BRE looks for a space with the character class [ ]. To handle at least one space, and for zero or more additional spaces, we add an additional [ ]*.
+Where multiple (or mixed) spaces and tabs are involved (which cannot be handled easily with BRE), the PCRE essentially does the same thing for both space and tab, while sacrificing some portability for the expanded expression handling provided by PCRE. ^[ \t]+ will accommodate one or more instances of space or tab characters before the search terms. The + requiring the presence of at least 1 or more matches of the characters within the character class.
+When looking for either int or char, the basic regular expression format is 
+\(int\|char\)
+
+where ( and | do not retain special meaning in a BRE and must be escaped while the PCRE form is simply:
+(int|char)
+
+So putting it altogether it simply anchors a search for one-or-more space (or using PCRE mixed space and tab) characters before either int or char in making the determination of which lines to display.
+Hope that helped.Can I implement client - client communication through server in between?I want to send message from client A to client B, through this server. I am not sure how can I get that? One approach I can think of is making a message queue for each client and add message to that queue if someone sends message to that client, and sends from that queue to the respective client ? But I am not sure How can I implement this ? Can anyone help me with this ?
+There can be n clients at any moments. In that case broadcast to all clients.
+Below is my server code. I have checked username and password of the user. insidePortal() function will take care of sending message to other client.
+#include<stdio.h>
+#include <stdlib.h>
+#include<string.h>    //strlen
+#include<sys/socket.h>
+#include<arpa/inet.h> //inet_addr
+#include<unistd.h>    //write
+
+int main(int argc , char *argv[])
+{
+    int socket_desc , client_sock , c , read_size, pid;
+    struct sockaddr_in server , client;
+    char client_message[2000], message_sent[2000], message_recieve[2000];
+
+    //Create socket
+    socket_desc = socket(AF_INET , SOCK_STREAM , 0);
+    if (socket_desc == -1)
+    {
+        printf("Could not create socket");
+    }
+    puts("Socket created");
+
+    //Prepare the sockaddr_in structure
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_port = htons( 5550 );
+
+    //Bind
+    if( bind(socket_desc,(struct sockaddr *)&server , sizeof(server)) < 0)
+    {
+        //print the error message
+        perror("bind failed. Error");
+        return 1;
+    }
+    puts("bind done");
+
+    //Listen
+    listen(socket_desc , 3);
+
+    while (1) {
+        //Accept and incoming connection
+        puts("Waiting for incoming connections...");
+        c = sizeof(struct sockaddr_in);
+
+        // accept connection from an incoming client
+        client_sock = accept(socket_desc, (struct sockaddr *)&client, (socklen_t*)&c);
+        if (client_sock < 0)
+        {
+            perror("accept failed");
+            return 1;
+        }
+
+        /* Create child process */
+        pid = fork();
+      if (pid == 0) {
+         /* This is the client process */
+        close(socket_desc);
+        puts("Connection accepted");
+
+        char username[50], password[50];
+
+        memset(message_recieve, 0, sizeof message_recieve);
+        recv(client_sock , username , 2000 , 0);
+        printf("username of the user: %s", username);
+
+        memset(message_recieve, 0, sizeof message_recieve);
+        recv(client_sock , password , 2000 , 0);
+        printf("password of the user: %s", password);
+
+        FILE *f = fopen("registeredUsers.txt", "r");
+        if (f == NULL)
+        {
+            printf("Error opening file!\n");
+            exit(1);
+        }
+
+        char uname[50], pass[50];
+        int login = 0;
+        while(fscanf(f, "%s %s\n", uname, pass) > 0) {
+            printf("Helllo %s %s", uname, pass);
+            if (strcmp(username, uname)==0 && strcmp(password, pass) == 0) {
+                login = 1;
+                break;
+            } 
+        }
+
+        memset(message_sent, 0, sizeof message_sent);
+        if (login == 1) {
+            strcpy(message_sent,"\n Successfull Login\n");
+            write(client_sock , message_sent , strlen(message_sent));   // Sends login status
+            insidePortal(client_sock, username);
+        } else {
+            strcpy(message_sent,"\nOops, wrong username or password. Please try again.\n");
+            write(client_sock , message_sent , strlen(message_sent));   // Sends login status
+        }
+
+
+
+
+        fclose(f);
+
+
+        if(read_size == 0)
+        {
+            puts("Client disconnected");
+            fflush(stdout);
+        }
+        else if(read_size == -1)
+        {
+         perror("recv failed");
+        }
+        exit(0);
+    } else {
+        close(client_sock);
+    }
+    }
+
+    return 0;
+}
+
+
+void insidePortal(int client_sock, char username[50]) {
+
+}I have this really long code I've wrote in the past that implements something similar to yours, but It's CPP, If you want too I'll post it here, but basically using message queues or multi-process programming seems kinda useless to me, If I were you I'd program it in the following way
+Client code -> Two Threads
+Server code -> Two Threads
+Client Has two threads, and Three functions, Connect / Send / Receive
+
+Connect - This function handles connection to server, whether you are using TCP it handles the listen-accept or if you use some UDP based made up protocol, it just handles it - makes sure you have some connectin
+Send - This function sends some data to server
+Receive This functino receives data from server
+
+The flow of Client would be the following: 
+
+Client connects to server on Main thread
+After connecting to server Client creates Second thread
+On Main thread -  Client enters some loop that reads data from user as Input then calls Send function and sends it to server
+On Second thread - Client enters some loop that calls Receive
+to receive data from server and prints it when data is received
+
+that handles Client, now about Server
+Server- Has Three functions and Some one Global data structure called Linked - List ( a Linked list obviously ) that would be shared by all it's threads, WaitForConnection Receive SendToAll
+
+WaitForConnection- Simply calls the "Accept" function of sockets API ( if you're using TCP ) or if you're using some other made up protocol, this function just blocks it's thread as trying to wait for incoming connection, when some connection arrives, this function registers the connection into the global linked-list of all connections called Connection-List, with the appropriate socket and client data
+SendToAll - Simply iterates all Connection-List and for every Connection within that list, It sends some data passed 
+Receive just receives some data but sets some timeout first, this is very important in order for Receive not to block for too long!
+
+The flow of Server would be the following:
+
+Main thread creats Second thread
+Main thread enters some loop and calls WaitForConnection within it in order to continuously get connections and add them into Connection-List
+Second thread enters some loop that iterates over Connection-List, for each connection within Connection-List, receive is called upon the appropriate socket, if some data is receive, SendToAll is called with the data received, if timeout, nothing happens, after that loop is continued and the next loop iteration is executed
+
+
+SendToAll sends the data to ALL clients within Connection-List
+
+
+This is some very simple Multi-Client Broadcast with Server architecture It should be really easy to implement! I hope this helps you
+I Apologize in advance as this is a code I wrote a while ago so It has a lot of nesting within it, and a lot of comments!
+------------------------- CLIENT CODE ----------------
+// Main.cpp
+#include <thread>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+
+#pragma comment (lib, "Ws2_32.lib")
+
+#define NAME_LENGTH    40
+#define DEFAULT_BUFLEN 512
+#define DEFAULT_PORT "8888"
+
+void Receive(SOCKET* pscktConnection);
+void Send(SOCKET* pscktConnection);
+
+void main()
+{
+    // Variable definition
+    int       nResult;
+    int       nNameLength   = 0;
+    char     pcNameBuffer[NAME_LENGTH];
+    SOCKET    sckConnection = NULL;
+    WSADATA   wsaData;
+    addrinfo  addrAddressFormat;
+    addrinfo* paddrServerAddress;
+
+    // Code section
+
+    // Initialize Winsock
+    nResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // If winsock dll loading has failed
+    if (nResult != 0)
+    {
+        std::cout << "Failed loading winsock DLL" << std::endl;
+    }
+    // DLL loaded successfully
+    else
+    {
+         //Setup connection info
+            ZeroMemory(&addrAddressFormat, sizeof(addrAddressFormat));
+            addrAddressFormat.ai_family = AF_INET;
+            addrAddressFormat.ai_socktype = SOCK_STREAM;
+            addrAddressFormat.ai_protocol = IPPROTO_TCP;
+
+        // Resolve the server address and port with the address setting into our final address
+        nResult = getaddrinfo("10.0.0.5", DEFAULT_PORT, &addrAddressFormat, &paddrServerAddress);
+
+        // Address resolving has failed
+        if (nResult != 0)
+        {
+            std::cout << "Some error has occured during connection establishment" << std::endl;
+        }
+        else
+        {
+            // Request user for his name
+            pcNameBuffer[0] = '\0';
+            std::cout << "PLEASE ENTER YOUR NAME -> ";
+            std::cin.getline(pcNameBuffer, NAME_LENGTH);
+            std::cout << std::endl << std::endl ;
+
+            // Creating the socket
+            sckConnection = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+            // Connecting
+            nResult = connect(sckConnection, paddrServerAddress->ai_addr, (int)paddrServerAddress->ai_addrlen);
+
+
+            // Creating of the socket has failed
+            if (nResult == SOCKET_ERROR)
+            {
+                std::cout << "Creating of the socket has failed" << std::endl;
+            }
+            // Send server user's name
+            else
+            {
+                // Measure the name length
+                while (pcNameBuffer[nNameLength] != '\0')
+                {
+                    ++nNameLength; 
+                }
+
+                // If invalid name
+                if (nNameLength == 0)
+                {
+                    pcNameBuffer[0] = 'G';
+                    pcNameBuffer[1] = 'U';
+                    pcNameBuffer[2] = 'E';
+                    pcNameBuffer[3] = 'S';
+                    pcNameBuffer[4] = 'T';
+                    pcNameBuffer[5] = '\0';
+
+                    nNameLength = 6;
+                }
+
+                nResult = send(sckConnection, pcNameBuffer, nNameLength + 1, 0);
+
+                // An error has occured while sending server the user's name
+                if (nResult <= 0)
+                {
+                    std::cout << "Some error has occured" << std::endl;             
+                }
+                // Good to go
+                else
+                {
+                    std::thread Read(Receive, &sckConnection);
+                    Send(&sckConnection);
+                }
+            }
+        }
+    }
+
+    // cleanup resources
+    WSACleanup();
+}
+
+/*
+* [Description]: This method is used only to read messages from server and print them 
+* [Paramaters]:
+* pscktServerSocket - The address of the our connection socket
+* [Return Value]: none
+*/
+void Receive(SOCKET* pscktConnection)
+{
+    // Variable definition
+    int  nReceivedBytes;
+    int  nBufferLen = DEFAULT_BUFLEN;
+    char pcBuffer[DEFAULT_BUFLEN];
+
+    // Code section
+
+    // Keep this operation running constantly
+    while (true)
+    {
+        // Read from server -- NO TIME OUT NEEDED
+        nReceivedBytes = recv((*pscktConnection), pcBuffer, nBufferLen, 0);
+
+        // More than zero bytes received
+        if (nReceivedBytes > 0)
+        {
+            // Set a zero termination to simulate a string
+            pcBuffer[nReceivedBytes] = '\0';            
+            std::cout << pcBuffer << std::endl;     
+        }
+        // Server has closed the connection probably
+        else
+        {
+            // TODO - CLOSE CONNECTION          
+        }
+    }
+}
+
+
+/*
+* [Description]: This method is used only to send messages to the server
+* [Paramaters]:
+* pscktServerSocket - The address of the our connection socket 
+* [Return Value]: none
+*/
+void Send(SOCKET* pscktConnection)
+{
+    // Variable definition
+    int  nSentBytes;
+    int  nBufferLen = DEFAULT_BUFLEN;
+    char pcBuffer[DEFAULT_BUFLEN];
+
+    // Code section
+
+    pcBuffer[0] = '\0';
+
+    // Keep this operation running constantly
+    while (true)
+    {
+        int nSentBytes = 0;
+
+        // Read
+        std::cin.getline(pcBuffer, nBufferLen);
+
+        // Go through string untill backslash 0
+        while (pcBuffer[nSentBytes] != '\0')
+        {
+            // Increase the number of bytes we want to send
+            ++nSentBytes;
+        }       
+
+        pcBuffer[nSentBytes] = '\0';
+
+        nSentBytes = send((*pscktConnection), pcBuffer, nSentBytes, 0);
+
+        // An error has occured
+        if (nSentBytes == SOCKET_ERROR)
+        {
+            // TODO - HANDLE ERROR;
+        }
+    }
+}
+
+`
+------------------------- SERVER CODE ----------------
+// Source.cpp
+#include <thread>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include "Client.h"
+#include "Connections.h"
+
+#pragma comment (lib, "Ws2_32.lib")
+
+#define NAME_LENGTH    40
+#define DEFAULT_BUFLEN 512
+#define DEFAULT_PORT "8888"
+#define MAX_CONNECTIONS 5
+
+
+// Globals
+Connections* conAllConnections = Connections::getInstance();
+
+bool LoadServerSocket(SOCKET* pscktServerSocket);
+void Dispatcher(SOCKET* pscktServerSocket);
+void SendAll(ClientNode* pclndSenderAddress, char* pcMessageBuffer, int nLength);
+void HandleConnections();
+
+void main()
+{
+    // Variable definition
+    int       nResult;
+    SOCKET    sckServerSocket = NULL;
+    WSADATA   wsaData;
+
+    // Code section
+
+    // Initialize Winsock
+    nResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // If winsock dll loading has failed
+    if (nResult != 0) 
+    {
+        std::cout << "Failed loading winsock DLL" << std::endl;
+    }
+    // DLL loaded successfully
+    else
+    {
+        // If failed loading the server socket
+        if (!LoadServerSocket(&sckServerSocket))
+        {
+            std::cout << "Failed loading the server socket!" << std::endl;
+        }
+        else
+        {
+            std::thread  dispatch(Dispatcher,&sckServerSocket);
+            //dispatch.join();
+            HandleConnections();
+        }
+    }
+
+    // cleanup resources
+    WSACleanup();
+}
+
+/*
+* [Description]: This method is used to load and bind server socket into some pointer.
+* [Paramaters]:
+* pscktServerSocket - a pointer variable that we would like to load our socket into the address this pointer
+* is pointing at
+* [Return Value]: A boolean indication of whether our socket was created successfully
+*/
+bool LoadServerSocket(SOCKET* pscktServerSocket)
+{
+    // Variable definition
+    int       nResult;
+    bool      bWasServerSocketCreated = false;
+    bool      bWasAddressResolved     = false;
+    addrinfo  addrAddressFormat;
+    addrinfo* paddrFinalAddress       = NULL;
+
+    // Code section
+
+    // Fil addrAddressFormat with zeros, and set correct settings of our desired socket
+    ZeroMemory(&addrAddressFormat, sizeof(addrAddressFormat));
+    addrAddressFormat.ai_family = AF_INET;
+    addrAddressFormat.ai_socktype = SOCK_STREAM;
+    addrAddressFormat.ai_protocol = IPPROTO_TCP;
+    //addrAddressFormat.ai_flags = AI_PASSIVE;
+
+    // Resolve the server address and port with the address setting into our final address
+    nResult = getaddrinfo("10.0.0.5", DEFAULT_PORT, &addrAddressFormat, &paddrFinalAddress);
+
+    // If resolving of the address was successful
+    if (nResult == 0)
+    {
+        // Set address resolving bool indication to true
+        bWasAddressResolved = true;
+
+        // Create server socket
+        (*pscktServerSocket) = socket(paddrFinalAddress->ai_family,
+                                      paddrFinalAddress->ai_socktype,
+                                      paddrFinalAddress->ai_protocol);
+
+        // Socket creating was successful
+        if ((*pscktServerSocket) != INVALID_SOCKET)
+        {
+            // Set socket creation indication to true
+            bWasServerSocketCreated = true;
+
+            //  Bind our socket into our address
+            nResult = bind((*pscktServerSocket),
+                           paddrFinalAddress->ai_addr,
+                           (int)paddrFinalAddress->ai_addrlen);
+
+            // In case binding failed
+            if (nResult == SOCKET_ERROR) 
+            {
+                closesocket((*pscktServerSocket));
+                bWasServerSocketCreated = false;
+            }
+        }
+    }
+
+    // Freeing resources
+    if (bWasAddressResolved)
+    {
+        freeaddrinfo(paddrFinalAddress);
+    }
+
+    return (bWasServerSocketCreated);
+}
+
+/*
+* [Description]: This uses the loaded server socket and handles incoming requests for connections
+* [Paramaters]:
+* pscktServerSocket - a pointer to the loaded server socket
+* [Return Value]: none
+*/
+void Dispatcher(SOCKET* pscktServerSocket)
+{
+    // Variable definition
+    int     nResult;
+    char    pcBuffer[NAME_LENGTH];
+    DWORD   timeout     = 1500;
+    SOCKET  sckClientSocket;
+    Client  clntNewClient;
+
+    // Code section
+
+    // Keep this running constantly
+    while (true)
+    {
+        // Keep this running as long as we have the sufficient amount of connections
+        while (conAllConnections->getNumOfConnections() < MAX_CONNECTIONS)
+        {
+            // Attempt listening on the server socket
+            nResult = listen((*pscktServerSocket), MAX_CONNECTIONS);
+
+            // Listening was a failure
+            if (nResult == SOCKET_ERROR)
+            {
+                std::cout << "Failed listening with the server socket" << std::endl;
+                // HANDLE ERROR - TODO
+            }
+            // Listening was successful
+            else
+            {
+                std::cout << "Listening...." << std::endl;
+                // Accept a client socket
+                sckClientSocket = accept((*pscktServerSocket), NULL, NULL);
+
+                // Accepting was a failure
+                if (sckClientSocket == INVALID_SOCKET)
+                {
+                    std::cout << "Client accepting has failed" << std::endl;
+                    // HANDLE ERROR - TODO
+                }
+                // Client was added successfully
+                else
+                {
+
+                    setsockopt(sckClientSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+                    nResult = recv(sckClientSocket, pcBuffer, NAME_LENGTH, 0);
+
+                    // If received a valid username
+                    if (nResult > 0)
+                    {
+                        timeout = 1;
+
+                        std::cout << "New Client -> " << pcBuffer << std::endl;
+                        clntNewClient.setClientSocket(sckClientSocket);
+                        clntNewClient.setIsAdmin(false);
+                        clntNewClient.setClientName(pcBuffer);
+
+                        setsockopt(clntNewClient.getClientSocket(), SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+                        conAllConnections->Add(clntNewClient);
+
+                        // Receive until the peer shuts down the connection         
+                    }
+                }
+            }
+        }
+    }
+}
+
+/*
+* [Description]: This method forwards a message to all other clients but the client who sent it
+* [Paramaters]: 
+* pclndSenderAddress - The address of the client node who sent the  
+* pcMessageBuffer- a pointer to the message buffer
+* nLength - the length of the message
+* [Return Value]: none
+*/
+void SendAll(ClientNode* pclndSenderAddress, char* pcMessageBuffer, int nLength)
+{
+    // Variable definition
+    int         nError;
+    int         nResult;
+    Client      clntCurrentClient;
+    ClientNode* pclndCurrentNode;
+    ClientNode* pclndNextNode;
+
+    // Code section
+
+    // Set first node
+    pclndCurrentNode = conAllConnections->getFirst();
+
+    // Go through all connections
+    while (pclndCurrentNode != NULL)
+    {
+        // Save the next node in this phase of the code in order to avoid corruption of memory
+        // in case node would be deleted from dynamic allocated memory and we wont be able to call the next val upon it
+        pclndNextNode = pclndCurrentNode->getNext();
+
+        // Compare addresses, we do not want to forward the message to the sender
+        if (pclndCurrentNode != pclndSenderAddress)
+        {
+
+            clntCurrentClient = pclndCurrentNode->getClient();
+
+            // Forward the message
+            nResult = send(clntCurrentClient.getClientSocket(), pcMessageBuffer, nLength, 0);
+
+            // An error has occured
+            if (nResult == SOCKET_ERROR)
+            {
+                nError = WSAGetLastError();
+
+                // TODO -- handle later
+            }   
+        }
+
+        // Forward current node
+        pclndCurrentNode = pclndNextNode;
+    }
+}
+
+/*
+* [Description]: This method handles and receives messages from our clients and forwards them
+* [Paramaters]: none
+* [Return Value]: none
+*/
+void HandleConnections()
+{
+    // Variable definition
+    int         nIndex;
+    int         nError;
+    int         nRecvLen;
+    int         nNameLen;
+    int         nRecvbuflen = DEFAULT_BUFLEN;
+    char        pcBuffer[DEFAULT_BUFLEN + NAME_LENGTH + 3];
+    Client      clntCurrentClient;
+    ClientNode* pclndCurrentNode;
+    ClientNode* pclndNextNode;
+
+    // Code section
+
+    // Keep this going constantly
+    while (true)
+    {
+        pclndCurrentNode = conAllConnections->getFirst();
+
+        // Go through all connections
+        while (pclndCurrentNode != NULL)
+        {
+            clntCurrentClient = pclndCurrentNode->getClient();
+
+            // Save the next node in this phase of the code in order to avoid corruption of memory
+            // in case node would be deleted from dynamic allocated memory and we wont be able to call the next val upon it
+            pclndNextNode = pclndCurrentNode->getNext();
+
+            // Attempt receiving data from client
+            nRecvLen = recv(clntCurrentClient.getClientSocket(), pcBuffer, nRecvbuflen, 0);
+
+            // An error has occured
+            if (nRecvLen <= 0)
+            {
+                nError = WSAGetLastError();
+
+                // if not a timeout error
+                if (nError != 10060)
+                {   
+                    std::cout << "Client removed" << std::endl;
+
+                    // Socket error, remove connection
+                    conAllConnections->Remove(pclndCurrentNode);
+                }
+            }
+            // No error has occured
+            else
+            {
+                //// The purpose of this part of the code is only to place a [CLIENTNAME]
+                //// prefix within the begining of each message
+                ////--------------------------------////
+
+                // Get client's name length
+                nNameLen = clntCurrentClient.getNameLength();
+
+                nIndex = nRecvLen - 1;
+                // Copy the message some offset forward -- offset is (namn length + 4) 
+                while (nIndex >= 0)
+                {
+                    // Copy letter (namelen + 4) times forward
+                    pcBuffer[nIndex + nNameLen + 4] = pcBuffer[nIndex];
+
+                    // Reduce nIndex
+                    --nIndex;
+                }
+
+                pcBuffer[0] = '[';
+
+                nIndex = 0;
+
+                // Place clients name within message
+                while (nIndex < nNameLen)
+                {
+                    // + 1 for offset
+                    pcBuffer[nIndex + 1] = (clntCurrentClient.getClientName())[nIndex];
+
+                    // Increase nIndex
+                    ++nIndex;
+                }
+
+                pcBuffer[nIndex + 1] = ']';
+                pcBuffer[nIndex + 2] = ':';
+                pcBuffer[nIndex + 3] = ' ';
+
+                ////--------------------------------////
+                //// No longer adding a prefix code
+
+                SendAll(pclndCurrentNode, pcBuffer, nRecvLen + nNameLen + 4);
+            }
+
+            // Forward current node
+            pclndCurrentNode = pclndNextNode;
+        }
+    }
+}
+////////////////////////////////////////////////////
+// Connections.h
+#ifndef CONNECTIONS_H
+#define CONNECTIONS_H
+#include "ClientNode.h"
+
+
+class Connections
+{
+    private:
+
+        // Data members
+        static Connections* _Instance;
+        int         nNumOfConnections;
+        ClientNode* pclndFirst;
+
+        // Ctor
+        Connections();
+
+    public:
+
+        // Methods
+        void        Add(Client clntNewClient);
+        void        Remove(ClientNode* pclndClientToRemove);
+        int         getNumOfConnections();
+        ClientNode* getFirst();
+
+        // Static methods
+        static Connections* getInstance();
+};
+
+#endif
+////////////////////////////////////////////////////
+// Connections.cpp
+#include "Connections.h"
+
+// Set instance to null
+Connections* Connections::_Instance = NULL;
+
+/* ------- PRIVATE CTOR -------
+* [Description]: This method is the constructor of the Connections
+* [Paramaters]: none
+* [Return Value]: none
+*/
+Connections::Connections()
+{
+    this->nNumOfConnections = 0;
+    this->pclndFirst = NULL;
+}
+
+/*
+* [Description]: This method returns the amount of connections currently within our linked list
+* [Paramaters]: none
+* [Return Value]: The amount of connections
+*/
+int Connections::getNumOfConnections(){
+
+    return (this->nNumOfConnections);
+}
+
+/*
+* [Description]: This method returns a pointer to the first client node within our connection list
+* [Paramaters]: none
+* [Return Value]: A pointer to the first client node
+*/
+ClientNode* Connections::getFirst()
+{
+    return (this->pclndFirst);
+}
+
+/*
+* [Description]: This method adds a new client to the linkedlist of clients
+* [Paramaters]: 
+* clntNewClient - The new client struct
+* [Return Value]: none
+*/
+void Connections::Add(Client clntNewClient)
+{
+    // Create a new client node
+    ClientNode* pclndNewClientNode = new ClientNode;
+
+    // Set the client node's client
+    pclndNewClientNode->setClient(clntNewClient);
+
+    // Set the client node's next client pointer to point at the currenly first address
+    pclndNewClientNode->setNext(this->getFirst());
+
+    // Set the first client pointer to point at the new client node's address ( Push it within the linked list )
+    this->pclndFirst = pclndNewClientNode;
+
+    // Increase the number of connection
+    ++(this->nNumOfConnections);
+}
+
+/*
+* [Description]: This method removes a client from our linked list of connections
+* [Paramaters]: 
+* pclndClientToRemove - The address of the client node we wish to remove
+* [Return Value]: none
+*/
+void Connections::Remove(ClientNode* pclndClientToRemove){
+
+    // Variable definition
+    int         nIndex;
+    ClientNode* pclndCurrentNode;
+
+    // Code section
+
+    pclndCurrentNode = this->getFirst();
+
+    // Checking if we need to remove the first node
+    if (pclndCurrentNode == pclndClientToRemove)
+    {
+        // Jump over deleted node
+        this->pclndFirst = pclndClientToRemove->getNext();
+
+        // Free memory
+        delete pclndClientToRemove;
+
+        // Decrease amount of connections
+        --(this->nNumOfConnections);
+    }
+    // We do not need to remove the first one
+    else
+    {
+        // Go through all ClientNodes addresses
+        for (nIndex = 0; nIndex < (this->nNumOfConnections - 1); ++nIndex)
+        {
+            // If the next node is the node we wish to delete
+            if (pclndCurrentNode->getNext() == pclndClientToRemove)
+            {
+                // Set the current node next node to be the next node of the node we wish to delete
+                pclndCurrentNode->setNext(pclndClientToRemove->getNext());
+
+                // free dynamically allocated memory
+                delete pclndClientToRemove;
+
+                // break outside the loop
+                break;
+
+                // Decrease amount of connections
+                --(this->nNumOfConnections);
+            }
+            // Next node is not the node we whish to delete
+            else
+            {
+                // Move to the next node
+                pclndCurrentNode = pclndCurrentNode->getNext();
+            }
+        }
+    }
+}
+
+/*
+* [Description]: This method returns the only instance of Connections (SINGLETON PATTERN)
+* [Paramaters]: none
+* [Return Value]: A pointer to the single instance of connection
+*/
+Connections* Connections::getInstance(){
+
+    // If instance was not instantiated yet
+    if (_Instance == NULL)
+    {
+        // Call CTOR
+        _Instance = new Connections();
+    }
+
+    return (_Instance);
+}
+////////////////////////////////////////////////////
+// ClientNode.h
+#ifndef CLIENTNODE_H
+#define CLIENTNODE_H
+#include "Client.h"
+
+class ClientNode
+{
+    // Data members
+    Client   clntClient;
+    ClientNode*  pclntNextClient;
+
+public:
+
+    // Access methods       
+    void setNext(ClientNode* pclndNextNode);
+    void setClient(Client clntNewClient);
+    Client getClient();
+    ClientNode* getNext();
+
+};
+#endif
+////////////////////////////////////////////////////
+// ClientNode.cpp
+#include "ClientNode.h"
+
+/*
+* [Description]: This method sets the next node our node would be pointing add
+* [Paramaters]: 
+* pclndNextNode - The address of the next node we want this node to point at
+* [Return Value]: none
+*/
+void ClientNode::setNext(ClientNode* pclndNextNode)
+{
+    this->pclntNextClient = pclndNextNode;
+}
+
+/*
+* [Description]: This method sets the client struct we want our current node to contain
+* [Paramaters]: 
+* clntNewClient - New client
+* [Return Value]: none
+*/
+void ClientNode::setClient(Client clntNewClient)
+{
+    this->clntClient = clntNewClient;
+}
+
+/*
+* [Description]: This method returns the client instance our node contains
+* [Paramaters]: none
+* [Return Value]: Our client
+*/
+Client ClientNode::getClient()
+{
+    return (this->clntClient);
+}
+
+/*
+* [Description]: This method returns the next node our node points at
+* [Paramaters]: none
+* [Return Value]: The address of the next node this node is pointing at
+*/
+ClientNode* ClientNode::getNext()
+{
+    return (this->pclntNextClient);
+}
+////////////////////////////////////////////////////
+// Client.h
+#ifndef CLIENT_H
+#define CLIENT_H
+#include <WinSock2.h>
+
+#define MAX_CLIENT_NAME_LEN = 40
+
+class Client
+{
+    // Data members
+    SOCKET scktClientSock;
+    char*  szClientName;
+    bool   bIsAdmin;
+    int    nNameLength;
+
+    public:
+
+        // Access methods       
+        void   setClientSocket(SOCKET scktClientSock);
+        SOCKET getClientSocket();
+        void   setClientName(char* szClientName);
+        char*  getClientName();
+        void   setIsAdmin(bool bIsAdmin);
+        bool   getIsAdmin();
+        int    getNameLength();
+
+        // Other methods
+
+};
+#endif
+////////////////////////////////////////////////////
+// Client.h
+#include "Client.h"
+
+/*
+* [Description]: This method changes the SOCKET data member of the Client class
+* [Paramaters]:
+* _scktClientSock - the new socket client that is being set
+* [Return Value]: none
+*/
+void   Client::setClientSocket(SOCKET _scktClientSock)
+{
+    this->scktClientSock = _scktClientSock;
+}
+
+/*
+* [Description]: This method retrieves the client's socket
+* [Paramaters]: none
+* [Return Value]: The socket client
+*/
+SOCKET Client::getClientSocket()
+{
+    return (this->scktClientSock);
+}
+
+/*
+* [Description]: This method changes the client's name
+* [Paramaters]:
+* _szClientName - a zero terminated string that describes the new client's name
+* [Return Value]: none
+*/
+void   Client::setClientName(char* _szClientName)
+{
+    // Variable definition
+    int nIndex = -1;
+
+    // Code section
+    this->szClientName = new char[41];
+
+    // Copy string char per char
+    do
+    {
+        ++nIndex;
+        this->szClientName[nIndex] = _szClientName[nIndex];
+    } while (_szClientName[nIndex] != '\0');    
+
+    // Name length is equal to index
+    this->nNameLength = nIndex;
+}
+
+/*
+* [Description]: This method returns a pointer to the first char of the zero terminated client string
+* [Paramaters]: none
+* [Return Value]: a pointer to the string
+*/
+char*  Client::getClientName()
+{
+    return (this->szClientName);
+}
+
+/*
+* [Description]: This method is used to set whether the client is an admin or not 
+* [Paramaters]:
+* _bIsAdmin - a boolean indication of whether the user is an admin or not
+* [Return Value]: none
+*/
+void   Client::setIsAdmin(bool _bIsAdmin)
+{
+    this->bIsAdmin = _bIsAdmin;
+}
+
+/*
+* [Description]: This method determines whether the user is an admin or not
+* [Paramaters]: none
+* [Return Value]: A boolean indication of whether the user is an admin or not
+*/
+bool  Client::getIsAdmin()
+{   
+    return (this->bIsAdmin);
+}
+
+/*
+* [Description]: This method retrieves the client's name length
+* [Paramaters]: none
+* [Return Value]: the name length
+*/
+int  Client::getNameLength()
+{   
+    return (this->nNameLength);
+}
+
+Again this is some really old code I've wrote I apologize if it's not so good but It definitely works... also notice that I've contains many different models within the server code, each are seperated by the following
+////////////////////////////////////////////////////gtk - SelectObject failed and MaskBlt failedI'm relatively new in GTK+-2 programming. I'm following a tutorial about it. 
+
+When I run this program:
+#include <gtk/gtk.h>
+#include <glib.h>
+
+GtkWidget * window;
+GtkWidget * value1;
+GtkWidget * value2;
+GtkWidget * dec1;
+GtkWidget * dec2;
+GtkWidget * bin1;
+GtkWidget * bin2;
+GtkWidget * table;
+GtkWidget * result;
+GtkWidget * label1;
+GtkWidget * label2;
+GtkWidget * label3;
+GtkWidget * btnAdd;
+GtkWidget * btnSub;
+GtkWidget * box1;
+GtkWidget * box2;
+GSList * group;
+GSList * group2;
+void des (GtkWidget *widget, gpointer data)
+{
+    ;
+}
+void signalevent (GtkWidget *widget, gpointer data)
+{
+
+}
+gint delete_event( GtkWidget *widget, GdkEvent *event, gpointer data )
+{
+    g_print ("delete event occurred\n");
+    return TRUE;
+}
+void destroy( GtkWidget *widget, gpointer data )
+{
+    gtk_main_quit ();
+}
+
+int main( int argc, char *argv[] )
+{
+    gtk_init (&argc, &argv);
+
+    window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title (GTK_WINDOW (window), "DECIMAL-BINARY CALCULATOR");
+    gtk_widget_set_size_request(window, 300, 300);
+    g_signal_connect (G_OBJECT (window), "destroy", G_CALLBACK (destroy), NULL);
+    gtk_container_set_border_width (GTK_CONTAINER (window), 10);
+
+    table = gtk_table_new(6, 2, TRUE);
+
+    //ROW 1 COL 1
+    label1 = gtk_label_new("Value 1: ");
+    gtk_table_attach_defaults(GTK_TABLE(table), label1, 0,1,0,1);
+    gtk_widget_show(label1);
+
+    //ROW 1 COL 2
+    value1 = gtk_entry_new();
+    gtk_table_attach_defaults(GTK_TABLE(table), value1, 1,2,0,1);
+    gtk_widget_show(value1);
+
+    //ROW 2 COL 1 and 2
+    box1 = gtk_hbox_new(TRUE, 0);
+    dec1 = gtk_radio_button_new_with_label(NULL, "DECIMAL");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dec1), TRUE );
+    gtk_box_pack_start(GTK_BOX(box1), dec1, TRUE, TRUE, 0);
+    gtk_widget_show(dec1);
+
+    group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(dec1));
+    bin1 = gtk_radio_button_new_with_label(group, "BINARY");
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (bin1), FALSE);
+    gtk_box_pack_start(GTK_BOX(box1), bin1, TRUE, TRUE, 0);
+    gtk_widget_show(bin1);
+
+    gtk_table_attach_defaults(GTK_TABLE(table), box1, 0, 2, 1, 2);
+    gtk_widget_show(box1);
+
+    //ROW 3 COL 1
+    label2 = gtk_label_new("Value 2: ");
+    gtk_table_attach_defaults(GTK_TABLE(table), label2, 0,1,2,3);
+    gtk_widget_show(label2);
+
+    //ROW 3 COL 2
+    value2 = gtk_entry_new();
+    gtk_table_attach_defaults(GTK_TABLE(table), value2, 1,2,2,3);
+    gtk_widget_show(value2);
+
+    //ROW 4 COL 1 and 2
+    box2 = gtk_hbox_new(TRUE, 0);
+    dec2 = gtk_radio_button_new_with_label(NULL, "DECIMAL");
+    gtk_toggle_button_set_active( GTK_TOGGLE_BUTTON(dec2), TRUE );
+    gtk_box_pack_start(GTK_BOX(box2), dec2, TRUE, TRUE, 0);
+    gtk_widget_show(dec2);
+
+    group2 = gtk_radio_button_get_group(GTK_RADIO_BUTTON(dec2));
+    bin2 = gtk_radio_button_new_with_label(group2, "BINARY");
+    gtk_toggle_button_set_active( GTK_TOGGLE_BUTTON(bin2), FALSE );
+    gtk_box_pack_start(GTK_BOX(box2), bin2, TRUE, TRUE, 0);
+    gtk_widget_show(bin2);
+
+    gtk_table_attach_defaults(GTK_TABLE(table), box2, 0, 2, 3, 4);
+    gtk_widget_show(box2);
+
+    //ROW 5 COL 1
+    btnAdd = gtk_button_new_with_label("Add");
+    g_signal_connect (G_OBJECT (btnAdd), "clicked", G_CALLBACK (signalevent), "button");
+    g_signal_connect_swapped (G_OBJECT (btnSub), "clicked", G_CALLBACK (des), G_OBJECT (window));
+    gtk_table_attach_defaults(GTK_TABLE(table), btnAdd, 0,1,4,5);
+    gtk_widget_show(btnAdd);
+
+    //ROW 5 COL 2
+    btnSub = gtk_button_new_with_label("Subtract");
+    g_signal_connect (G_OBJECT (btnAdd), "clicked", G_CALLBACK (signalevent), "button");
+    g_signal_connect_swapped (G_OBJECT (btnSub), "clicked", G_CALLBACK (des), G_OBJECT (window));
+    gtk_table_attach_defaults(GTK_TABLE(table), btnSub, 1,2,4,5);
+    gtk_widget_show(btnSub);
+
+    //ROW 6 COL 1
+    label3 = gtk_label_new("Result: ");
+    gtk_table_attach_defaults(GTK_TABLE(table), label3, 0,1,5,6);
+    gtk_widget_show(label3);
+
+    //ROW 6 COL 2
+    result = gtk_entry_new();
+    gtk_table_attach_defaults(GTK_TABLE(table), result, 1,2,5,6);
+    gtk_widget_show(result);
+
+    gtk_container_add(GTK_CONTAINER(window), table);
+    GTK_WIDGET_SET_FLAGS (dec1, GTK_CAN_DEFAULT);
+    GTK_WIDGET_SET_FLAGS (dec2, GTK_CAN_DEFAULT);
+    gtk_widget_grab_default (dec1);
+    gtk_widget_grab_default (dec2);
+    gtk_widget_show(table);
+    gtk_widget_show(window);
+    gtk_main();
+}
+
+It gives many instances of errors like these: 
+Gdk-WARNING : gdkdrawable-win32.c:711: SelectObject failed: The operation completed successfully
+
+Gdk-WARNING : gdkdrawable-win32.c:711: MaskBlt failed: The operation completed successfully
+
+This is the screenshot
+
+where the Decimal and Binary in the program are radio buttons (supposedly).
+P.S. Some functions are still empty because it's ongoing. I'm still testing its GUI. 
+
+EDIT: I discovered that the errors (or warnings) spawn when I hover the radio buttons.Issues implementing a reduce in CUDAI am trying to implement a reduce in cuda, where I find the maximum element in an array. I have used this kernel for finding the minimum, and it works, but it doesnt work when I try to find the maximum. I have stepped through the algorithm repeatedly and can't find a bug. Any help would really be appreciated. (additionally, I get a different output when I uncomment the print statement there, which is also quite a headache....)
+__global__
+void findMaxAndMin(const float* const d_logLuminance, float* reduceCopy, int length, float* min_logLum, float* max_logLum){
+    int idx = threadIdx.x + blockDim.x*blockIdx.x;
+    if(idx >= length){
+        return;
+    }
+    reduceCopy[idx] = d_logLuminance[idx];
+    __syncthreads();
+
+    //do a reduction with max
+
+    for(int offset = 1;offset < length;offset = offset*2){
+        if(idx % (offset*2) == 0){
+            int compIdx = idx + offset;
+            if(compIdx < length){
+                float newVal = a_max(reduceCopy[idx], reduceCopy[compIdx]);
+                if(idx == 0){
+                    //printf("val %f \n", newVal);
+                }
+                __syncthreads();
+                reduceCopy[idx] = newVal;
+                __syncthreads();
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if(idx == 0){
+        *max_logLum = reduceCopy[0];
+    }
+
+}There are several problems with the code. If it worked for minimum, you were lucky.
+
+I presume you launch more than one block (you use blockIdx.x). You repeatedly use the result of one block in another -- the reduceCopy[compIdx] may be set by another block. You cannot rely on this: you cannot predict the order of execution of the blocks or synchronize them. __syncthreads() is a barrier that works only within a single block!
+if(idx >= length) return is dangerous because it causes that not all threads will reach the following __syncthreads.
+you have __syncthreads() within a divergent conditional if(compIdx < length).
+a_max is undefined. Remember to always include the minimum working example. I can guess what that function is supposed to do, but maybe there is yet another bug lurking within it?
+
+It seems to me that you have a good understanding on parallel reduction in theory, but the implementation fails because of the CUDA-specific behavior.
+I would suggest you read some examples on how to do parallel reduction specifically on CUDA.PCRE pcre_exec thread safe?I have a C program that uses a PCRE regex to determine if a process in a cgroup should be added to one variable or another. I spawn a thread to read the cpuacct.stat file in each running cgroup, where the number of threads never exceeded the number of cores. These samples and results are then combined into one of two variables.
+The relevant snippet of code is:
+    pcreExecRet = pcre_exec(reCompiled,
+                        pcreExtra,
+                        queue,
+                        strlen(queue),          // length of string
+                        0,                      // Start looking at this point
+                        0,                      // OPTIONS
+                        subStrVec,
+                        30);                    // Length of subStrVec
+
+    //CRITICAL SECTION?
+    pthread_mutex_lock(&t_lock); //lock mutex
+    while (sumFlag == 0) {
+        pthread_cond_wait(&ok_add, &t_lock); //wait on ok signal
+    }
+
+    if(pcreExecRet > 0) {
+        sumOne += loadavg;
+    } else if (pcreExecRet == PCRE_ERROR_NOMATCH){
+        sumTwo += loadavg;
+    } else {
+        perror("Could not determine sum!\n"); //if this fails
+
+    }
+
+    sumFlag = 1;
+
+    pthread_cond_signal(&ok_add); //signal that it is ok to add
+    pthread_mutex_unlock(&t_lock); //unlock mutex
+
+My question is whether or not the pcre_exec() call is thread-safe? Should it be moved into the critical section? I know the compiled regex is thread safe, but I'm not sure about pcreExtra (const pcre_extra) or subStrVec (int *ovector). These variables are global for now.Yes it is thread safe, all PCRE functions are but you should be careful under certain conditions
+The following is from the manual pages for PCRE
+
+MULTITHREADING
+
+   The PCRE functions can be used in  multi-threading  applications,  with
+   the  proviso  that  the  memory  management  functions  pointed  to  by
+   pcre_malloc, pcre_free, pcre_stack_malloc, and pcre_stack_free, and the
+   callout  and  stack-checking  functions  pointed to by pcre_callout and
+   pcre_stack_guard, are shared by all threads.
+
+   The compiled form of a regular expression is not altered during  match-
+   ing, so the same compiled pattern can safely be used by several threads
+   at once.
+
+   If the just-in-time optimization feature is being used, it needs  sepa-
+   rate  memory stack areas for each thread. See the pcrejit documentation
+   for more details.Why is the error "Segmentation fault" here? [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I tried to implement the recursive form of Selection sort. But error as "Segmentation fault " is being shown. Where is the error? What are the errors generally faced with recursive algorithms?
+#include <stdio.h>
+void ssort(int[],int,int);
+void prints(int[],int);
+void sorting(int[],int,int);
+
+int a[]= {5,6,3,1,2,4};
+
+int main()
+{
+    ssort(a,0,6);
+    prints(a,6);
+    return 0;
+}
+
+void ssort(int a[],int s,int e)
+{
+    int min=a[s];
+    int ch,p,j;
+    for(j=s+1; j<e; j++)
+    {
+        if(min>a[j])
+        {
+            min=a[j];
+            ch=j;
+        }
+    }
+    sorting(a,j,ch);
+    if(s+1<e)
+    {
+        ssort(a,s+1,e);
+    }
+}
+
+
+void prints(int a[],int n)
+{
+    int i;
+    for(i=0; i<n; i++)
+        printf("%d",a[i]);
+}
+
+void sorting(int a[],int j,int ch)
+{
+    int p=a[j];
+    a[j]=a[ch];
+    a[ch]=p;
+}Segmentation fault is thrown when illegal memory is accessed. There is a possibility that "sorting(a,j,ch);" may get called even when the code may not have gone through the if block inside the prededing for-loop. In that case value of  "ch" may be unpredictable and then when u access a[ch] inside the sorting(..) function, it may be access some illegal memory which will cause segmentation faultComment by BLUEPIXY in the question pretty much solves the problem. Writing this to add why those changes are needed.
+ISSUE 1: At each step of recursion you will store the minimum value in first index (for that level of reursion). To do this first you identify the index of the minimum value, which in your code you are stroing in ch. Then you swap the values in first index and the index with minimum value. That means your code  should be swapping the values in indexes s and ch. But, you are swapping the values in last index and the index with minimum value. So you need to make the below change:
+/* sorting(a,j,ch); */   // ISSUE:   you are swapping with last index
+sorting(a, s, ch);       // CORRECT: you are swapping with first index
+
+ISSUE 2: If the condition if(min>a[j]) is never true then ch = j; is never executed, and ch will have indeterminate value. And then when you call sorting(a, s, ch); your program will not have deterministic results, and it may even crash. So, you have to set s as the minimum index at the beggning, as:
+/* int ch,p,j; */ 
+int ch = s, p,j;    // Initialize ch with starting index
+
+These changes should resolve you issue. However, one change you can make is, swap the values only if need:
+/*sorting(a,j,ch);*/
+if (ch != s)
+    sorting(a, s, ch);
+
+And finally, you may want to change the name of the function sorting to swap.Method lookup in C [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I'm trying to make a game in C, using OOP. I ran into the problem of being able to look up methods in superclasses.
+At the moment, my objects look more or less like this:
+typedef unsigned int PTR
+
+struct Object{
+    PTR super;
+    PTR (method1 (PTR self, ...));
+    .
+    .
+    .
+    PTR (methodN (PTR self, ...));
+}
+
+I want to look up a method, and if it's not found in an object, to iteratively look for it in it's super, it's super's super, etc, and return 0 (method not found) if super == NULL at some point.
+How could I achieve this?You can implement it with a simple loop:
+typedef PTR (*MPTR)();
+
+MPTR lookup_method1(struct Object obj) {
+    MPTR res;
+    do {
+        res = obj->method1;
+        obj = obj->super;
+    } while (!res && obj);
+    return res;
+}
+
+The loop walks up the links of your inheritance hierarchy until the appropriate method is found.
+However, your approach is rather slow. You should walk your hierarchy upfront, and set all NULLs to the pointer from the parent. This way you'd have a quick look-up; if the pointer is NULL, there is no implementation.A common approach is not to search the super class for an implementation, but rather include the method table of the super class in the derived class. Saves you a lot of hassle:
+typedef struct SUPER {
+   int attribute1;
+   int attribute2;
+   int (*method1)(struct SUPER *self, int arg1, int arg2);
+   int (*method2)(struct SUPER *self, char *ptr);
+} SuperClass_t;
+
+typedef struct SUB {
+   struct SUPER superclass;
+   int (*method3)(struct SUB *self);
+} SubClass_t;
+
+Finding the superclass implementation in a derived class is dead easy:
+// Call superclass method
+void subClassMethod (SubClass_t *self, char *ptr){
+   self->superclass->method2 (&(self->superclass), ptr);
+}
+
+If you want it even more close to "real" OOP languages, don't store the method pointers in the instances, but rather have an indirection to a VMT shared by all instances that actually holds the method pointers. Adds another indirection when calling a method, but saves you a lot of initialisation code in the constructor as you need do it only the first time you instantiate an instance of a specific class.&C returns invalid address in loop [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I am looping through my file structure with a C program. It I hit a new folder, i appending it's path to a linked list so I can look through all subdirectories iteratively. 
+The program consists of: 
+main function, calling the iterative function (which loops through the files)
+When i loop through all the files once everything works fine. However when i have a while loop in my main function to call the iterative function more often, it always fails on the second time due to segmenatation error. 
+So i was investigating a bit and it seems that one element of the linked list is having an invalid address.
+All addresses of my elements have this format and length:  0x2398ff0 or 0x2398ee0
+However the illegal pointer has an address from 0x7f3770304c58
+Does anyone have any thoughts why this address is so long? 
+I have checked throught printf("%p", element) every new address that gets added to the linked list, and this address never appear anywhere before in the code. It like magically appears. 
+I was thinking about a wild pointer maybe, but after i free any pointer i set it to NULL to, which should prevent this right?
+Thanks for any tip. I haven't posted the code right now cause it is very long and thought maybe there are obvious things i just dont see. 
+EDIT: the entire code, including main function
+#include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+
+void iterativefile(FILE *f, char** field, int looper){
+
+    DIR *d;
+    struct dirent *dir;
+
+    typedef struct nextpath { // Define element type of linked list
+        char *thispath;
+        struct nextpath *next;
+    }nextpath;
+
+    nextpath *startpath = malloc(sizeof(nextpath));
+    char * beginning = (char *) malloc(2); //create first element in linked list, starting on root node "."
+    strcpy(beginning, ".");
+    startpath->thispath = beginning;
+
+    int found = 0;
+
+    nextpath *currentzeiger = startpath;
+    nextpath *firstelement = startpath;
+    char *newdir, *currentfile, *currentpath;
+
+    do {
+        currentpath = currentzeiger->thispath;
+        d = opendir(currentpath);
+        if (!d){ //IF the path is invalid or cannot be opened
+
+            firstelement = currentzeiger->next;
+            free(currentzeiger);
+            currentzeiger = firstelement;
+            continue;
+        }
+        while((dir = readdir(d)) != NULL){
+            if (dir->d_type != DT_REG){ // current element is a directory -> add it to linked list
+                if (strcmp(dir->d_name, ".") != 0 && strcmp(dir->d_name, "..") != 0){
+                    newdir = (char *) malloc(2+strlen(currentpath) + strlen(dir->d_name));      
+                    strcpy(newdir, currentpath);
+                    strcat(newdir, "/");
+                    strcat(newdir, dir->d_name);
+                    nextpath *new = malloc(sizeof(nextpath)); // add new folder to linked list
+                    new->thispath = NULL;
+                    new->thispath = strdup(newdir);
+                    new->next = currentzeiger->next;
+                    currentzeiger->next = new;
+                    free(newdir);
+                    newdir = NULL;              
+                }
+            }
+            else { // current element is a file -> check if already included in list, if not, add it
+                currentfile = (char *) malloc(2+strlen(currentpath)+strlen(dir->d_name));
+                strcpy(currentfile, currentpath);
+                strcat(currentfile, "/");
+                strcat(currentfile, dir->d_name);
+                found = 0;
+                if (field != NULL) {
+                    for (int z = 0; z < looper; z++){
+                        if (field[z] != NULL){
+                            if(strcmp(currentfile,field[z]) == 0){
+                                found = 1;
+                                free(field[z]);
+                                field[z] = NULL;
+                            }
+                        }
+                    }
+                }
+                if (found == 0){
+                    char *renamefile = (char *) malloc(strlen(currentpath) + 6);
+                    strcpy(renamefile, currentpath);
+                    strcat(renamefile, ".cbsm");
+                    free(renamefile);
+                    renamefile = NULL;
+
+                }
+                free(currentfile);
+                currentfile = NULL;
+            }
+        }
+
+        firstelement = currentzeiger->next;
+        free(currentzeiger->thispath);
+        currentzeiger->thispath = NULL;
+        free(currentzeiger);
+
+        currentzeiger = firstelement;
+        closedir(d);
+
+    }while(currentzeiger != NULL);
+}
+
+
+
+int main()
+{
+    int counterofwhile = 1;
+    while(1){
+    printf("Loop number: %d\n", counterofwhile);
+    counterofwhile++;
+    FILE *fp = fopen("datasyn.txt", "rw+");
+    if (fp == NULL) {
+        printf("FILE ERROR");
+        FILE *fp = fopen("datasyn.txt", "ab+");
+        iterativefile(fp, NULL, 0);
+    }
+    else {
+        int lines = 0;
+        int ch = 0;
+        int len = 0;
+        int max_len = 0;
+        while((ch = fgetc(fp)) != EOF){
+            ++len;
+            if (ch == '\n'){
+                if(max_len < len)
+                    max_len = len;
+                ++lines;
+                len = 0;
+            }
+        }
+
+        if (len)
+            ++lines;
+        fprintf(stderr, "%d lines\n", lines);
+        if (lines > 0){
+            int numProgs = 0;
+            char *programs[lines];
+            char line[max_len + 1];
+            rewind(fp);
+            while(fgets(line, sizeof(line), fp)){
+                int new_line = strlen(line) - 1;
+                if (line[new_line] == '\n')
+                    line[new_line] = '\0';
+                programs[numProgs++] = strdup(line);
+            }
+
+            iterativefile(fp, programs, numProgs);
+            for (int j = 0; j < numProgs; j++){
+            free(programs[j]);
+            }
+        }
+        else {
+            iterativefile(fp, NULL, 0);
+        }
+    sleep(1);
+
+
+    printf("Done\n");
+    fclose(fp);
+    }
+
+    }
+    return 0;
+}In the function iterativefile(), you don't use calloc() to allocate startpath and you don't set startpath->next to null.  The memory returned by malloc() is not necessarily zeroed.  When you subsequently use startpath->next, all hell breaks loose.
+You also don't use the file pointer passed into iterativefile().  When you remove the parameter from the definition, you change the calls, and you've got a shadowed fp in main() (in the if (fp == NULL) block, you create a new FILE *fp which is really not needed).  It really isn't clear what else is meant to happen; you've not given clear instructions on what the program is meant to be doing.  I don't have the datasyn.txt file, but it shouldn't matter since the file stream is not used.  I got lots of lines like FILE ERRORLoop number: 280 from the code, but no crash where previously I was getting a crash.
+Compile with more warning options.  I called the file fp17.c and compiled my hacked version using:
+gcc -O3 -g -std=c11 -Wall -Wextra -Werror -Wmissing-prototypes -Wstrict-prototypes \
+    -Wold-style-definition fp17.c -o fp17
+
+With a few other simple changes (static before the function; int main(void)), the code compiled cleanly (and would have needed -Wshadow to spot the shadowing if it hadn't been for an 'unused variable' warning that pointed me to it).Strcmp Contradicts Printf in C [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I am passing a pointer to a pointer to a void function, whose purpose is to dynamically allocate and create a string (containing a full file path).
+At the end of the function, I check with a printf(%s) and the function seems to work perfectly (for the ~10 test files in my sample run). However, I check the pointer again in main, just after the void is called, and the result doesn't seem to be maintained.
+At the end of the void function:
+printf("%s\n", *ptr) returns usr/path/file
+
+In main:
+printf("%s\n", *ptr) returns usr/path/fil50(??
+
+Stuff like this happens for several of the longer file paths (the shorter strings seem to be immune).  I create the string inside the void function with strcpy and strcat on two char buffers (for directory path and file name).
+The really weird thing is - I added strcmp and strlen checks on the *ptr strings in the two places (at the end of the void function and in main), and:
+
+strlen is the same for the two, even though the externally printed string is clearly longer! See the above example. I can clearly tell because each string is printed on a new line.
+strcmp returns 0, even though the strings printed are obviously different.
+
+I cannot account for this behavior...The change in *ptr within and outside the function is one thing, but how can printf and strcmp contradict each other??
+I have not been able to find anyone else who has experienced this, and would be grateful for any help. 
+EDIT- I should have mentioned the void function is trying to replace an existing intra-main operation that wastes a lot of memory (calling sprintf on a massive buffer). Frankly I was just asking a general question about contradiction between strcmp and printf, but am certainly willing to provide more evidence.
+int main(int argc, char *argv[]) {
+char buff[MASSIVE_SIZE];
+    sprintf(buff, "%s/%s", dir, path->d_name);
+    char **ptr = (char **)malloc(sizeof(char*));
+    make_full_path(dir, path->d_name, ptr);
+    printf("external, strcmp:%d\n%s\n", strlen(*ptr), *ptr);
+    printf("strcmp=%d\n", strcmp(buff, *ptr));
+}
+
+
+void make_full_path (const char *dir_name, char *other_name, char **pptr){
+int len_one = strlen(dir_name);
+int len_two = strlen(other_name);
+
+char dest[len_one+2];
+strcpy(dest, dir_name);
+dest[len_one] = '/';
+dest[len_one+1] = '\0';
+char src[len_two+1];
+strcpy(src, other_name);
+src[len_two] = '\0';
+*pptr = strcat(dest, src);
+printf("internal, strlen=%d:\n%s\n", strlen(*pptr), *pptr);
+}However, I check the pointer again in main, just after the void is called, and the result doesn't seem to be maintained.
+
+This could mean only one thing: you are returning a pointer to local. This is undefined behavior:
+char dest[len_one+2];
+...
+*pptr = strcat(dest, src); // Passing a local back to main
+
+Replace it with a call of malloc will fix the problem:
+char dest[len_one+strlen(other_name)+2];
+...
+strcat(dest, src);
+*pptr = malloc(strlen(dest)+1);
+strcpy(*pptr, dest);ARM A7 Linux raw interrupt handling possible?I'd like to write an open-sourced core driver for controlling stepper motors in Linux. In this case, especially for 3D-Printers.
+The basic idea is that the driver reserves pins on one IO port, and then manipulates those pins at once. It receives a buffer full of "toggle this, toggle that" values, and then emits those to the port, using a hardware timer.
+Now the question is: Is there any way to handle a specific hardware interrupt as fast as possible?
+The chip in question is an Allwinner H3, and I am using the TMR1 resource of said chip (IRQ 51). I can use it just fine, and it works as an interrupt as well:
+static irqreturn_t stepCore_timer_interrupt(int irq, void *dev_id)
+{
+        writel(TMR1_IRQ_PEND, TMR_IRQ_ST_VREG);
+        icnt++;
+
+        porta_state = readl(PA_VDAT);
+        porta_state &= porta_mask;
+
+        if(icnt & 0x00000001)
+        {
+            porta_state |= 0x00000001;
+        }
+
+        writel(porta_state, PA_VDAT);
+
+        return IRQ_HANDLED;
+}
+
+static struct irqaction stepCore_timer_irq = {
+        .name = "stepCore_timer",
+        .flags = IRQF_DISABLED | IRQF_NOBALANCING , IRQF_PERCPU,
+        .handler = stepCore_timer_interrupt,
+        .dev_id = NULL,
+};
+
+static void stepCore_timer_interrupt_setup(void)
+{
+    int ret;
+    u32 val;
+
+    writel( 24000000, TMR1_INTV_VALUE_VREG );
+    writel( ( TMR1_MODE_CONTINUOUS | TMR1_CLK_PRES_1 | TMR1_CLK_SRC_OSC24M ), TMR1_CTRL_VREG );
+
+    ret = setup_irq(SUNXI_IRQ_TIMER1, &stepCore_timer_irq);
+    if (ret)
+            printk("%s: ERROR: failed to install irq %d\n", __func__, SUNXI_IRQ_TIMER1);
+    else
+            printk("%s: irq %d installed\n", __func__, SUNXI_IRQ_TIMER1);
+
+    ret = irq_set_affinity_hint(SUNXI_IRQ_TIMER1, cpumask_of(3));
+    if (ret)
+            printk("%s: ERROR: failed to set irq affinity for irq %d\n", __func__, SUNXI_IRQ_TIMER1);
+    else
+            printk("%s: set irq affinity for irq %d\n", __func__, SUNXI_IRQ_TIMER1);
+    /* Enable timer0 interrupt */
+    val = readl(TMR_IRQ_EN_VREG);
+    writel(val | TMR1_IRQ_EN, TMR_IRQ_EN_VREG);
+
+}
+
+TMR1 is otherwise unused (in fact, I had to add it myself) and so far works. However, there is quite some latency in handling the rather simple IRQ routine. Since I want to produce some code that is usable for a 3D printer, I very much like a more "stable" timer interrupt.
+So, my question is: Is there any way to have a very short IRQ routine in Linux that has the highest possible priority? Or even doesn't care about the Linux scheduler at all, and just "does it's thing"? Basically a raw IRQ handler, ignoring what Linux thinks it should be?
+The core it runs on is dedicated to just that task, anyways. The handler will be as short as possible: fetch an u32 from an array, write that to the port, done.
+Preferably I would like to have something that just ignores the remainder of Linux all together. Yes, I know that that isn't the way to do it. But this is meant for a rather special case, so I have no qualms with adapting the regular kernel sources to suit those needs.
+Oh, that reminds me, the kernel is 3.4.112 with the suitable preempt-rt patches. 
+Any help is greatly appreciated.
+Greetings,
+ChrisHere is a general solution to this issue. You can write a kernel module which will overwrite the existing interrupt handling routine and will be replaced by your own routine, where you can handle your irq of interest and redirect all the irq to the existing kernel interrupt handling routine. It's possible for x86 arch where you will get low level CPU instructions to get the existing address of interrupt description routine (lidt). I believe it should be possible for ARM too. Now, Linux has technique of CPU isolation isolcpus by utilizing this technique you can take a CPU out of scheduler domain i.e. no task will be scheduled on that particular CPU, until you specify a task to be run on that particular CPU  (using taskset). After you take a CPU out of scheduler domain you can take help of the technique of affine a interrupt to that isolated CPU,  you can do it via /proc/irq/IRQ_NUMBER/smp_affinity. Now all of your interrupt will be handled by this isolated CPU and 100% dedicated to that interrupt. And with your own IRQ routine you have full control over the interrupt handling.
+Hopefully this will help!Have you thought about using FIQ for that. We have a blog post about it:
+http://free-electrons.com/blog/fiq-handlers-in-the-arm-linux-kernel/Shellcode in C programIn Demystifying the Execve Shellcode is explained a way to write an execve shellcode:
+#include<stdio.h>
+#include<string.h>
+
+unsigned char code[] = 
+"\x31\xc0\x50\x68\x6e\x2f\x73\x68\x68\x2f\x2f\x62\x69\x89\xe3\x50\x89\xe2\x53\x89\xe1\xb0\x0b\xcd\x80";
+
+main()
+{
+
+    printf("Shellcode Length: %d\n", strlen(code));
+
+    int (*ret)() = (int(*)())code;
+
+    ret();
+}
+
+What does the line int (*ret)() = (int(*)())code; do?int (*ret)() = (int(*)())code;
+  ~~~~~~~~~~~~   ~~~~~~~~~~~~~~
+        1              2
+
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+               3
+
+
+It defines ret as a pointer to a function which has no parameter () and returns int. So, Those () indicates the definition of parameters of a function.
+It's for casting code to a pointer to a function which has no parameter () and returns int.
+Casts code as a function and assigns it to ret. After that you can call ret();.
+
+ 
+unsigned char code[] =  "\x31\xc0\x50\x68\x6e\x2f\...
+
+It is a sequence of machine instructions represented by hex values. It will be injected to the code as a function.(*(void(*)())shellcode)()
+
+==
+    p = (void(*)()) shellcode;
+    (*p)();The int line declares the ret() function, by pointing to the code[] array; in other words, the function is mapped to the code[] binary instructions.
+The \x construct is a safe way to embed hexadecimal characters in a string.  You could for instance replace “\x31” by “1” as the character code of “1” is 49, or hexadecimal 31.Can this function pointer part be re-written in a simpler form?
+
+I don't know if you think this is simpler, but maybe:
+#include <stdio.h>
+#include <string.h>
+
+unsigned char code[] = 
+"\x31\xc0\x50\x68\x6e\x2f\x73\x68\x68\x2f\x2f\x62\x69\x89\xe3\x50\x89\xe2\x53\x89\xe1\xb0\x0b\xcd\x80";
+
+typedef int(*shellcode_t)();
+
+int main(int argc, char ** argv) {
+    printf("Shellcode Length: %ld\n", strlen(code));
+
+    shellcode_t ret = (shellcode_t)code;
+
+    ret();
+}Decreasing realloc [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Using realloc to shrink the allocated memory
+
+                                (5 answers)
+                            
+
+
+Can I assume that calling realloc with a smaller size will free the remainder? [duplicate]
+
+                                (5 answers)
+                            
+
+
+what will realloc do to the old pointer [duplicate]
+
+                                (6 answers)
+                            
+
+Closed last year.
+
+
+
+I have a few questions about understanding 
+realloc behavior.
+#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+    int *str;
+
+    /* Initial memory allocation */
+    str = malloc(5 * sizeof(int));
+    *str = 1;
+    *(str + 1) = 2;
+    *(str + 2) = 3;
+    *(str + 3) = 4;
+    *(str + 4) = 5;
+
+    /* Reallocating memory */
+    int i, j;
+
+    for (i = 5; i > 0; i--) {
+        str = realloc(str, i * sizeof(int));
+
+        for (j = 0; j < i; j++) {
+            printf("%d", *(str + j));
+        }  
+
+        printf("\n");
+    }
+
+    free(str);
+
+    return(0);
+}
+
+
+In this code example, can I be sure that a smaller realloc will drop the highest number?
+Is the realloc is only freeing the last memory and keeping the same address in str? Or may the address change even though it's getting smaller and for sure have space in the current place?Yes. If you have a memory block p of size N and you do realloc(p, M), then (assuming realloc succeeds), the result will contain the first min(N, M) bytes from p.
+The address can change, even if the new size is smaller than the old one. realloc simply makes no guarantees about this case (it can even fail).How to implement the lexer hack for a C parser in ANTLRIs it possible to implement the classic Yacc lexer hack to differentiate between identifier names and type names in a C parser generated by ANTLR4, using a standard C grammar (like the one found on the official ANTLR4 GitHub repo) ?
+It seems ad-hoc code that can be plugged in ANTLR4 lexers is quite limited. In the book "The Definitive ANTLR4 Reference", Terrence Parr says: 
+
+"A common practice that s been around forever involves sending
+  feedback from the parser to the lexer so that the lexer can send
+  precise tokens to the parser. [...] Unfortunately, this is not
+  possible with ANTLR grammars because ANTLR-generated parsers often
+  look very far ahead in the token stream to make parsing decisions.
+  [...]"
+
+Any way to circumvent the above, and implement that feedback loop? Or is the implementation of a C parser in ANTLR4 just impossible without resorting to crazy hacks when visiting the parse tree?Who says you have to ask the parsing machinery anything to implement the lexer hack?  The hack is in the lexer. 
+The key to the C lexer hack is to have the lexer, all by itself, record which identifiers are typenames.   You can do this in the lexer by tracking the emitted lexical tokens.  With enough ad hockery (which is why it is called a hack) your lexer can recognize "typedef .... x;" as it goes by, and record "x" as a type in a lexer-local symbol table. 
+Then when an identifier is encountered by the lexer, that happens to be typename according to its local symbol table, the lexer can emit "type_identifier" rather than "identifier".
+Your lexer has to keep track of scoping constructs, too, in case the typedef is scope-local, and adjust the table of live typedefs accordingly as it scans across scope boundaries.
+Of course, this hack works only if you know that you have a language like C, in which the parser will not backtrack back across the tokens because they might have a different parse.  AFAIK, ANTLR doesn't backtrack.
+(Yes, if the parser will provide access to a symbol table that it tracks as some kind of side effect of parsing, you can simply have the lexer consult that table, again provided the parser won't backtrack.  What makes this "safe" is presumably that while executing the lexer, the parsing subystem is not executing in the parser, and so symbol table accesses are safe.   If your lexer is producing a pipeline of lexemes in advance of the parser's use, then it is running asynchronously WRT to the parser and now it cannot use the parser's symbol table; you have to fall back on a lexer-local symbol table as described above).
+(If you switch to a GLR parser, you can avoid the hack.)No. You literally quoted the answer to your own question.
+On a side note, writing a parser isn't that hard. Forewarning, I wrote this recursive descent parser off the top of my head; it's not been tested, but it nonetheless will give you the basic idea:
+#include <ctype.h>     // isalnum, isalpha, isdigit
+#include <stdio.h>     // printf
+#include <stdlib.h>    // atoi
+#include <string.h>    // strncmp
+
+
+/* ASCII numbers are positive, and only between 0 and 127.
+ * We can thus use negative numbers to identify special tokens. */
+enum {
+    TOK_SPACE = -1,
+    TOK_ID = -2,
+    TOK_NUM = -3,
+    TOK_ELSE = -4,
+    TOK_IF = -5
+};
+
+
+int token_length;
+union {
+    char *s;
+    int i;
+} token_value;
+
+
+int get_token(char *str) {
+    token_length = 0;
+    if (isspace(*str)) {
+        do {
+            token_length++;
+            str++;
+        } while (isspace(*str));
+        return TOK_SPACE;
+    }
+    if (isalpha(*str) || *str == '_') {
+        token_value.s = str;
+        do {
+            token_length++;
+            str++;
+        } while (isalnum(*str) || *str == '_');
+        if (!strncmp(token_value.s, "else", token_length))
+            return TOK_ELSE;
+        if (!strncmp(token_value.s, "if", token_length))
+            return TOK_IF;
+        return TOK_ID;
+    }
+    if (isdigit(*str)) {
+        token_value.s = str;
+        do {
+            token_length++;
+            str++;
+        } while (isdigit(*str));
+        token_value.i = atoi(str);
+        return TOK_NUM;
+    }
+    token_length = 1;
+    return *str;
+}
+
+int is_conditional(char *str) {
+    int tok, len = 0, rule_len;
+    tok = get_token(str);
+    if (tok == TOK_SPACE) {      // accept space
+        len += token_length;
+        str += token_length;
+        tok = get_token(str);
+    }
+    if (tok != TOK_ID && tok != TOK_NUM) // require id or number
+        return 0;
+    return len + token_length;   // return the length of the entire match
+}
+
+int is_if_statement(char *str) {
+    int tok, len = 0, rule_len;
+    tok = get_token(str);
+    if (tok == TOK_SPACE) {      // accept space
+        len += token_length;
+        str += token_length;
+        tok = get_token(str);
+    }
+    if (tok == TOK_IF) {         // require 'if'
+        len += token_length;
+        str += token_length;
+        tok = get_token(str);
+    } else return 0;
+    if (tok == TOK_SPACE) {      // accept space
+        len += token_length;
+        str += token_length;
+        tok = get_token(str);
+    }
+    if (tok == '(') {            // require l-paren
+        len++;
+        str++;
+        tok = get_token(str);
+    } else return 0;
+    rule_len = is_conditional(str);
+    if (rule_len != 0) {         // require conditional
+        len += rule_len;
+        str += rule_len;
+        tok = get_token(str);
+    } else return 0;
+    if (tok == TOK_SPACE) {      // accept space
+        len += token_length;
+        str += token_length;
+        tok = get_token(str);
+    }
+    if (tok == ')') {            // require r-paren
+        len++;
+        str++;
+        tok = get_token(str);
+    } else return 0;
+    if (tok == TOK_SPACE) {      // accept space
+        len += token_length;
+        str += token_length;
+        tok = get_token(str);
+    }
+    if (tok != TOK_ID)
+        return 0;
+    return len + token_length;   // return the length of the entire match
+}
+
+void parse(char *str) {
+    int rule_len;
+    if ((rule_len = is_if_statement(str)))
+        printf("an if-statement was matched!\n");
+    else
+        printf("the input is not valid code!\n");
+    str += rule_len;
+}
+
+int main(int argc, char *argv[]) {
+    parse("if (x) y");     // valid!
+    parse("if (1) ...");   // invalid!
+    return 0;
+}Linux kernel modules - redundant includesThere are some tutorials out there that #include the following headers
+#include <linux/kernel.h>
+#include <linux/init.h>
+
+However, the module works just fine without them; mere linux/module.h included. Are the two includes necessary?As stark said, they are probably unnecessary in some specific cases. If you find it on some tutorials, it was probably because the writer simply copy/paste-d his headers to gain some time.
+Looking at module.h:
+
+#include <linux/init.h>
+#include <linux/kobject.h>
+
+
+and kobject.h:
+
+#include <linux/kernel.h>
+
+
+However, unused #include should be removed because they may have some negative effects like increasing compilation time and memory usage.
+A tool called Include what you use can help people to track unused #includes.Does AES_cbc_encrypt add padding?Consider the following snippet of C++ code:
+#include <iostream>
+#include <openssl/aes.h>
+
+#define AES_KEY_LENGTH 32
+
+using namespace std;
+
+int main()
+{
+    AES_KEY encryption_key;
+    AES_KEY decryption_key;
+
+    unsigned char key[AES_KEY_LENGTH] = {'t', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't'};
+
+    unsigned char iv[AES_BLOCK_SIZE] = {'t', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't', 't', 'e', 's', 't'};
+
+    unsigned char iv_enc[AES_BLOCK_SIZE];
+    unsigned char iv_dec[AES_BLOCK_SIZE];
+
+    memcpy(iv_enc, iv, AES_BLOCK_SIZE);
+    memcpy(iv_dec, iv, AES_BLOCK_SIZE);
+
+    AES_set_encrypt_key(key, AES_KEY_LENGTH * 8, &(encryption_key));
+    AES_set_decrypt_key(key, AES_KEY_LENGTH * 8, &(decryption_key));
+
+    char message[] = "Attack at dawn! Attack.";
+
+    unsigned char * encryption_output = new unsigned char[32];
+    encryption_output[31] = 3;
+
+    AES_cbc_encrypt((unsigned char *) message, encryption_output, sizeof(message), &encryption_key, iv_enc, AES_ENCRYPT);
+
+    unsigned char * decryption_output = new unsigned char[32];
+
+    AES_cbc_encrypt(encryption_output, decryption_output, 32, &decryption_key, iv_dec, AES_DECRYPT);
+}
+
+What I do here is encrypt and then decrypt a message using openssl aes library. What I am concerned about is the length encryption_output. As far as my understanding goes, since AES encrypts in blocks of size AES_BLOCK_SIZE (aka 16 bytes) the number of output bytes should be equal to the size of the message, rounded up to the closest multiple of AES_BLOCK_SIZE. Is this correct? In particular, what happens if I extend the message to be exactly 32 bytes long? Will this still work, or will 16 empty padding bytes be added thus causing a segmentation fault when trying to write bytes 32 to 47 in encryption_output?Proper PKCS#7 padding: 
+
+rounds the length up to a multiple of the blocksize if it wasn´t a multiple before  
+and it adds a whole block otherwise
+
+Else, when decrypting, you couldn´t possibly know if the last ciperhtext block is "real" or only padding. (The actual byte values to pad with are specified too, but your real last block could contain these => again not possible to recognize it).  
+There are other schemes than PKCS#7, but this is not relevant here.  
+However, with AES_cbc_encrypt, you´ll have to implement this yourself, ie. pad before encrypting and remove the padding after decrypting. The encrypting itself will work with non-multiple lengths, but the used "padding" has the problem mentioned above. To answer your original question, AES_cbc_encrypt won´t add blocks, rounding up the length is the only thing it does.  
+For functions with proper padding (and without several other disadvantages of AES_cbc_encrypt, like missing AESNI support etc.etc.), look into the EVP part of OpenSSL. AES_cbc_encrypt is a more lowlevel part, depending on the situation it´s used by the highlevel function too.  
+Btw., something about C++: If you don´t get a segmentation fault,
+it doesn´t mean that the code is correct.how to detect duplicates in arrays & print non duplicates?void main ()
+    {
+        int x[19]={0}, i=0, y=0, u=0, p;
+        while (i<=19)
+        {
+            scanf("%d",&x[i]);
+            i=i+1;
+        }
+        for (i=u;i<=19;i++)
+        {
+            if (x[y]!=x[i+1])
+                p=x[y];
+                else
+                {
+                   u++;
+                   y++;
+                }
+        }
+        printf("%d",p);
+    }
+
+So I used this to check for duplicates & it should print non duplicates, but as you can see this works if all are duplicates but one, as in 
+        x[0]=1 x[1]=1 x[3]=9 x[4]=1 ... x[19]=1;
+    prints 
+      9 
+
+So how to print non duplicates ? Any help ?This would be the easiest solution, simply nest an additional for-loop. However, this takes O(n^2). Depending on the size of the array, it could be beneficial to look at a fast sort.
+void main() {
+    int x[4] = { 1, 3, 2, 1 };
+
+    size_t i, j;
+    for (i = 0; i < sizeof(x) / sizeof(int); i ++) {
+        // Note that we only have to go to the last value before i.
+        for (j = 0; j < i; j ++) {
+            // We break if the value is a duplicate.
+            if (x[i] == x[j])
+                break;
+        }
+
+        // Check if the inner loop was break'ed (j < i) or not (j == i).
+        if (j == i)
+            printf("Unique: %i\n", x[i]);
+    }
+}
+
+One more thing: only use sizeof(x) / sizeof(int) if the size of x is known during compilation. This is the case here, but don't use it with malloc.One of the simplest ways is to sort the array to group the duplicates together. Then, as you go through the array you only print a number if its different from the number that came before.
+// Print the unique elements of a sorted array:
+for(int i=0; i<N; i++){
+    if (i-1 >= 0 && arr[i] == arr[i-1]) { continue; }
+    if (i+1 < N  && arr[i] == arr[i+1]) { continue; }
+    printf("%d\n", arr[i]);
+}
+
+To sort the array you can use the qsort functionvoid main ()
+{
+    int num[20]={0}, i=0, n=0, index_num=0, init_incr=0, unique=0, n_uniq=1, temp, check=0;
+    while (i<=19)
+    {
+        printf("%02d-  ",i+1);
+        scanf("%d",&num[i]);
+        i=i+1;
+    }
+    for (index_num=0;index_num<19;index_num++)
+    {
+        for (n=init_incr+index_num;n<19;n++)
+        {
+            if (num[index_num]!=num[index_num+1] && num[index_num]!=num[index_num-1])
+            {
+                check++;
+                temp=num[index_num];
+                unique=temp;
+                for (;n_uniq<=check;n_uniq++)
+                printf("\tunique %02d  = %d\n", n_uniq, unique);
+                break;
+            }
+        }
+    }
+}Retrieving clock cycles with inline ARM assemblyI'm playing around with some C reference code and it came with its own benchmarking routines.  Unfortunately, the benchmarking code had a line of inline x86 assembly, and I'm trying to compile it on AArch64 ARMv8 system (a Raspberry Pi 3 if that helps).
+From the context I figured out all the x86 assembly does is report clock cycles.  I dug around the ARM processor docs and figured out I should probably be polling the CNTPCT_EL0 system register, and wrote the following:
+unsigned long long result;
+asm volatile ("mrs %0, cntpct_el0" : "=r" (result));
+
+However, I get the following error from the assembler:
+Error: selected processor does not support requested special purpose register -- `mrs r0,cntpct_el0'
+
+So far I've tried changing the gcc flags (variations on -mcpu and -march), explicitly setting the destination register to being 64 bit, even updating binutils.  What am I missing?Wrap macro with variable number of argumentsI need to wrap a macro so that it can be accessed with a function.
+The macro is defined like: 
+#define gDbgLog(fmt,...)  dbgLog(g_pdbg,MODULE_NAME,__FUNCTION__,fmt,##__VA_ARGS__)
+
+and I've attempted to wrap it up like:
+void pMonDbgLog(char* fmt, ...)
+{
+    va_list args;
+    va_start(args,fmt);
+    gDbgLog(fmt,args);
+    va_end(args);
+}
+
+while fmt seems to come through fine, the arguments (int) seem to get clobbered up. I call it like:
+int x = 51144;
+pMonDbgLog("some text %d",x);
+
+and what I get is "some text 642129608" while calling the macro directly like DbgLog("some text %d",x); works fine. Why is this?
+dbgLog() wraps vsnprintf() to generate the output.wrap macro with variable number of arguments
+
+It simply is not possible to "expand" a valist to a variable number of arguments and pass those to a variadic functions on run-time, at least not with any additional helpers (which are not part of C and are not portable and might not be available for you implementation/platform).
+gDbgLog() expects getting each argument passed separately:
+gDbgLog("%s %d", "hello, world", 42);
+
+What the code you show does instead is passing exactly one parameter as the __VA_ARGS__ part, namely the value of valist.
+gDbgLog(fmt,args);
+
+
+How to solve this?
+
+dbgLog() wraps vsnprintf() to generate the output.
+
+So just drop gDbgLog() and call vsnprintf() from pMonDbgLog() directly passing the valist as initialised by the code snippet you show.C can't allocate enough memoryBelow code doesn't give any allocation error , however the counting ends at about 16970 with memory allocation error and system halted
+,I use Turbo C++ 3.0 IDE
+,Windows XP sp3
+, all partitions : NTFS
+,PC : Dell 1545 with 2 GB ram installed .
+#include <stdio.h>
+#include <stdlib.h>
+
+long counter=0;
+int main(int argc, char *argv[])
+    {
+        char* array=(char*) malloc (1024*1024*10);
+        if (array==NULL) 
+            {
+                /* allocation error */
+                return 1;
+            }
+         for (counter=0 ; counter<10000000;counter++)
+         array[counter] = 1;  // trying to fill the array with one's
+        free (array);
+        return 0;
+    }Turbo C++ worked in a DOS environment, in real mode unless you specifically enable protected mode. In real mode, memory space is broken into 64kbyte segments, and size_t (the parameter for malloc) could easily be 16 bits. 1024*1024*10 mod 65536 = 0, so the call to malloc above works out to malloc(0).
+The return value of malloc(0) is implementation-defined, and may be nonzero. (what does malloc(0) return?) Using the returned pointer would be a bad idea, and Windows XP might be intervening with the memory allocation error.Ubuntu, How to link .exp file in C?How to link .exp file in C? 
+I can link .so, .o, .a, .la, lo and .slo files. 
+But there is file httpd.h with .exp file only(No .so, .o, .a, .la, lo and .slo files) and I need to use a function from it.
+And, I am getting undefined symbol error.
+undefined symbol: ap_cstr_casecmp.exp file contains the list of exported symbols only. There is no point to link with it, you need the library to link with..exp is used on Windows only and is of no use on Ubuntu.  You need a .so or .a file to link to on Ubuntu.
+You need to find the library file (lib<name>.so or lib<name>.a or similar, where <name> is the name of the library) and then link with -L<path> -l<name> where <path> should be replaced by the path to the directory that contains the library file.  If <path> is /usr/lib then -L<path> can be omitted.C: pointers to arrays, and destructive sortingI wrote a brief piece of code. It has two functions: bubbleSort is a bubble sorting function (smallest to largest), and "int main" is used to test this piece of code with an int array of size 5.
+I'd like this to destructively sort the array, and not simply pass through a copy. I have looked and looked, but I am still not entirely clear how this should work. What am I missing here?
+#include <stdio.h>
+
+void bubbleSort(int values[], int n);
+
+int main(void) {
+//set simple test array to make sure bubbleSort works
+    int arr[5] = {5,4,3,2,1};
+//run it through function, and then print the now sorted array to make sure
+    bubbleSort(arr, 5);
+    printf("%i", arr);
+    return 0;
+}
+
+
+void bubbleSort(int values[], int n)
+{
+    for (int i = 0; i < n; i++) { 
+        for (int j = 0, hold = 0; j < n-i; j++) {
+            if (values[j] > values[j+1]) {
+                hold = values[j+1];
+                values[j+1] = values[j];
+                values[j] = hold;
+            }
+        }
+    }
+    return;
+}
+
+Note: The rest of my code looks sound to my amateur coding mind, but please give me pointers on what i can improve, what can be better, etc. I thought about using recursion for the bubble sort but i'm not yet as comfortable with C as I'd like to be to implement that. However if you have suggestions i'll be more than happy to read them.
+thanks!Looks like your function is sorting the array (although with some bugs) and you are just printing the result incorrectly. printf doesn't know how to print arrays. Instead, you need to use a loop to print each integer one at a time:
+for(int i=0; i<5; i++){
+  printf("%d ", arr[i]);
+}
+printf("\n");
+
+After changing this, the output is 1 2 3 4 5, as expected.
+However, as mentioned in the comments, there are some bugs in the implementation of the bubblesort. For example, it tries to read elements from indedex after the end of the array, which is undefined behavior (namely, j+1 can be 5, which is out of bounds). I would recommend checking your book again to get a correct implementation of bubblesort.There is one issue in you bubble sort code which must be fixed. Your inner loop has the issue:
+/* for (int j = 0, hold = 0; j < n-i; j++) { */  // ISSUE here
+for (int j = 0, hold = 0; j < n-i-1; j++) { // j < n-i-1 should be the condition
+
+This is becasue, take the case of when i = 0, i.e. the first iterartion of outer for loop.  This time, j < n - i will be true when j is one less than n - which is the last index of your array. Then you do comaprision between values[j] and values[j+1], where values[j+1] is clearly out of bound of your array. This will invoke undefined behavior, and your function will not give deterministic results.
+Next improvement could be that your outer loop only needs to iterate from i = 0 till i < n-1, i.e. one times less than the total elements. You are interating one time more than needed.
+Third, you can use a flag to keep track of weather you swap at least once in your inner loop. If there there are no swaps in inner loop then it means that array is already sorted. So at the end of each iteration of inner loop you can see if any swap was done, and if no swaps were done then break out of the outer loop. This will improve performance in cases where array is already almost sorted.
+void bubbleSort(int values[], int n)
+{        
+    int swap;   // To use as a flag
+
+    // for (int i = 0; i < n; i++) { 
+    for (int i = 0; i < n-1; i++) {                 
+            swap = 0;     // set swap flag to zero
+            // for (int j = 0, hold = 0; j < n-i; j++) {
+            for (int j = 0, hold = 0; j < n-i-1; j++) {
+                    if (values[j] > values[j+1]) {
+                            hold = values[j+1];
+                            values[j+1] = values[j];
+                            values[j] = hold;
+                            swap = 1;        // swap was done
+                    }
+            }
+            if (swap == 0)   // If no swap was done
+                    break;   // Means array already sorted
+    }
+    return;
+}
+
+And, although not related to your sorting function, as others have pointed out, printf("%i", arr); is wrong, and will invoke undefined behavior because you are using a wrong format specifier in printf. It seems like you are trying to print the array. For that you can do:
+// printf("%i", arr);
+for (int i = 0; i < 5; i++)
+    printf("%d ", arr[i];)
+printf("\n");Your code already sorts the array in-place - although there is a bug in it. I'll address the subject of the question only (in-place sorting of an array in C) as comments have already highlighted the bugs with the sort function.
+The print-out of the result is incorrect though as it tries to print the arr pointer as an integer:
+sort.c:10:18: warning: format specifies type 'int' but the argument has type 'int *' [-Wformat]
+    printf("%i", arr);
+            ~~   ^~~
+1 warning generated.
+
+However changing this to:
+    for (int i = 0; i < 5; i++)
+        printf("%i", arr[i]);
+
+fixes the problem with the output.
+Perhaps your confusion comes from how arrays are actually a syntactic way to access pointers in C. arr is a pointer. arr[1] is the same as *(arr + 1) (the contents of the pointer arr + 1 using pointer arithmetic, which increments the pointer by the sizeof the type). So when you pass arr into the function, you are passing a pointer to the existing array, then you are modifying its contents, sorting the array in-place.C on CodeBlocks: how can I send user input without pressing "enter"? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Capture characters from standard input without waiting for enter to be pressed
+
+                                (18 answers)
+                            
+
+Closed 5 years ago.
+
+
+
+I'm trying an example from "The C programming language" on Windows with CodeBlock and I don't know how I can get user input without having to press enter. This program counts the number of lines in the input using getchar() and so when I run it "enter" only works as a \n and doesn't allow me to send my input. Is there an alternative way to do it?
+EDIT 
+the problem was with the compiler. Figured it out after looking into it for some timeThis is not a problem of the C programming language. It has more to do with the terminal that you are using to interface with the C program.
+By default, most terminals buffer the input that you type and only send it to the program when you finish the line by pressing enter. This is what allows you to use the backspace key to correct typing mistakes before they are sent to the C program.
+If you are not creating an interactive program, then if you redirect the program output to read from a file instead of from the terminal then getchar() will not have to wait. After all, the input file is all there from the start.
+./myprogram.exe < myinputfile.txt
+
+If you want to create an interactive program then the simplest thing you can do is to accept that the input comes one full line at a time. It is what users typing at the terminal will expect.
+If you want your application to immediately respond to keypresses then you will need to use something outside the standard C library. For example, in Linux you could use ncurses to create terminal applications that can immediately react to a keypress, including arrow keys and so on.What ARM compiler version is needed for attribute(noinline) support?I'm not sure how to find out what version of ARM compiler(armcc) is required for any given attribute to be supported.
+For example __atribute__((noinline))?
+See 
+http://www.keil.com/support/man/docs/armcc/armcc_chr1359124975804.htmTo address the titular question directly, the earliest version of armcc for which __attribute__((noinline)) is supported is version 3.0. I found that out the hard way, though; I don't know of any quick-reference for which versions introduced particular features.fork() to search through a 3D array C programming [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I just learned about fork on the web, I understand the main principle with the child and parent processes but I am still a little bit confused on how we can use fork to search faster through a 3D array. Can anyone give a quick coded example to show how it works ?
+ThanksI recommend you to check out posix threads. The difference is that threads work in the same process so they share address space (imo it is faster and easier to exchange data between threads then between processes). To search faster you should divide N dimensional array to X groups(smaller arrays - one for each thread/process) and pass each group of N dimensional data to particular thread(pthread)/process(fork).Fork can make things run faster by allowing the calculations to be split up amongst the processors. Here's example code using a flat array (it's easier to get the concept across with a flat array instead of 3d array):
+int main() {
+    int i;
+    int array[] = {0,1,2,3,4,5,6,7,8,9,10};
+    int findThisNumber = 8;
+    int pid = fork(); //split into two processes
+                      //the parent return the childs pid
+                      //and the child returns 0
+
+    if(pid == 0) { //this is the child
+        for(i = 0; i < 5; i++) { //scan the first half of the array
+            if(array[i] == findThisNumber) {
+                printf("%d found at index %d\n", findThisNumber, i);
+            }
+        }
+    } else { //this is the parent
+        for(i = 6; i < 10; i++) { //scan the second half
+            if(array[i] == findThisNumber) {
+                printf("%d found at index %d\n", findThisNumber, i);
+            }
+        }
+    }
+}
+
+In this example, the program splits into two processes and each process searches half of the array. I ran a the same program with 1000000000 elements in the array and these are the times:
+time ./noFork.exe
+real    0m0.796s
+
+time ./a.exe
+real    0m0.391s
+
+I hope that helps, if I can clear anything else up let me know.Multiplying integer by rational without intermediate overflowI have a struct representing a nonnegative rational number p/q:
+struct rational {
+    uint64_t p;
+    uint64_t q; // invariant: always > 0
+};
+
+I would like to multiply my rational by a uint64 n and get an integer result, rounded down. That is, I would like to calculate:
+uint64_t m = (n * r.p)/r.q;
+
+while avoiding intermediate overflow in n * r.p. (Of course the final result may overflow, which is acceptable.)
+How can I do this? Is there a way to do it without a high-multiply?
+(I looked at boost::rational but it does not appear to provide this feature.)You can use peasant multiplication:
+// requires 0 < c < 2^63
+// returns (a * b) / c.
+uint64_t multDiv(uint64_t a, uint64_t b, uint64_t c) {
+  uint64_t rem = 0;
+  uint64_t res = (a / c) * b;
+  a = a % c;
+  // invariant: a_orig * b_orig = (res * c + rem) + a * b
+  // a < c, rem < c.
+  while (b != 0) {
+    if (b & 1) {
+      rem += a;
+      if (rem >= c) {
+        rem -= c;
+        res++;
+      }
+    }
+    b /= 2;
+    a *= 2;
+    if (a >= c) {
+      a -= c;
+      res += b;
+    }
+  }
+  return res;
+}Either 128-bits and you might use Karatsuba multiplication there; or you might use the Chinese Remainder Theorem to represent (n * r.p) mod p1 and also mod p2. The second might be slower.Is there a random_device equivalent in CIn C++ we can generate true random numbers (if your hardware supports) with random_device. And i am writing a implementation of One-time Pad algorithm with C. Is there a way to generate true random numbers in C? I writing with C for speed and some another reasons. If i use a PRNG, it is will be unsafe.  
+char *KeyGenerate(unsigned long long StringLength)
+{
+    std::random_device TrueRandomNumberGenerator;
+    char *Key = (char *) malloc(StringLength + 1);
+
+    for(unsigned long long I = 0; I < StringLength; I++)
+    {
+        Key[I] = TrueRandomNumberGenerator();
+    }
+    Key[StringLength] = '\0';
+
+    return Key;
+}The C standard library is very very tiny. To get true random numbers, you will need to use OS-specific APIs.
+In Linux systems, you can get a stream of cryptographically-strong random bytes from the /dev/urandom file.As noted on Linux you have to read /dev/urandom. On WIndows alternative would be to use CryptGenRandom
+This is what is done in Python, I believe - API calls /dev/urandom based code on Linux, but CryptGenRandom on Windows.
+Don't know enough about OS XC uses a PRNG (pseudorandom number generator) so you can't really get true random numbers.
+Since your code is generating a bunch of random numbers, you could simply:
+srand(time(NULL));
+int r = rand();
+
+where srand(time(NULL));
+will go above the for loop. This way you seed once, then generate your random numbersC: Memory usage not reflecting after callocI run 
+calloc(1024 * 1024 * 1024, sizeof(int));
+I check my program's usage and it's zero but I never made a call to free
+
+Edit:
+Running Debian Jessie
+Edit 2:
+I am using the top as the system monitorLinux does lazy memory allocation. Only when a page fault occurs on a page marked as allocated does Linux actually consider it as being used. Try writing to a byte inside the allocated data and checking the memory usage again. For more information on memory allocation in Linux, check http://www.tldp.org/LDP/tlk/mm/memory.html.
+Additionally, even though calloc zeroes the allocated memory, it can still be done in a lazy way that leads to the behavior you described. See How to lazy allocate zeroed memory?.Your example only allocates a few K, which may be too small to see.  But even if you were to ask for a much larger amount of memory, you won't see usage until you actually use the memory. 
+Linux by default does not actually allocate memory pages until you touch them somehow.   Although calloc is supposed to initialize the memory to zero, this does not count as touching it as internally keeps track of uninitialized pages and returns zeros when read.Issue with gcc on Ubuntu Bash on windows with math libraryI have a makefile that uses "-lm" flag to include the math library. I also included #include  for each .c file. 
+I am still getting error and "undefined reference" to the math such as exp, floor, and pow etc.
+Using bash on windows Ubuntu.
+Copy of my terminal output:
+labyu@DESKTOP-U037B9F:~/software/BICseq2/NBICseq-norm_v0.2.4$ make
+gcc -g -O2 -Wall -lm   -c -o combineFile/combine.o combineFile/combine.c
+gcc -g -O2 -Wall -lm   -c -o lib/read.o lib/read.c
+lib/read.c: In function ‘read_table’:
+lib/read.c:74:14: warning: variable ‘flag’ set but not used [-Wunused-but-set-variable]
+  int i=0,j=0,flag=1,low_mmry = 40000, is_num=0,k;
+              ^
+gcc -g -O2 -Wall -lm combineFile/combine.o lib/read.o -o combineFile/combineFile
+gcc -g -O2 -Wall -lm   -c -o DataPrepare/DtaPrep.o DataPrepare/DtaPrep.c
+gcc -g -O2 -Wall -lm   -c -o lib/statlib.o lib/statlib.c
+gcc -g -O2 -Wall -lm  DataPrepare/DtaPrep.o lib/read.o lib/statlib.o -o DataPrepare/PrepPois
+DataPrepare/DtaPrep.o: In function `print_oneline':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:593: undefined reference to `pow'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:591: undefined reference to `log'
+DataPrepare/DtaPrep.o: In function `calculate_bias':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:685: undefined reference to `pow'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:690: undefined reference to `exp'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:681: undefined reference to `log'
+DataPrepare/DtaPrep.o: In function `fprint_gc_bin':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:810: undefined reference to `floor'
+DataPrepare/DtaPrep.o: In function `fprintf_predicted':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:850: undefined reference to `exp'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:860: undefined reference to `floor'
+DataPrepare/DtaPrep.o: In function `calculate_bias':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/DataPrepare/DtaPrep.c:749: undefined reference to `exp'
+lib/statlib.o: In function `db_shuffle':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:56: undefined reference to `floor'
+lib/statlib.o: In function `db_shuffle_int':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:71: undefined reference to `floor'
+lib/statlib.o: In function `rgamma1':
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:99: undefined reference to `log'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:100: undefined reference to `pow'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:103: undefined reference to `pow'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:104: undefined reference to `exp'
+/home/labyu/software/BICseq2/NBICseq-norm_v0.2.4/lib/statlib.c:90: undefined reference to `log'
+collect2: error: ld returned 1 exit status
+make: *** [PrepPois] Error 1
+
+But, when I make a sample program, such as this: test.c 
+#include <stdio.h>
+#include <math.h>
+
+int main(void)
+{
+   int number;
+   number = pow(10,2);
+   printf("%d\n", number);
+   return 0;
+ }
+
+I can use gcc test.c even without the -lm flag and it compiles fine.
+Is this a bug?In your test case, since all data is constant, it seems the compiler computes directly the value (it may depend on the compiler, but recent versions of gcc seem to handle this fine)
+When disassembling the code (x86) we see it clearly
+   0:   55                      push   %rbp
+   1:   48 89 e5                mov    %rsp,%rbp
+   4:   48 83 ec 30             sub    $0x30,%rsp
+   8:   e8 00 00 00 00          callq  d <main+0xd>
+
+direct 100 value passed to printf at the line below
+   d:   c7 45 fc 64 00 00 00    movl   $0x64,-0x4(%rbp)
+  14:   8b 45 fc                mov    -0x4(%rbp),%eax
+  17:   89 c2                   mov    %eax,%edx
+  19:   48 8d 0d 00 00 00 00    lea    0x0(%rip),%rcx        # 20 <main+0x20>
+  20:   e8 00 00 00 00          callq  25 <main+0x25>
+  25:   b8 00 00 00 00          mov    $0x0,%eax
+  2a:   90                      nop
+  2b:   48 83 c4 30             add    $0x30,%rsp
+  2f:   5d                      pop    %rbp
+  30:   c3                      retq
+  31:   90                      nop
+
+i have changed the code to this:
+#include <stdio.h>
+#include <math.h>
+
+int main(void)
+{
+   int number;
+   int v=10;
+   number = pow(v,2);
+   printf("%d\n", number);
+   return 0;
+ }
+
+And now when I nm the file I get:
+>nm simplemath.o
+0000000000000000 b .bss
+0000000000000000 d .data
+0000000000000000 p .pdata
+0000000000000000 r .rdata
+0000000000000000 r .rdata$zzz
+0000000000000000 t .text
+0000000000000000 r .xdata
+                 U __main
+0000000000000000 T main
+                 U pow
+                 U printf
+
+Before I introduced the variable, the pow symbol was not referenced. The compiler did the math statically.
+The disassembly shows a more complex code, using float registers and all.
+0000000000000000 <main>:
+   0:   55                      push   %rbp
+   1:   48 89 e5                mov    %rsp,%rbp
+   4:   48 83 ec 40             sub    $0x40,%rsp
+   8:   e8 00 00 00 00          callq  d <main+0xd>
+   d:   c7 45 fc 0a 00 00 00    movl   $0xa,-0x4(%rbp)
+  14:   66 0f ef c0             pxor   %xmm0,%xmm0
+  18:   f2 0f 2a 45 fc          cvtsi2sdl -0x4(%rbp),%xmm0
+  1d:   48 b8 00 00 00 00 00    movabs $0x4000000000000000,%rax
+  24:   00 00 40
+  27:   48 89 45 e8             mov    %rax,-0x18(%rbp)
+  2b:   f2 0f 10 4d e8          movsd  -0x18(%rbp),%xmm1
+  30:   e8 00 00 00 00          callq  35 <main+0x35>  <== the linker wil add the call to pow here
+  35:   f2 0f 2c c0             cvttsd2si %xmm0,%eax
+  39:   89 45 f8                mov    %eax,-0x8(%rbp)
+  3c:   8b 45 f8                mov    -0x8(%rbp),%eax
+  3f:   89 c2                   mov    %eax,%edx
+  41:   48 8d 0d 00 00 00 00    lea    0x0(%rip),%rcx        # 48 <main+0x48>
+  48:   e8 00 00 00 00          callq  4d <main+0x4d>
+  4d:   b8 00 00 00 00          mov    $0x0,%eax
+  52:   90                      nop
+  53:   48 83 c4 40             add    $0x40,%rsp
+  57:   5d                      pop    %rbp
+  58:   c3                      retq
+
+But to my surprise, no need of -lm, it links OK without it.
+Newest gcc versions must include it by default since it's often used. Maybe someone can confirm. You version seems to need it, mine doesn't (gcc 4.9.4)How to prevent scanf() from terminating when user presses enter key?If enter key is pressed, scanf() stops taking inputs hereafter. I've tried many ways: changing data to string and comparing it to null, comparing to ASCII. But, I could not prevent scanf from terminating when user presses enter.Read a line of text using fgets.  
+If fgets is able read the line without error, use sscanf to read the number from the line. 
+If sscanf is successful, use the number. Otherwise, go to error handling code.
+
+
+char line[LINE_SIZE];
+if ( fgets(line, LINE_SIZE, stdin) != NULL )
+{
+   int number;
+   if ( sscanf(line, "%d", &number) == 1 )
+   {
+      // Use the number
+   }
+   else
+   {
+      // Deal with error
+   }
+}I think you did not fully understand how scanf works.
+if you ask scanf to read an integer (by using %d), it will read an integer. As long as there is no reason to stop waiting for an integer, it will not stop - why would it. The part you probably missed is that sscanf is ignoring 'whitespace' - all RET, TAB, SPACE, etc., are ignored, everything that would not produce visible output on a screen.
+That means if you hit RET, TAB, SPACE, they will be ignored, and scanf will still wait for your integer.
+If you use another key, like any character, it is clear that this is not going to be an integer, and it will stop reading and return to the program (with a status of 0 = zero successful assignments).There are a lot of possible ways to catch this.
+See this, for instance: 
+#include<stdio.h>
+
+int main(void){
+    char enterCheck;
+    int check;
+
+    do{
+        printf("Hit Enter:> ");
+        if((scanf("%c",&enterCheck)) == 1){
+
+            if (enterCheck == 10){
+                printf("You pressed ENTER\n");
+            }else{
+                printf("You didn't press ENTER\n\n");
+                while((check = getchar()) != 0 && check != '\n');
+            }
+        }else{
+            printf("There was an Error!\n");
+        }
+    }while(enterCheck != 10);
+    return 0;
+}
+
+Output:
+michi@michi-laptop ~ $ ./program 
+Hit Enter:> dsadas
+You didn't press ENTER
+
+Hit Enter:> 12
+You didn't press ENTER
+
+Hit Enter:> 
+You pressed ENTER
+
+So as you can see, the program asks for ENTER key. If you don't hit it, it will ask again, and again.
+Now take a closer look, think and try to change this program to do what you need. Think how you would do it when you need to check if user pressed Enter.Two different definitions of a priority queue?I don't understand if both of the following definitions of a priority queue are correct:
+1.
+-ascending priority queue - elements are inserted arbitrarily, but after deletion, the smallest element is removed (assuming that data is an integer).
+-descending priority queue - elements are inserted arbitrarily, but after deletion, the largest element is removed (assuming that data is an integer).
+Examples for each:
+5 15 10 -> after dequeue() -> 15 10
+15 5 10 -> after dequeue() -> 5 10
+
+2.
+Every element of priority queue has a priority by which deletion is done.
+There can be two cases. First, element with the highest priority is removed. Second, element with the lowest priority is removed.
+Clearly, this is different from the first definition. If we assign priorities 6,3,12 to numbers 15, 10, 5, then after dequeue() operation there are two cases. If element with the lowest priority is removed, then the queue is 15,5 (10 is removed).  If element with the highest priority is removed, then the queue is 15,10 (5 is removed). 
+Also, if element of a queue aren't numbers (strings, for example), then the first definition is useless.
+Is that correct?
+Question: Are both definitions correct? It seems to me that the first is only usable for numbers but even then it violates the priority from the second definition. Could someone explain this?
+Here are two implementations for both definitions in C:
+           //1. DEFINITION//
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#define MAX 6
+
+int intArray[MAX];
+int itemCount = 0;
+
+int peek(){
+   return intArray[itemCount - 1];
+}
+
+bool isEmpty(){
+   return itemCount == 0;
+}
+
+bool isFull(){
+   return itemCount == MAX;
+}
+
+int size(){
+   return itemCount;
+}
+
+void insert(int data){
+   int i = 0;
+
+   if(!isFull()){
+      // if queue is empty, insert the data
+      if(itemCount == 0){
+         intArray[itemCount++] = data;
+      }else{
+         // start from the right end of the queue
+
+         for(i = itemCount - 1; i >= 0; i-- ){
+            // if data is larger, shift existing item to right end
+            if(data > intArray[i]){
+               intArray[i+1] = intArray[i];
+            }else{
+               break;
+            }
+         }
+
+         // insert the data
+         intArray[i+1] = data;
+         itemCount++;
+      }
+   }
+}
+
+int removeData(){
+   return intArray[--itemCount];
+}
+
+int main() {
+
+   insert(3);
+   insert(5);
+   insert(9);
+   insert(1);
+   insert(12);
+
+   int num = removeData();
+   printf("Element removed: %d\n",num);
+
+   return 0; 
+}
+
+             //2. DEFINITION//
+
+#include<stdio.h>
+#include<stdlib.h>
+#define SIZE 5            /* Size of Queue */
+int f=0,r=-1;       /* Global declarations */
+typedef struct PRQ
+{
+    int ele;
+    int pr;
+}PriorityQ;
+
+PriorityQ PQ[SIZE];
+
+PQinsert(int elem, int pre)
+{
+    int i;       /* Function for Insert operation */
+    if( Qfull()) printf("\n\n Overflow!!!!\n\n");
+    else
+    {
+        i=r;
+        ++r;
+        while(PQ[i].pr >= pre && i >= 0) /* Find location for new elem */
+        {
+            PQ[i+1]=PQ[i];
+            i--;
+        }
+        PQ[i+1].ele=elem;
+        PQ[i+1].pr=pre;
+    }
+}
+
+PriorityQ PQdelete()
+{                      /* Function for Delete operation */
+    PriorityQ p;
+    if(Qempty()){ printf("\n\nUnderflow!!!!\n\n");
+    p.ele=-1;p.pr=-1;
+    return(p); }
+    else
+    {
+        p=PQ[f];
+        f=f+1;
+        return(p);
+    }
+}
+int Qfull()
+{                     /* Function to Check Queue Full */
+    if(r==SIZE-1) return 1;
+    return 0;
+}
+
+int Qempty()
+{                    /* Function to Check Queue Empty */
+    if(f > r) return 1;
+    return 0;
+}
+
+display()
+{                  /* Function to display status of Queue */
+    int i;
+    if(Qempty()) printf(" \n Empty Queue\n");
+    else
+    {
+        printf("Front->");
+        for(i=f;i<=r;i++)
+            printf("[%d,%d] ",PQ[i].ele,PQ[i].pr);
+        printf("<-Rear");
+    }
+}
+
+main()
+{                         /* Main Program */
+    int opn;
+    PriorityQ p;
+    do
+    {
+        printf("\n ### Priority Queue Operations(DSC order) ### \n\n");
+        printf("\n Press 1-Insert, 2-Delete,3-Display,4-Exit\n");
+        printf("\n Your option ? ");
+        scanf("%d",&opn);
+        switch(opn)
+        {
+        case 1: printf("\n\nRead the element and its Priority?");
+            scanf("%d%d",&p.ele,&p.pr);
+            PQinsert(p.ele,p.pr); break;
+        case 2: p=PQdelete();
+            if( p.ele != -1)
+                printf("\n\nDeleted Element is %d \n",p.ele);
+            break;
+        case 3: printf("\n\nStatus of Queue\n\n");
+            display(); break;
+        case 4: printf("\n\n Terminating \n\n"); break;
+        default: printf("\n\nInvalid Option !!! Try Again !! \n\n");
+            break;
+        }
+        printf("\n\n\n\n  Press a Key to Continue . . . ");
+        getch();
+    }while(opn != 4);
+}A priority queue is a data structure holding elements (like any data structure) as well as their priority. This is your second definition.
+However, in some cases, the elements actually represent their own priority. This is your first definition : sometimes, you just need to store a bunch of unordered numbers and retrieve them in order. Note that in this case, elements are not necessarily numbers. Other data types might have a property that can be used as priority.Getting 'access denied' when trying to access an airport RSS feedI'm trying to access an airport RSS feed using the curl library in C. Whenever I try to access it, though, I get access denied error. The following is the code I'm using. It's almost identical to the example code at https://curl.haxx.se/libcurl/c/simple.html:
+#include <stdio.h>
+#include <curl/curl.h>
+
+int main(int argc, char **argv)
+{
+        CURL *curl;
+        CURLcode res;
+        char *feed_addr = "http://w1.weather.gov/xml/current_obs/KUCP.rss";
+        //airport not in the state I live
+
+        curl = curl_easy_init();
+        if(curl) {
+                curl_easy_setopt(curl, CURLOPT_URL, feed_addr);
+
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+                // Perform the request, res will get the return code
+                res = curl_easy_perform(curl);
+                // Check for errors
+                if(res != CURLE_OK) {
+                        fprintf(stderr, "curl_easy_perform() failed: %s\n",curl_easy_strerror(res));
+                }
+
+                // always cleanup
+                curl_easy_cleanup(curl);
+        }
+        return 0;
+}
+
+I've tried this with other websites besides weather.gov (google, youtube, mit.edu) and they all work just fine. But when I tried this, even with other airport RSS feeds (which can be found at http://w1.weather.gov/xml/current_obs/seek.php?state=pa&Find=Find), I get the same access denied error. I also get the same error when I set feed_addr to any weather.gov page. 
+To make this stranger, when I tried to access the feed using Python3's urllib.request module, it worked just fine. I can also access it just fine with Google Chrome. So I can rule out the idea that it doesn't want me accessing the feed.
+Is there something that I'm missing? Is there a way to get the feed via the curl library? Or is there a way using a different library?Answering my own question (I did not originally plan to, but I solved the issue before someone else answered):
+So here is the code that I got to work
+#include <stdio.h>
+#include <curl/curl.h>
+
+int main(int argc, char **argv)
+{
+        CURL *curl;
+        CURLcode res;
+        char *feed_addr = "http://w1.weather.gov/xml/current_obs/KUCP.rss";
+        //airport not in the state I live    
+
+        curl = curl_easy_init();
+        if(curl) {
+                curl_easy_setopt(curl, CURLOPT_URL, feed_addr);
+
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+                //line that solved my issue
+                curl_easy_setopt(curl, CURLOPT_USERAGENT, <string>);
+                /**
+                 * The line as written will not work.
+                 * I'm only using <string> as a stand-in for some personal information
+                 * If you're having the same issue as I did, I explain how to solve it under the code
+                 */
+
+                // Perform the request, res will get the return code
+                res = curl_easy_perform(curl);
+                // Check for errors
+                if(res != CURLE_OK) {
+                        fprintf(stderr, "curl_easy_perform() failed: %s\n",curl_easy_strerror(res));
+                }
+
+                // always cleanup
+                curl_easy_cleanup(curl);
+        }
+        return 0;
+}
+
+The way I solved this was finding a site that printed out my HTTP request. In this case, it was http://rve.org.uk/dumprequest. I visited the site like normal in one tab, and I used the program to get the source, then launched that in another tab. That was when I saw that several fields were present when I manually opened the page, but absent when I used the code. 
+So, I looked at curl_easy_setopt to see if there was a way to set those fields. It turns out, curl_easy_setopt has documentation for that and many more at the website https://curl.haxx.se/libcurl/c/curl_easy_setopt.html. At the suggestion of one of the comments, I looked at CURLOPT_USERAGENT first.
+Since that one took a char *, I found the line in the HTTP request that started with User-Agent:, copy-and-pasted the rest, and that was <string> in the above line.
+So if the request included the line:
+User-Agent: Lord Voldemort (Tom Marvolo Riddle)
+
+The line I included would be:
+curl_easy_setopt(curl, CURLOPT_USERAGENT, "Lord Voldemort (Tom Marvolo Riddle)");CPSID i assembly instruction not supported by Cortex M0I'm developing code for a Cortex M0 using FreeRTOS and eclipse with the AC6 plugin. At the end of my tasks, I'm using an assert to determine if the watermark of my task is greater than the specified task size. The macro I use for my assert looks like this:
+#define HMI_DBG_ASSERT(x) if ((x) == 0) {taskDISABLE_INTERRUPTS(); \
+                  HAL_GPIO_WritePin(ASSERT_LED_GPIO_Port, ASSERT_LED_Pin, GPIO_PIN_SET); \
+                  for( ;; );}
+
+My tasks look like this:
+for(;;)
+{
+    //some
+    //code
+    uxHighWaterMark = uxTaskGetStackHighWaterMark( NULL );
+    HMI_DBG_ASSERT(uxHighWaterMark >= WDG_STACK_SIZE_WATERMARK_WORD);
+}
+
+This compiles and works perfectly! My issue is that I'm working on common code with another developer, and he used a macro that is almost identical to mine:
+#define CMN_DBG_ASSERT(x) if ((x) == 0) {taskDISABLE_INTERRUPTS(); \
+                  HAL_GPIO_WritePin(ASSERT_LED_GPIO_Port, ASSERT_LED_Pin, GPIO_PIN_SET); \
+                  for( ;; );}
+
+When I call this macro, my compiler returns the following error:
+selected processor does not support `cpsid i' in Thumb mode
+
+the "taskDISABLE_INTERUPTS();" macro is defined by FreeRTOS, and calls the following assembly instruction:
+__asm volatile( " cpsid i " )
+
+I find it weird that my compiler doesn't complain with my other macro, but with this one it does. Also, I tried using my HMI_DBG_ASSERT in the .c file where my CMN_DBG_ASSERT is called, and I get the same error. I made sure that my code includes the file correctly and my inclusion path in eclipse is specified. 
+Cortex-M wiki says that "CPSIE and CPSID also don't exist because ARM instruction set is missing from Cortex-M. Other CPS instructions still exists in the Cortex-M."
+ARM's website does have a specification for the CPSIE and CPSID in their documentation for Cortex-M0:
+http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dui0497a/BABHBAAB.html
+In any case, the macro has been called before and it worked fine, it's just really weird that my compiler is only complaining now. A colleague of mine using IAR Cortex-M edition tried using the macro and it worked fine... I'm starting to think its another strange eclipse problem.
+Can anybody shed some light on the issue I'm having?Solved. Somehow my folder with the common code had a different build setting than the other folders in my project, and the -mcpu flag was not there. To reset build configuration to default:
+Right-click folder -> Resource Configurations -> Reset to DefaultWhy to pass extern struct to function in C? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Are global variables bad? [closed]
+
+                                (28 answers)
+                            
+
+Closed 5 years ago.
+
+
+
+I have seen an example where someone has passed an extern struct to a function in C. Is there a good reason to do this instead of using the extern struct without passing it as a parameter? Is this solution more encapsulated?
+//Test.h
+struct TEST_STRUCT
+{
+    int   member;                                                 
+};
+extern struct TEST_STRUCT test_struct; 
+
+//Test.c
+struct TEST_STRUCT test_struct = {0};   
+
+Now I can decide to pass this test_struct to my function or to set my "member" variable in my function very comfortable like this:
+test_struct.member = 10;It is generally better to avoid global variables and to pass the information needed by a function to that function using parameters rather than relying on global variables.  All else apart, you can only have one global variable; you may have many functions that need to call the one function with different values at different times.  However, it is hard to tell whether another function is relying on the current value of the global variable.
+So, yes, passing (a pointer to) the structure explicitly is generally better referencing the global variable — it encapsulates the information better.VS2010 - Debug win32 console application using cmd.exeI am new to C programming and I'm currently developing a simple Win32 console application to help me learn.  I'm doing this at work and they have provided me with Visual Studio 2010.  Our work computers are restricted so I do not have the option to install additional software or make changes which require admin access.
+While attempting to debug my program, I discovered that there are several options available.  The two below are the ones I want to use:
+
+Start Debugging
+Start Without Debugging
+
+When I pick option 1, the application is launched directly (as if I'd double clicked the .exe file).  However, when I pick option 2, the application is launched indirectly via cmd.exe.  Also, at the point where the application would normally terminate, a line of text comes up which says 'Press any key to continue'.  That keeps the console open until I press another key.
+Is there a way to to modify the settings in Visual Studio so that option 1 behaves the same as option 2 but still allows debugging?  If not, are there any other workarounds which will accomplish the same thing and can be initiated with a single keyboard shortcut?Unfortunatelly, I don't know any "out-of-the-box" (see alternative below) way to accomplish the same thing with a single keybard command but the following is what I think could be help you:
+
+Add a call to MessageBox or _getch or something else to your code to pause execution at this point until user clicks a button or presses a key
+Start your application using 2nd method ("Without Debugging")
+When you see message box or user input prompt created in step 1 DO NOT continue yet
+In Visual Studio under menu "Debug" invoke "Attach to process...".
+In the list of currently running processes find your application. You can recognize it by message box title or user prompt or by process ID. Select that process and click "Attach" button
+After you will see that VS is attached to that process switch to application (cmd window) and click button or press a key to continue execution. From that point your application is running under debugger
+
+If you really need a single command to do all this I think you'll need to write your own VS macro. If you need help with such macro it is probaly needs to be a different question.
+[EDIT]
+You said in your question that you are with VS2010, so the following is probably not an option for you, but just in case I'll add it here:
+If you were using VS2013 or (2015) you could use 
+Child Process Debugging Power Tool (another link), which will allow you to specify cmd $(TargetPath) as "command" and then use your 1st option to debug cmd together with its child process, which will happen to be your process (screenshot from VS2012, but the same option exsists in VS versions)Importing a CSV list to an array structure in CSo i'm working on a class project that is going to manage a stores inventory. The program will need to remove/add products as well as update stock counts. When the program runs the structure array needs to be initialized by a inventory file that its values are separated by commas which saves all the data after each use.
+Here is the file data. 
+1000,1.49,3.79,10,0,Fish Food
+2000,0.29,1.59,100,1,Angelfish
+2001,0.09,0.79,200,1,Guppy
+5000,2.40,5.95,10,0,Dog Collar (Large)
+6000,49.99,129.99,3,1,Dalmatian Puppy
+
+Here is the structure layout.
+    struct inventory_s
+    {
+      int productNumber;
+      float mfrPrice;
+      float retailPrice;
+      int numInStock;
+      char liveInv;
+      char productName[PRODUCTNAME_SZ];
+    }; 
+
+And here is the code
+int fileData()
+{
+
+FILE* pFile;
+char *buf = malloc(MAX_INVENTORY); // MAX INVENTORY = 50
+char *info;
+if ( ( pFile = fopen( "inventory.txt", "r" ) ) == NULL ) //Reading a file
+{
+    printf( "File could not be opened.\n" );
+}
+
+int i = 0;
+while (fgets(buf, MAX_INVENTORY, pFile) != NULL)
+{
+    if ((strlen(buf)>0) && (buf[strlen (buf) - 1] == '\n'))
+        buf[strlen (buf) - 1] = '\0';
+
+    info = strtok(buf, ",");
+    inventory[i].productNumber = atoi(info);
+
+    info = strtok(buf, ",");
+    inventory[i].mfrPrice = atof(info);
+
+     info = strtok(NULL, ",");
+    inventory[i].retailPrice = atof(info);
+
+      info = strtok(NULL, ",");
+    inventory[i].numInStock = atoi(info);
+
+    info = strtok(NULL, ",");
+    strcpy(inventory[i].liveInv, info);
+
+    info = strtok(NULL, ",");
+    strcpy(inventory[i].productName, info);
+
+
+    printf("%i, %f, %f, %i, %s, %s \n", inventory[i].productNumber , inventory[i].mfrPrice, inventory[i].retailPrice , inventory[i].numInStock, inventory[i].liveInv, inventory[i].productName );
+
+    i++;
+}
+
+fclose(pFile);
+return 0;
+}
+
+Right now I dont get anything if I run the code, but if I run only up to the first initialization
+info = strtok(buf, ",");
+inventory[i].productNumber = atoi(info);
+
+I get all the first values assigned correctly.Continuing from the comment, It is hard to tell without seeing your entire code where the issue may be. However, the thing that jumps out is there is no need to strip the trailing '\n' from buf before calling strtok. You are better served by using a delimiter of ",\n" and letting strtok handle the final string in each line.
+A short example would be:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum { PRODUCTNAME_SZ = 32, MAXINV = 128, MAXC = 512 };
+
+typedef struct {
+    int productNumber;
+    float mfrPrice;
+    float retailPrice;
+    int numInStock;
+    char liveInv;
+    char productName[PRODUCTNAME_SZ];
+} inventory_s; 
+
+int main (int argc, char **argv) {
+
+    inventory_s *inv = NULL;
+    char buf[MAXC] = "", *delim = ",\n";
+    size_t allocsz = MAXINV, idx = 0;
+    FILE *fp = argc > 1 ? fopen (argv[1], "r") : stdin;
+
+    if (!fp) {  /* validate file open for reading */
+        fprintf (stderr, "error: file open failed '%s'.\n", argv[1]);
+        return 1;
+    }
+
+    if (!(inv = malloc (sizeof *inv * allocsz))) {
+        fprintf (stderr, "error: virtual memory exhausted.\n");
+        return 1;
+    }
+
+    while (fgets (buf, MAXC, fp)) { /* read each line */
+        char *p = buf;
+        size_t val = 0;     /* tokenize line with strtok */
+        for (p = strtok (p, delim); p; p = strtok (NULL, delim))
+            switch (val) {  /* switch controls assignment */
+                case 0 :    inv[idx].productNumber = (int)strtol (p, NULL, 10);
+                            val++; break;
+                case 1 :    inv[idx].mfrPrice = strtof (p, NULL);
+                            val++; break;
+                case 2 :    inv[idx].retailPrice = strtof (p, NULL);
+                            val++; break;
+                case 3 :    inv[idx].numInStock = (int)strtol (p, NULL, 10);
+                            val++; break;
+                case 4 :    inv[idx].liveInv = (char)strtol (p, NULL, 10);
+                            val++; break;
+                case 5 :    strncpy (inv[idx].productName, p, PRODUCTNAME_SZ);
+                            inv[idx].productName[PRODUCTNAME_SZ-1] = 0; break;
+            }
+        if (val != 5) {     /* validate all struct members filled */
+            fprintf (stderr, "error: incomplete parse of values line: %zu\n",
+                     idx+1);
+            return 1;
+        }
+
+        if (++idx == allocsz) { /* realloc when allocsz reached */
+            void *tmp = realloc (inv, (allocsz + MAXINV) * sizeof *inv);
+            if (!tmp) {
+                fprintf (stderr, "error: realloc - virtual memory exhausted.\n");
+                break;  /* leave read loop preserving exhisting data in inv */
+            }
+            inv = tmp;
+            allocsz += MAXINV;
+        }
+    }
+
+    for (size_t i = 0; i < idx; i++)
+        printf ("%5d  %6.2f  %7.2f  %4d  %d  %s\n", inv[i].productNumber,
+                inv[i].mfrPrice, inv[i].retailPrice, inv[i].numInStock,
+                inv[i].liveInv, inv[i].productName);
+
+    free (inv); /* free allocated memory */
+
+    if (fp != stdin) fclose (fp);     /* close file if not stdin */
+
+    return 0;
+}
+
+note: if your liveInv value is really just a single digit, then you can replace (char)strtol (p, NULL, 10); with simply *p - '0';.
+(You may need to set PRODUCTNAME_SZ larger depending on your full dataset)
+Example Use/Output
+$ ./bin/inventory <dat/inventory.txt
+ 1000    1.49     3.79    10  0  Fish Food
+ 2000    0.29     1.59   100  1  Angelfish
+ 2001    0.09     0.79   200  1  Guppy
+ 5000    2.40     5.95    10  0  Dog Collar (Large)
+
+Look it over and let me know if you have any questions.I'm a Java Programmer but Now Building Its so called Java Collections in C &C++. This code is a Part of My Project "Big Data Analysis Using C & C++".
+I already had the code, so, modified for your data. It can take any no. of columns. Just pass opened file pointer & separation type.
+You can get a particular column just by removing all the if part of j (ex. if(j==1), etc) to your particular column. Most people forget this. :-D
+#include <iostream>
+#include <stdio.h>
+
+int MAX=1000; // Size of Single String
+void analyse(FILE *fp, char separation) {
+/* fp is file pointer (already opened)
+ * separation is how data is separated (' ' or '\t' or ',')
+ */
+    char str[MAX],ch;
+    int i=-1;
+    long j=0;
+// J is Column. This Can Be Applied For Any No. of Columns.
+    cout<<"Reading File.."<<endl;
+    while((ch=getc(fp))!=EOF) {
+        i++;
+        if(ch!=separation && ch!='\n')
+            str[i] = ch;
+        else {
+            str[i] = '\0';
+            if(ch == separation || ch == '\n') {
+                j++;
+            }
+// At Each if of j, you can write you code to store them.
+            if(j == 1) {
+                cout<<"Product No. : "<<str<<endl;
+            }
+            if(j == 2) {
+                cout<<"MFR Price : "<<str<<endl;
+            }
+            if(j == 3) {
+                cout<<"Retail : "<<str<<endl;
+            }
+            if(j == 4) {
+                cout<<"Num in Stock : "<<str<<endl;
+            }
+            if(j == 5) {
+                cout<<"LiveInv : "<<str<<endl;
+            }
+            if(j == 6) {
+                cout<<"Product Name : "<<str<<endl;
+            }
+            cout<<"-------------------------------------"<<endl;
+            if(ch == '\n')
+                j = 0;
+            i = -1;
+        }
+    }
+    cout<<"Reading Completed.."<<endl;
+}add library on makefile [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 5 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I execute the guide of "Using a “Real” Cross-Compiler" descript on the link. In the botton of the guide there is a standard makefile. I write a simple program write in C and with the comand make it run. Now I would to write a program with the library "ev3c.h". How can I add this library in the makefile?If you're using gcc or clang, pass -I  /home/daniele/ev3c/include to it in your recipe.
+That'll allow you to #include from that path with #include "someheader".
+As far as Make-treatment of include files is concerned, they're usually implicit dependencies—that is you usually don't want to mention them in your dependencies explicitly, because compilers such as clang or gcc can detect them and add them to the appropriate Makefile rules for you. 
+-MMD -MF somefile allows you to do this kind of #include dependency detection with gcc or clang:
+For example:
+%.o: %.c
+    $(COMPILE.c) -I /home/daniele/ev3c/include $(OUTPUT_OPTION) $< -MMD -MF $(patsubst %.o,%.o.d,$@)
+
+-include $(wildcard *.o.d)
+
+This will have the compiler detect include dependencies for each compiled c file and the -include line will add these dependencies to your Makefile so that if your C file includes "foo.h" and foo.h changes, make will trigger a recompile even if you don't mention foo.h  as an explicit dependency.Your .h file is header. Headers are included in the source code, not at compile time like libraries:
+#include "ev3c.h"
+
+for example.
+A library has a different extension, like .a for example. You would add libev3c.a with:
+-lev3c
+
+in your makefile on the line that calls your compiler. However, you have a header, so simply add #include "ev3c.h" to the top of your source code (the .c file)Linux/C: Check for user credentials in ProgramI need to secure a section in my application making sure only the owner of the account can change settings. Is there any way to ask for users credentials like on the loginscreen to unlock the page in the application? Is it possible with PAM?
+#include <security/pam_appl.h> 
+
+#include <security/pam_misc.h> 
+
+#include <stdio.h> 
+
+int main()
+{
+    pam_handle_t *pamh;
+    struct pam_conv pamc;
+
+    pamc.conv = &misc_conv;
+    pamc.appdata_ptr = NULL;
+
+    pam_start("su", getenv("USER"), &pamc, &pamh);
+
+    if (pam_authenticate (pamh, 0) != PAM_SUCCESS)
+    {
+        printf("Nope!\n");
+    }
+    else
+    {
+        printf("Good job!\n");
+    }
+    pam_end(pamh, 0);
+    return 0;
+}
+
+I managed to put this together real quick. Is there a way to give pam the credentials myself? I want the passwort to be asked by GTK in a dialog and then pass it along to PAM if possible...Why is XORing a string in c giving me garbage values?I want to make a simple program which does the following,
+
+Take Input string from user, char ip[50]. 
+XOR each character
+    of the string with the character '0'.
+Display the thus generated
+    Cipher Text, char op[50].
+And using this string(op), again
+    decipher the string and give the output same as input string.
+    char rv[50].
+Display the deciphered text.
+
+So, for doing this I wrote the code below,
+#include<stdio.h>
+#include<string.h>
+void main(){
+    int i=0,len;
+    char ip[50],op[50],rv[50],b='0';
+    printf("Enter the original text: ");
+    fgets(ip,50,stdin);
+    len=strlen(ip);
+    //ip is input text
+    //op is output cypher text
+    //rv is again the input text obtained by XORing '0'
+    while(i<len-1){
+        op[i]=(ip[i++]^b); //XORing the input character with '0' and storing it in output string ^__^
+    }
+    op[i]='\0';
+    printf("\nThe Cypher Text is: ");
+    i=0;
+    puts(op);
+    while(i<len-1){
+        printf("%c",op[i++]); 
+    }
+    i=0;
+
+    while(i<len-1){
+        rv[i]=(op[i++]^b);//XORing the output text again in hope of getting the input text back -__-
+    }
+    rv[i]='\0';
+    printf("\nThe Original text again is: ");
+    puts(rv);
+    i=0;
+    printf("\n");
+    while(i<len-1){
+        printf("%c",rv[i++]);
+    }
+}
+
+but the output is always
+Output
+C:\Users\cypher>gcc cypher.c
+
+C:\Users\cypher>a
+Enter the original text: qwerty
+
+The Cypher Text is: ▄AGUBD
+▄AGUBD
+The Original text again is: Ω∞qwer
+
+Ω∞qwer
+
+Note: using puts() is just to check for any errors.
+Any help would be appreciated, Thanks.Statements  
+op[i]=(ip[i++]^b); 
+
+and  
+rv[i]=(op[i++]^b);  
+
+invokes undefined behavior because side effect on i in op[i++] is unsequenced relative to the value computation of i in rv[i].   
+Change them to  
+op[i]=(ip[i]^b);
+i++; 
+
+and
+rv[i]=(op[i]^b);
+i++;Statements like this
+    op[i]=(ip[i++]^b); //XORing the input character with '0' and storing it in output string ^__^
+
+have undefined behavior because there is no sequence point between expressions i and i++ in the left and right sides of the assignment. 
+Moreover it would be better to remove the appended new line character for the input string as for example
+ip[strcspn( ip, "\n" )] = '\0';
+
+Thus the condition of the loop in this case should look like
+while ( i < len){
+        ^^^^^^^
+
+Here is a demonstrative program
+#include <stdio.h>
+#include <string.h>
+
+#define N   50
+
+int main(void) 
+{
+    char ip[N];
+    char op[N];
+    char rv[N];
+    char c = '0';
+    size_t i, len;
+
+    printf( "Enter the original text: " );
+    fgets( ip, sizeof( ip ), stdin );
+
+    ip[strcspn( ip, "\n" )] = '\0';
+
+    len = strlen( ip );
+
+    i = 0;
+    for ( ; i < len; i++ ) op[i] = ip[i];
+    op[i] = '\0';
+
+    i = 0;
+    for ( ; i < len; i++ ) rv[i] = op[i];
+    rv[i] = '\0';
+
+    puts( ip );
+    puts( rv );
+
+    return 0;
+}
+
+the program output might look like
+Enter the original text: querty
+querty
+quertyThis program implements a coder that is it's own decoder.  But demonstrating that isn't convincing if you use separate code for coding and decoding -- you should define the coder/decoder as a function that you call twice to demonstrate that it truely is it's own inverse.
+Specific problems with your code: you use fgets() which leaves the trailing newline (\n) in place which messes up both your encoding and your formatting -- I suggest you remove the trailing newline (i.e. replace it with '\0') to make everything simpler; others have mentioned issues with using i and i++ in the same statement, you could have avoided this by using a for loop instead of a while loop.
+Here's a potential rework using the ideas mentioned above:
+#include <stdio.h>
+#include <string.h>
+
+#define BUFFER_SIZE (50)
+
+void encode_decode(char key, const char *input, char *output) {
+    size_t i = 0, input_length = strlen(input);
+
+    // XOR the input character with key and store it in output string ^__^
+    for (i = 0; i < input_length; i++) {
+        output[i] = input[i] ^ key; 
+    }
+
+    output[i] = '\0';
+}
+
+int main() {
+    char key = '0', input[BUFFER_SIZE], output[BUFFER_SIZE], reverse[BUFFER_SIZE];
+
+    printf("Enter the original text: ");
+
+    (void) fgets(input, BUFFER_SIZE, stdin);
+
+    *strrchr(input, '\n') = '\0';
+
+    encode_decode(key, input, output);
+
+    printf("The Cypher Text is: %s\n", output); 
+
+    // reverse is the input text obtained by again XORing with key
+    encode_decode(key, output, reverse);
+
+    printf("The Original text again is: %s\n", reverse);
+
+    return 0;
+}
+
+EXAMPLE
+> ./a.out
+Enter the original text: elephant
+The Cypher Text is: U\U@XQ^D
+The Original text again is: elephant
+>Set a function argument with function pointersIn C is there a way to set a function argument using function pointers such that all calls to that function pointer just use the set parameter? As an example, is it possible to do something like the code below?
+void do_something(int *a, int *b, int *c){
+    *a = *c - 5;
+    *b = *c - 10;
+}
+
+typedef void (*funcptr)(int *a, int *b, int *c);
+
+int main(){
+  int num = 5;
+  funcptr f = do_something(c=&num); // c = 5 for all calls to f(a, b)
+  int *a; int *b;
+  f(a, b); //a = 0, b = -5
+
+  num = 10;
+  f = do_something(c=&num); // c = 10 for all calls to f(a, b)
+  f(a, b); //a = 5, b = 0
+}
+
+This seems possible with external C libraries like Blocks and FFCALL, but it appears I'd need to set a, b, and c instead of setting a single argument.no, this is not a language feature of C or of the C calling convention.
+You'll need to construct function that calls your function pointer with that argument yourself; external libraries that provide such functionality are available, as you've noticed.
+Another way, though I'm personally not overly fond of that is using <stdarg> and varargs, letting your function do one thing or another, depending on the number of arguments passed.
+In C frameworks, you'll often find a lot of functions that work in some kind of context. That is often even used in implementation of object-oriented programming. I don't know the larger picture of what you want to implement, but often questions like these are rised in a context where someone wants to do something that resembles function overloading in C++; if that's the case, you might really just make functions that take a "state/context" argument, and further arguments, which might or might not be relevant, depending on the state.C has no such features like default arguments or function overloading.
+Moreover in this declaration
+funcptr f = do_something;
+
+the initializer shall be a function pointer.Standard C has no such facility. Compilers offer extensions that allow this though. Nested functions in GCC, Blocks in clang or via a library like CALLBACK in clisp or assembling your call via libffi.Rather than using function pointers, you would need a wrapper function that uses a global for state.
+void do_something(int *a, int *b, int c){
+    *a = c - 5;
+    *b = c - 10;
+}
+
+static int c_val = NULL;
+
+void do_something_wrap(int *a, int *b)
+{
+    do_something(a, b, c);
+}
+
+int main(){
+  int num = 5;
+  c_val = num;
+  int a; int b;
+  do_something_wrap(&a, &b); //a = 0, b = -5
+
+  num = 10;
+  c_val = num;
+  do_something_wrap(&a, &b); //a = 5, b = 0
+}[..] is there a way [..] ?
+
+There always is a way. The question is if it's worth the effort and possible downsides.
+The following is based on another answer I gave about deferred (that is, called e.g. at the end of scope) function execution.
+Start off with a unified type for a "partially applied function":
+struct partially_applied {
+  void * data; // parameters
+  void (*function)(void *); // function unpacking parameters and calling actual function
+  void (*store)(void *, char const *, void *); // storing parameters
+};
+typedef struct partially_applied * FUN;
+
+To make a function partially apply-able we need
+
+a struct holding the (eventually) already applied parameters (I added an init function and an allocation function)
+a function to unpack these and call the actual function
+a function to store ("partially apply") parameters
+
+Here we go:
+#define MAKE_PARTIAL(fn, N, ...) \
+struct partially_applied_ ## fn ## _data { \
+    DATA_DEF(N, __VA_ARGS__) \
+}; \
+\
+static void init_partially_applied_ ## fn ## _data (void * p) { \
+    struct partially_applied_ ## fn ## _data * data = p; \
+    DATA_INIT(N, __VA_ARGS__); \
+} \
+\
+static void * allocate_partially_applied_ ## fn ## _data (void) { \
+    void * data = malloc(sizeof(struct partially_applied_ ## fn ## _data)); \
+    if (data == NULL) { \
+        fprintf(stderr, "Allocation failure for " #fn " data\n"); \
+        exit(1); \
+    } \
+    init_partially_applied_ ## fn ## _data(data); \
+    return data; \
+} \
+\
+static void partially_applied_ ## fn (void * p) { \
+    struct partially_applied_ ## fn ## _data * data = p; \
+    if (DATA_CHECK(N, __VA_ARGS__)) { \
+        fn(DATA_ACCESS(N, __VA_ARGS__)); \
+    } else { \
+        fprintf(stderr, "Not all parameters for " #fn " are vaild\n"); \
+    } \
+} \
+\
+static void partially_applied_ ## fn ## _store ( \
+    void * p, char const * id, void * src) { \
+    struct partially_applied_ ## fn ## _data * data = p; \
+    DATA_STORE_CODE(N, __VA_ARGS__) \
+    fprintf(stderr, "Cannot store %s in " #fn "!\n", id); \
+}
+
+The above contains some macros. These depend on the number of macro arguments (which could be counted by the preprocessor, but I want to keep it simpler). To expand the correct macro (depending on the number of arguments) we need a little helper:
+#define SPLICE_2(l,r) l##r
+#define SPLICE_1(l,r) SPLICE_2(l,r)
+#define SPLICE(l,r) SPLICE_1(l,r)
+
+Now on to the macros. DATA_DEF defines the structure contents:
+#define DATA_DEF_0(...)
+#define DATA_DEF_1(type, name)      type name; bool name ## _valid;
+#define DATA_DEF_2(type, name, ...) type name; bool name ## _valid; DATA_DEF_1(__VA_ARGS__)
+#define DATA_DEF_3(type, name, ...) type name; bool name ## _valid; DATA_DEF_2(__VA_ARGS__)
+#define DATA_DEF_4(type, name, ...) type name; bool name ## _valid; DATA_DEF_3(__VA_ARGS__)
+// add more to support more parameters
+#define DATA_DEF(N, ...) SPLICE(DATA_DEF_,N)(__VA_ARGS__)
+
+DATA_INIT expands to code to initialize such a structure:
+#define DATA_INIT_0(...)
+#define DATA_INIT_1(t, name)      data->name ## _valid = false;
+#define DATA_INIT_2(t, name, ...) data->name ## _valid = false; DATA_INIT_1(__VA_ARGS__)
+#define DATA_INIT_3(t, name, ...) data->name ## _valid = false; DATA_INIT_2(__VA_ARGS__)
+#define DATA_INIT_4(t, name, ...) data->name ## _valid = false; DATA_INIT_3(__VA_ARGS__)
+// add more to support more parameters
+#define DATA_INIT(N, ...) SPLICE(DATA_INIT_,N)(__VA_ARGS__)
+
+DATA_CHECK expands to a condition testing if all arguments have been applied:
+#define DATA_CHECK_0(...) true
+#define DATA_CHECK_1(t, name)      data->name ## _valid
+#define DATA_CHECK_2(t, name, ...) data->name ## _valid && DATA_CHECK_1(__VA_ARGS__)
+#define DATA_CHECK_3(t, name, ...) data->name ## _valid && DATA_CHECK_2(__VA_ARGS__)
+#define DATA_CHECK_4(t, name, ...) data->name ## _valid && DATA_CHECK_3(__VA_ARGS__)
+// add more to support more parameters
+#define DATA_CHECK(N, ...) SPLICE(DATA_CHECK_,N)(__VA_ARGS__)
+
+DATA_ACCESS expands into code for passing the parameters to the actual function (actually it's only the comma separated arguments list):
+#define DATA_ACCESS_0(...)
+#define DATA_ACCESS_1(t, name)      data->name
+#define DATA_ACCESS_2(t, name, ...) data->name, DATA_ACCESS_1(__VA_ARGS__)
+#define DATA_ACCESS_3(t, name, ...) data->name, DATA_ACCESS_2(__VA_ARGS__)
+#define DATA_ACCESS_4(t, name, ...) data->name, DATA_ACCESS_3(__VA_ARGS__)
+// add more to support more parameters
+#define DATA_ACCESS(N, ...) SPLICE(DATA_ACCESS_,N)(__VA_ARGS__)
+
+And finally DATA_STORE_CODE expands into code to store the parameters:
+#define DATA_STORE_CODE_OP(type, name) \
+if (strcmp(id, #name) == 0) { data->name = *((type *) src); data->name ## _valid = true; return; }
+
+#define DATA_STORE_CODE_0(...)
+#define DATA_STORE_CODE_1(type, name)      DATA_STORE_CODE_OP(type, name)
+#define DATA_STORE_CODE_2(type, name, ...) DATA_STORE_CODE_OP(type, name) DATA_STORE_CODE_1(__VA_ARGS__)
+#define DATA_STORE_CODE_3(type, name, ...) DATA_STORE_CODE_OP(type, name) DATA_STORE_CODE_2(__VA_ARGS__)
+#define DATA_STORE_CODE_4(type, name, ...) DATA_STORE_CODE_OP(type, name) DATA_STORE_CODE_3(__VA_ARGS__)
+// more
+#define DATA_STORE_CODE(N, ...) SPLICE(DATA_STORE_CODE_,N)(__VA_ARGS__)
+
+Adding little helpers to allocate and free partially applied function structures (data is expected to be allocated by malloc here) ...
+FUN make_fun(void (*function)(void *), void (*store)(void *, char const *, void *), void * data) {
+    FUN f = malloc(sizeof(*f));
+    if (f == NULL) {
+        fprintf(stderr, "Allocation of FUN failed\n");
+        exit(1);
+    }
+    f->function = function;
+    f->store = store;
+    f->data = data;
+    return f;
+}
+void free_fun(FUN f) {
+    free(f->data);
+    free(f);
+}
+
+... we can go on to define a macro that actually makes an instance of a partially applied function:
+#define PARTIAL(fn) make_fun(&(partially_applied_ ## fn), \
+                             &(partially_applied_ ## fn ## _store), \
+                             allocate_partially_applied_ ## fn ## _data())
+
+Of course we want to be able to apply some arguments:
+#define APPLY(PFN, N, ...) \
+do { \
+    struct partially_applied * pfn = (PFN); \
+    DATA_STORE(N, __VA_ARGS__) \
+} while(0)
+
+The macro DATA_STORE expands into code to call the store functions multiple times, so that we can apply multiple arguments at once:
+#define DATA_STORE_OP(name, value) pfn->store(pfn->data, #name, &(value));
+#define DATA_STORE_0(...)
+#define DATA_STORE_1(name, value) DATA_STORE_OP(name, value)
+#define DATA_STORE_2(name, value, ...) DATA_STORE_OP(name, value) DATA_STORE_1(__VA_ARGS__)
+#define DATA_STORE_3(name, value, ...) DATA_STORE_OP(name, value) DATA_STORE_2(__VA_ARGS__)
+#define DATA_STORE_4(name, value, ...) DATA_STORE_OP(name, value) DATA_STORE_3(__VA_ARGS__)
+#define DATA_STORE(N, ...) SPLICE(DATA_STORE_,N)(__VA_ARGS__)
+
+Last but not least we want to be able to call such a function (this could also be a function, but well):
+#define CALL(fn) (fn)->function((fn)->data)
+
+Finally, an example:
+void foo(char * str, int i) {
+    printf("FOO| str = %s, i = %d\n", str, i);
+}
+void bar(float f, int i, size_t s) {
+    printf("BAR| f = %f, i = %d, s = %zu\n", f, i, s);
+}
+MAKE_PARTIAL(foo, 2, char *, string, int, integer)
+MAKE_PARTIAL(bar, 3, float, floating, int, INT, size_t, SOME_SIZE)
+
+
+int main() {
+    FUN f = PARTIAL(foo);
+    char * c = "Crazy";
+    APPLY(f, 1, string, c);
+    printf("doing other stuff\n");
+    FUN g = PARTIAL(bar);
+    size_t size = 99;
+    APPLY(g, 1, SOME_SIZE, size);
+    int answer = 42;
+    APPLY(f, 1, integer, answer);
+    answer = 21;
+    float pi = 3.14;
+    APPLY(g, 2, INT, answer, floating, pi);
+    CALL(f);
+    printf("done\n");
+    CALL(g);
+    printf("now completely done\n");
+    return 0;
+}
+
+Some downsides:
+
+macros. macros everywhere.
+Losing some type safety (in APPLY)
+Need for lvalues (APPLY(f, 1, integer, 42) does not work)if else statement inside while loop.(i m trying to insert a node at a given position in linked list.)void insertM(struct node **s,int pos,int n)
+   {    
+   struct node *temp,*e;
+   temp=(struct node *)malloc(sizeof(struct node));
+   temp->x=n;
+   temp->link=NULL;
+   int count=1;
+   e=*s;
+   while(e!=NULL)
+   {
+       if(count==pos)
+       {
+           temp->link=e->link;
+           e->link=temp;
+       }          
+       else
+       {
+           e=e->link;
+           count++;
+       }
+
+   }
+}
+
+If I remove the above else statement and put its content in the while loop after the if statement, the program works. But with the else statement it doesn't work. Why? What's wrong with the else statement?The problem is when count==pos gets true you have an infinite loop because you don't change e and count anymore. In other words, the execution will constantly take the TRUE-path of the if-statement and go on forever.
+You should add a break statement - like:
+   if(count==pos)
+   {
+       temp->link=e->link;
+       e->link=temp;
+
+       break;  // Break out of the while-loop as we are done
+   }          
+
+The reason your code worked without the else-part is that count and e was changed in every loop. So sooner or later you reached the end of the list and the loop terminated.
+However, for performance it is better to use the breakstatement.
+Also notice that your code has a bug when called with pos equal 1. You need to handle that as a special case and update *sThe reason why the else statement is causing an error is because when you finally find the target, count doesn't increment. Therefore, count will always equal pos and the loop never breaks. To better visualize this error, imagine trying to add a node at the first node starting at the while loop,
+e is not null so loop body is executed
+count == pos evaluates to true so temp is inserted after e
+else statement gets skipped so count stays at 1 and e stays at the first node
+e is not null so loop body is executed
+count == pos evaluates to true so temp is inserted after e
+
+As you can see, you're constantly adding temp after the front infinitely many times because count is never changing when you find the target node. To better understand these errors in the future, use a debugger.
