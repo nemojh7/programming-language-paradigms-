@@ -1,0 +1,3462 @@
+Fastest precise way to convert a vector of integers into floats between 0 and 1Consider a randomly generated __m256i vector. Is there a faster precise way to convert them into __m256 vector of floats between 0 (inclusively) and 1 (exclusively) than division by float(1ull<<32)?
+Here's what I have tried so far, where iRand is the input and ans is the output:
+const __m256 fRand = _mm256_cvtepi32_ps(iRand);
+const __m256 normalized = _mm256_div_ps(fRand, _mm256_set1_ps(float(1ull<<32)));
+const __m256 ans = _mm256_add_ps(normalized, _mm256_set1_ps(0.5f));The version below should be faster, compared to your initial version that uses _mm256_div_ps
+vdivps is quite slow, e.g. on my Haswell Xeon it’s 18-21 cycles latency, 14 cycles throughput. Newer CPUs perform better BTW, it’s 11/5 on Skylake, 10/6 on Ryzen.
+As said in the comments, the performance is fixable by replacing divide with multiply and further improved with FMA. The problem with the approach is quality of distribution. If you’ll try to get these numbers in your output interval by rounding mode or clipping, you’ll introduce peaks in probability distribution of the output numbers.
+My implementation is not ideal either, it doesn’t output all possible values in the output interval, skips many representable floats, especially near 0. But at least the distribution is very even.
+__m256 __vectorcall randomFloats( __m256i randomBits )
+{
+    // Convert to random float bits
+    __m256 result = _mm256_castsi256_ps( randomBits );
+
+    // Zero out exponent bits, leave random bits in mantissa.
+    // BTW since the mask value is constexpr, we don't actually need AVX2 instructions for this, it's just easier to code with set1_epi32.
+    const __m256 mantissaMask = _mm256_castsi256_ps( _mm256_set1_epi32( 0x007FFFFF ) );
+    result = _mm256_and_ps( result, mantissaMask );
+
+    // Set sign + exponent bits to that of 1.0, which is sign=0, exponent=2^0.
+    const __m256 one = _mm256_set1_ps( 1.0f );
+    result = _mm256_or_ps( result, one );
+
+    // Subtract 1.0. The above algorithm generates floats in range [1..2).
+    // Can't use bit tricks to generate floats in [0..1) because it would cause them to be distributed very unevenly.
+    return _mm256_sub_ps( result, one );
+}
+
+Update: if you want better precision, use the following version. But it’s no longer “the fastest”.
+__m256 __vectorcall randomFloats_32( __m256i randomBits )
+{
+    // Convert to random float bits
+    __m256 result = _mm256_castsi256_ps( randomBits );
+    // Zero out exponent bits, leave random bits in mantissa.
+    const __m256 mantissaMask = _mm256_castsi256_ps( _mm256_set1_epi32( 0x007FFFFF ) );
+    result = _mm256_and_ps( result, mantissaMask );
+    // Set sign + exponent bits to that of 1.0, which is sign=0, exponent = 2^0.
+    const __m256 one = _mm256_set1_ps( 1.0f );
+    result = _mm256_or_ps( result, one );
+    // Subtract 1.0. The above algorithm generates floats in range [1..2).
+    result = _mm256_sub_ps( result, one );
+
+    // Use 9 unused random bits to add extra randomness to the lower bits of the values.
+    // This increases precision to 2^-32, however most floats in the range can't store that many bits, fmadd will only add them for small enough values.
+
+    // If you want uniformly distributed floats with 2^-24 precision, replace the second argument in the following line with _mm256_set1_epi32( 0x80000000 ).
+    // In this case you don't need to set rounding mode bits in MXCSR.
+    __m256i extraBits = _mm256_and_si256( randomBits, _mm256_castps_si256( mantissaMask ) );
+    extraBits = _mm256_srli_epi32( extraBits, 9 );
+    __m256 extra = _mm256_castsi256_ps( extraBits );
+    extra = _mm256_or_ps( extra, one );
+    extra = _mm256_sub_ps( extra, one );
+    _MM_SET_ROUNDING_MODE( _MM_ROUND_DOWN );
+    constexpr float mul = 0x1p-23f; // The initial part of the algorithm has generated uniform distribution with the step 2^-23.
+    return _mm256_fmadd_ps( extra, _mm256_set1_ps( mul ), result );
+}First, no division, replace it with multiplication. While @Soonts might be good enough for you, I could only note due to the use of mapping to [1...2) interval, it produces uniform dyadic rationals of the form k/2−23, which is half of what could be generated. I prefer method from S.Vigna (at the bottom), with all dyadic rationals of the form k/2−24 being equally likely.
+Code, VC++2019, x64, Win10, Intel i7 Skylake
+#include <random>
+
+#include "immintrin.h"
+
+auto p256_dec_u32(__m256i in) -> void {
+    alignas(alignof(__m256i)) uint32_t v[8];
+    _mm256_store_si256((__m256i*)v, in);
+    printf("v8_u32: %u %u %u %u %u %u %u %u\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+}
+
+auto p256_dec_f32(__m256 in) -> void {
+    alignas(alignof(__m256)) float v[8];
+    _mm256_store_ps(v, in);
+    printf("v8_float: %e %e %e %e %e %e %e %e\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+}
+
+auto main() -> int {
+    const float c = 0x1.0p-24f; // or (1.0f / (uint32_t(1) << 24));
+
+    const int N = 1000000;
+
+    std::mt19937 rng{ 987654321ULL };
+
+    __m256 sum = _mm256_set1_ps(0.0f);
+
+    for (int k = 0; k != N; ++k) {
+        alignas(alignof(__m256i)) uint32_t rnd[8] = { rng(), rng(), rng(), rng(), rng(), rng(), rng(), rng() };
+
+        __m256i r = _mm256_load_si256((__m256i*)rnd);
+        __m256  q = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_srli_epi32(r, 8)), _mm256_set1_ps(c));
+
+        sum = _mm256_add_ps(sum, q);
+    }
+
+    sum = _mm256_div_ps(sum, _mm256_set1_ps((float)N)); // computing average
+
+    p256_dec_f32(sum);
+
+    return 0;
+}
+
+with output
+5.002970e-01 4.997833e-01 4.996118e-01 5.004955e-01 5.002163e-01 4.997193e-01 4.996586e-01 5.001499e-01(C Programming) How do I insert string into a character array and then print out all the elements of this array?I have this string that is presented in the form of character array temp. And I want to insert this character array to another array temp_list and then print out the contents of this array. In other words, storing many character arrays in a single array. Can anyone tell me if this is possible and how can I make it work?
+This is an example of what I am trying to accomplish:
+int main()
+{
+    char temp[5] = "begin";
+    char temp_list [10];
+    temp_list[0] = temp;
+
+    for (int i = 0; i < strlen(temp_list); i++)
+    {
+        printf("Labels: %s,", temp_list[i]);
+    }
+}
+
+When I run this program, it prints out gibberish.
+Any form of guidance would be very appreciated. Thank you.
+Edit:
+Thank you for the answers. They are all really helpful. But I have another question... what if I have multiple character arrays that I want to insert to temp_list? Using strcpy multiple times seem to not work, since I am assuming the function basically replaces the entire content of the temp_list with the string passed with strcpy?There are a bunch of misconceptions regarding strings. Your array temp needs to be big enough to also store the null-terminator, so it needs a size of at least 6 in this case:
+char temp[6] = "begin"; // 5 chars plus the null terminator
+
+To copy the string, use strcpy:
+char temp_list[10];
+strcpy(temp_list, temp);
+
+To print it, pass temp_list, not temp_list[i], also you don't need that loop:
+printf("%s\n", temp_list);
+
+The final program could look like this:
+int main()
+{
+    char temp[6] = "begin";
+    char temp_list[10];
+    strcpy(temp_list, temp);
+    printf("%s\n", temp_list);
+    return 0;
+}You have three problems here.  First, temp is not big enough to hold the string "begin".  Strings in C are null terminated, so this string actually takes up 6 bytes, not 5.  So make temp big enough to hold this string:
+char temp[6] = "begin";
+
+Or better yet:
+char temp[] = "begin";
+
+Which sizes the array exactly as needed for the string.  The second problem is here:
+temp_list[0] = temp;
+
+You're assigning an array (actually a pointer to the array's first element) to the first element of another array.  That's a type mismatch of assigning a char * to a char.  Even if the types matched, that's not how strings are copied.  For that, use the strcpy function:
+strcpy(temp_list, temp);
+
+Finally, you're not printing the result correctly:
+for (int i = 0; i < strlen(temp_list); i++)
+{
+    printf("Labels: %s,", temp_list[i]);
+}
+
+The %s format specifier expects a pointer to a char array in order to print a string, but you're passing in a single characters.  Mismatching format specifiers invokes undefined behavior.
+For printing single characters, use %c instead:
+for (int i = 0; i < strlen(temp_list); i++)
+{
+    printf("Labels: %c,", temp_list[i]);
+}
+
+Or you can get rid of the loop and just print the whole string using %s:
+printf("Labels: %s", temp_list);How can a user enter 10 elements in an array defined for 100 elements?Here, I want to take input from the user in an array. The condition is the array size should not exceed 100 elements. But, if the user has only 10 elements as input, what can he do? Because he will not be able to stop the loop after 10 elements as I have defined it for 100.   
+#include<stdio.h>
+#include<stdlib.h>
+
+int main()
+{
+    int* A;
+    int i;
+
+    A = (int*)malloc(100*(sizeof(A)));
+
+    for(i=0; i<100; i++)
+    {
+        scanf("%d", &A[i]);
+    }
+    return 0;
+}There's a few ways to do this. Here are two potential options:
+
+First, you could add a sentinel value that the user enters to stop input, such as a negative number, zero, or a non-number. Then check the input and break if you encounter your sentinel value.
+Secondly, have the user enter the number of values they wish to enter first, and make that the ending condition of your for loop. for(i=0; i != num_entries && i<100; i++)There needs to be some way for the user to tell the program that he's done inputting values.
+You could have the user first enter the number of values he wants to read:
+int count;
+printf("Number of values: ");
+int rval = scanf("%d", &count);
+
+if (rval == 1) {
+    for(i=0; i<count && i<100; i++) {
+        rval = scanf("%d", &A[i]);
+        if (!rval) {
+            int c;
+            while ((c=getchar()) != '\n' && (c != EOF));
+        }
+    }
+}
+
+Or you could have the user enter values continuously until a special value is entered:
+printf("Enter values (enter -1 to stop): ");
+for(i=0; i<count; i++) {
+    int value;
+    int rval = scanf("%d", &value);
+    if (!rval) {
+        int c;
+        while ((c=getchar()) != '\n' && (c != EOF));
+    } else if (value != -1) {
+        A[i] = value;
+    } else {
+        // -1 was entered
+        break;
+    }
+}#include<stdio.h>
+#include<stdlib.h>
+
+int main()
+{
+    int* A;
+    int i;
+
+    A = (int*)malloc(100*(sizeof(*A)));
+
+    for(i=0; i<100; i++)
+    {
+        int numEl = scanf("%d", &A[i]);
+        if(numEl!=1) break;
+    }
+    free(A);
+    printf("Read %d values\n", i);
+    return 0;
+}
+
+Just break if you found anything, but a number:
+gcc q.c && ./a.out 
+1
+2
+3
+
+
+
+4
+end
+Read 4 valueschar  opp="";
+int i=0;
+while(opp!="*")
+{
+    printf("Enter element %d :",i+1);
+    scanf("%d",&A[i]);
+    // You code here
+   printf("press * to stop:");
+   opp=getch();
+   i++;
+   if (i>=100)
+    break;
+
+}
+
+Try this .. Until  the user input *  it will keep on asking to inputProgram runs, calls function but I get no "output" on STM32L1I encounter a problem currently with a custom STM32L151 board that I will try to explain here.
+The program I am testing runs properly for some time, I get debug messages on puTTY as intended but at a time, the program seems to be "blocked".
+It is pretty weird behaviour because the function which prints over UART is called (I put a breakpoint here to see if I reach this point) but I get no output on a terminal.
+So I was wondering what could be the issue, if someone as an idea because I kinda run out of ideas to be honest, I tried to understand. I will assume there is no hardware issue, it is still possible but I do not think it could be that reason.
+Also, the programs is aimed at receiving a FSK message and answering it and it seems that I have the same behaviour with the radio chip: I receive the message and send a response (I get the TxDone callback called which indicates that the FSK message has normally been sent but the device which waits for this response does not receive it).
+So to sum up a bit: the program runs properly for a moment then "blocks" & I do not get any output anymore (debug or radio communication) but still runs (functions effectively called) and after a moment again, the program "unblocks" itself and runs properly again (debug messages work).
+The device I work on is STM32L151 based, I work with Keil, UART config is: 19200 baudrate, 8 data bits, 1 stop bit, no parity, XON/XOFF flow control & the radio chip I use is SX1272.
+If someone has any idea or any trail I can investigate on. If you need any further details, I am not sure I am accurate enough on the description of the problem but any help is appreciated.Hiding number in large pointer array by modifying least significant bit of elementsStraight of the bat I will say I barely know what I'm doing here - I'm having a major trouble grasping bitwise operators in C.  As an exercise in one of my courses I'm supposed to hide a number (unsigned int) in large pointer array (unsigned char) containing numbers. I'm doing it using srand (with key, so that I can decode it later) to choose specific elements of the array and then take one bit of the number I'm supposed to hide (iterating through all the bits) and changing the least significant bit of the array element. The choosing elements.
+While I get the general idea I cannot, despite googling, figure out the bit operations. So having the size that I'm supposed to encode in i-th run of the loop (i-th bit of size) and randomly chosen current_element this is what I came up with to get the bit and then alter the element.
+for (i=0; i<32; i++){    
+    tmp = rand() % max;
+    current_element = array[tmp];
+    current_element ^= ((size >> i)  & 0x01)<<7;
+}
+
+To decode I would write it analogically (where size is wiped unsigned char that I'm trying to write the decoded number to):
+for (i=0; i<32; i++){
+        tmp = rand() % max;
+        current_element = array[tmp];
+        size = size ^ ((current_pixel.blue<<0)<<7);
+
+    }
+
+These two are in diffrent functions and srand() is seeded anew in each of them beforehand.
+But these are clearly not working and I don't even know which one (I can only check if it decoded correctly). Truth be told these are mostly copied from other things I found online as so far operating on individual bits eludes me. So I'd be grateful for some sort of advice on what is wrong here (and I'm aware probably everything is wrong here and it's all gibberish but I've been trying to fix it to no avail for quite a while now).I'm only going to indirectly answer your question. I'm going to give you some gentle advice that many new programmers need.
+  If you want to learn to program,  Stop googling and Think. 
+Break the problem down into steps. Write pseudocode:
+  encode:
+     for each bit in message_word:
+        select random array element
+        if bit is set:
+           toggle LSB of element.
+
+  decode:
+     for each bit in message_word:
+        select random element
+        if LSB is toggled:
+           set bit in message_word
+
+Now, write the C code for each of those steps.  You actually have most of the pieces.
+ // for each bit in message_word
+ for (i=0;i<sizeof(message_word); i++) {
+   // select random array element
+   tmp = rand() % max;
+   current_element = array[tmp];
+   // if bit is set:
+   if ( bit_is_set(message_word,i) ) {
+       // toggle LSB of element.
+       toggle_lsb(current_element);
+   }
+ }
+
+Now that you are down to basic steps, maybe you can google "how to toggle a bit".  But make sure you understand the answer before plugging it in.
+int bit_is_set(word,bit) { return ((word>>bit)&0x01); }
+int toggle_lsb(word) { return word ^ 1; }
+
+However - this still won't work.  Why?  Time to think again.  You made a copy of the value at the randomly selected array index.  You toggled a bit in the copy.  What effect is that going to have on the array?
+Solve that and there's at least one more challenge. In the decode function, how will you implement is_lsb_toggled?  How will you know if a given bit was supposed to be 1 or 0?  You have all the information you need. Good Luck.Biggest/smallest bean cup algorithm in C - easy gameI'm doing a mini project for school, the game consists of an even set of cups, X, each one with x1, x2,... beans inside each cup. There are two players, Bella and Alex. 
+Alex always takes the cup with more beans. Bella, in her first play takes the one with less beans, the second play takes the cup with more beans, the third with less beans, and so on....
+They can just grab the first or the last cup of the set. Alex always starts first. Whoever gets the most beans win.
+For Example: X = 4, with x1 = 1, x2 = 2, x3 = 3, x4 = 4.
+Alex takes x4, A = 4. 
+-> X = 3, with x1 = 1, x2 = 2, x3 = 3.
+Bella takes x1 = 1, B = 1. (first play, takes the smallest)
+-> X = 2, with  x1 = 2, x2 = 3.
+Alex takes x2, A = 4 +3 = 7.
+-> X = 1, with  x1 = 2.
+Bella takes x1, B = 1+2 = 3.
+
+So, Alex wins with 7 beans against Bella's 3 beans.
+I've the code here, everything's fine but on the second play of Alex, he gets 8 instead of 7. Can you help me? The montinhos[] represents the array x1, x2, x3, x4...
+Thanks.
+PS - gcc option is: gcc -std=c99 -Wall $file -lm    
+#include <stdio.h>
+int i, j, z, n, A, B, jogada = 1;
+void alex(int *n, int montinhos[]);
+void bella(int *n, int montinhos[]);
+
+int main(void)
+{
+
+do
+{
+  printf("Number of cups: ");
+  scanf("%d", &n);
+} while(n < 2 || n > 100 || n % 2 != 0);
+
+int montinhos[n];
+
+for (i = 0; i < n; ++i)
+    scanf("%d", &montinhos[i]);
+
+for (j = 0; j < n / 2; ++j)
+{ //play while there are cups
+  alex(&n, montinhos);
+  printf("Temp Alex %d\n", A);
+  bella(&n, montinhos);
+  printf("Temp Bella %d\n", B);
+}
+
+if (A > B)
+{
+  printf("Alex wins with %d against %d\n", A, B);
+}
+else if (B < A)
+{
+  printf("Bella wins with  %d against %d\n", B, A);
+}
+else
+{
+  printf("Alex e Bella tie with %d\n", A);
+}
+
+return 0;
+}
+
+
+void bella(int *n, int montinhos[])
+{
+  if (*n==1) //if there's only 1 cup
+  {
+    B += montinhos[0];
+    *n--;
+  }
+  else if (jogada % 2 != 0) //first/uneven play - takes the smallest cup
+  {
+    if(montinhos[0] < montinhos[*n - 1])
+    {
+      B += montinhos[0];
+      for (z = 0; z < *n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      *n--;
+    }
+    else if(montinhos[0] > montinhos[*n - 1])
+    {
+      B += montinhos[*n - 1];
+      for (z = *n - 1; z < *n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      *n--;
+    }
+  }
+  else //if second/.../even play, takes the biggest cup
+  {
+    if(montinhos[0] > montinhos[*n - 1])
+    {
+      B += montinhos[0];
+      for (z = 0; z < *n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      *n--;
+    }
+    else if(montinhos[0] < montinhos[*n - 1])
+    {
+      B += montinhos[*n - 1];
+      for (z = *n - 1; z < *n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      *n--;
+    }
+  }
+}
+
+
+
+void alex(int *n, int montinhos[])
+{
+  //if left cup is bigger
+  if(montinhos[0] > montinhos[*n - 1])
+  {
+    A += montinhos[0];
+    for (z = 0; z < *n - 1; ++z)
+         montinhos[z] = montinhos[z+1];
+    *n--;
+
+  }
+  else if (montinhos[0] < montinhos[*n - 1])
+  {
+    A += montinhos[*n - 1];
+    for (z = *n - 1; z < *n - 1; ++z)
+         montinhos[z] = montinhos[z+1];
+    *n--;
+  }
+
+}After checking your code again, I realized that your variables are all globals (bad style, but not a bug).
+Summary of changes:
+
+Because n is a global variable, it doesn't need to be passed as a parameter to functions.   I removed the parameter from functions bella and alex.
+Your loop to count the number of cups remaining was wrong.  It was based on j < n/2.  I changed it to just while(n).
+
+
+#include <stdio.h>
+int i, j, z, n, A, B, jogada = 1;
+void alex(int montinhos[]);
+void bella(int montinhos[]);
+
+int main(void)
+{
+    do
+    {
+        printf("Number of cups: ");
+        scanf("%d", &n);
+    } while(n < 2 || n > 100 || n % 2 != 0);
+
+    int montinhos[n];
+
+    for (i = 0; i < n; ++i)
+        scanf("%d", &montinhos[i]);
+
+    while(n)
+    { //play while there are cups
+      alex(montinhos);
+      printf("Temp Alex %d\n", A);
+      bella(montinhos);
+      printf("Temp Bella %d\n", B);
+    }
+
+    if (A > B)
+    {
+        printf("Alex wins with %d against %d\n", A, B);
+    }
+    else if (B < A)
+    {
+        printf("Bella wins with  %d against %d\n", B, A);
+    }
+    else
+    {
+        printf("Alex e Bella tie with %d\n", A);
+    }
+
+    return 0;
+}
+
+void bella(int montinhos[])
+{
+  if (n==1) //if there's only 1 cup
+  {
+    B += montinhos[0];
+    n--;
+  }
+  else if (jogada % 2 != 0) //first/uneven play - takes the smallest cup
+  {
+    if(montinhos[0] < montinhos[n - 1])
+    {
+      B += montinhos[0];
+      for (z = 0; z < n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      n--;
+    }
+    else if(montinhos[0] > montinhos[n - 1])
+    {
+      B += montinhos[n - 1];
+      for (z = n - 1; z < n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      n--;
+    }
+  }
+  else //if second/.../even play, takes the biggest cup
+  {
+    if(montinhos[0] > montinhos[n - 1])
+    {
+      B += montinhos[0];
+      for (z = 0; z < n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      n--;
+    }
+    else if(montinhos[0] < montinhos[n - 1])
+    {
+      B += montinhos[n - 1];
+      for (z = n - 1; z < n - 1; ++z)
+           montinhos[z] = montinhos[z+1];
+      n--;
+    }
+  }
+}
+
+
+
+void alex(int montinhos[])
+{
+  //if left cup is bigger
+  if(montinhos[0] > montinhos[n - 1])
+  {
+    A += montinhos[0];
+    for (z = 0; z < n - 1; ++z)
+         montinhos[z] = montinhos[z+1];
+    n--;
+
+  }
+  else if (montinhos[0] < montinhos[n - 1])
+  {
+    A += montinhos[n - 1];
+    for (z = n - 1; z < n - 1; ++z)
+         montinhos[z] = montinhos[z+1];
+    n--;
+  }
+
+}In sqlite3, is reset required after a failed call to step?Is it a requirement to call sqlite3_reset() on a prepared statement after a failed call to sqlite3_step()? I'm using sqlite3 version 3.23.1. The lifecycle of my prepared statements is as follows:
+
+At the start of my application, I globally do sqlite3_prepare_v2() and keep the handle to the prepared statement available for the lifetime of the application.
+When I'm ready to do a query, I invoke one of the sqlite3_bind_*() functions, then do sqlite3_step() on that statement until I get something other than SQLITE_ROW returned.
+Then the code below is executed to reset the statement.
+
+Here is the part of the code that happens after I call sqlite3_step(). Note that variable resultCode holds the return value of the last call to sqlite3_step().
+   if (resultCode == SQLITE_DONE || resultCode == SQLITE_ROW)
+   {
+      if (sqlite3_reset(m_statement) != SQLITE_OK)
+      {
+         LogDbFailure(*m_db, "sqlite3_reset()");
+      }
+   }
+   else
+   {
+      LogDbFailure(*m_db, "sqlite3_step()");
+      success = false;
+   }
+
+Notice that if the call to step failed, I don't do a reset. Nothing in the documentation or search results on Google indicate that sqlite3_reset() must be called on failures. In fact, the documentation states that calling sqlite3_reset() after a failure will also fail:
+
+If the most recent call to sqlite3_step(S) for the prepared statement S indicated an error, then sqlite3_reset(S) returns an appropriate error code.
+
+Reading this made me think that maybe I shouldn't call the reset function if step fails.
+Can anyone clarify? Note in my case, sqlite3_step() is failing because of SQLITE_BUSY. I am using WAL journalling mode. Once step fails on a prepared statement, that prepared statement is forever in busy state when I call sqlite3_step(). Calls to sqlite3_bind_*() after that return sqlite3_bind_int64() failed (21): bad parameter or other API misuse (log format is my own, but 21 is  the error code), which makes me think that reset should be called in failure cases, since all errors seem to indicate that the database is busy because of the prepared statement stuck in mid-transaction due to the lack of a reset.Notice that if the call to step failed, I don't do a reset. Nothing in
+  the documentation or search results on Google indicate that
+  sqlite3_reset() must be called on failures.
+
+Well no, not specifically, but the docs for sqlite3_reset() do say
+
+The sqlite3_reset() function is called to reset a prepared statement
+  object back to its initial state, ready to be re-executed.
+
+You add,
+
+In fact, the documentation
+  states that calling sqlite3_reset() after a failure will also fail:
+
+If the most recent call to sqlite3_step(S) for the prepared statement S indicated an error, then sqlite3_reset(S) returns an
+    appropriate error code.
+
+
+No, you are misinterpreting that.  There is an important distinction between "returns an appropriate error code" and "will fail".  That should be clearer when considered in the context of this excerpt from the docs for sqlite3_step():
+
+In the legacy interface, the sqlite3_step() API always returns a
+  generic error code, SQLITE_ERROR, following any error other than
+  SQLITE_BUSY and SQLITE_MISUSE. You must call sqlite3_reset() or
+  sqlite3_finalize() in order to find one of the specific error codes
+  that better describes the error.
+
+Although that behavior of sqlite3_step() applies only to the legacy interface, not the V2 interface, it explains why the return value of sqlite3_reset() reports on the result of previous calls (if any) to sqlite3_step(), not on its own success or failure.  It is implicit that the reset itself cannot fail, or at least cannot report on its own failure via its return code.
+
+Reading this made me think that maybe I shouldn't call the reset
+  function if step fails.
+
+The docs for sqlite3_step() have this to say on that point:
+
+For all versions of SQLite up to and including 3.6.23.1, a call to
+  sqlite3_reset() was required after sqlite3_step() returned anything
+  other than SQLITE_ROW before any subsequent invocation of
+  sqlite3_step().
+
+Note: it is therefore not wrong to call sqlite3_reset() after sqlite3_step() reports an error.  The docs go on to say,
+
+Failure to reset the prepared statement using
+  sqlite3_reset() would result in an SQLITE_MISUSE return from
+  sqlite3_step(). But after version 3.6.23.1 (2010-03-26, sqlite3_step()
+  began calling sqlite3_reset() automatically in this circumstance
+  rather than returning SQLITE_MISUSE.
+
+That seems inconsistent with the behavior you report, but note that,
+
+[...] The SQLITE_OMIT_AUTORESET
+  compile-time option can be used to restore the legacy behavior.
+
+Thus, your safest bet is to reset the statement unconditionally, rather than to avoid resetting it after an error is reported.  That might be unnecessary with many SQLite3 builds, but it is not wrong or harmful, and it is necessary with some builds.Is there a way to bind Lua member variable as a call to C/C++ function with the name of that variableI'm totally new to Lua. From what I understand it is possible to bind Lua variables and methods to ones on the C/C++ side.
+But is it possible to bind a user type variable to the call of the C/C++ function which may look like properties on the Lua side ?
+Example:
+// C++
+struct player {
+  int get_value(const std::string& property) const {
+    auto it = values.find(name);
+
+    if (it != values.end()) {
+      return it->second;
+    }
+
+    return -1;
+  }
+
+  std::map<std::string, int> values;
+};
+
+And on the Lua side:
+-- Lua
+p = player.new()
+print(p.score)
+
+So when I call p.score in Lua, it gets translated to the call to the player::get_value function on C++ side with the value of property "score" ?
+SOLUTION
+Thanks to @Vlad for the directions!
+I came up using sol2 which is in my opinion a very nice  C++ library binding to Lua!
+Here is how it can be done with sol2:
+struct Player {
+  sol::object get(const std::string& key, sol::this_state state) {
+    const auto& it = values.find(key);
+
+    if (it != values.cend()) {
+      return sol::make_object(state, it->second);
+    }
+
+    return sol::lua_nil;
+  }
+
+  std::map<std::string, int> values;
+};
+
+int main() {
+  Player player;
+
+  player.values.emplace("score", 123);
+
+  sol::state lua;
+
+  lua.open_libraries(sol::lib::base);
+  lua.new_usertype<Player>("Player", sol::meta_function::index, &Player::get);
+  lua.set("player", &player);
+
+  lua.script(R"(
+    print("Player score: ", player.score)
+  )");
+  return 0;
+}
+
+Console output
+Player score:   123The object player should have metatable set with fields __index/__newindex set to C function that will be called when Lua is trying to read or write the field that doesn't exist in the Lua object.
+Normally the Lua object representing the native object (player in your case) will be a userdata, either storing the pointer to the C++ object, or hosting it within its storage.
+The metamethods __index/__newindex will receive in arguments the reference to the object being queried, the key value (e.g. your score field), and the value to store in case of __newindex metamethod. So you can find your native object and desired property easily.
+Some people prefer using existing binding solutions - tolua++/sol/luabind/etc, but it's very simple to implement required functionality yourself.Passing string variable to function containing system() command in CI am aware of the other posts about this topic. But after reviewing all of them, there still seems to be a problem for my case.
+Currently I am  working on a 'String to speech' function  using a Vbscript to convert a string to speech. (spraak.vbs) The VBsript is saved in the same folder as the C code.
+Content of the `VBscript file with 1 argument 
+rem String to speech  
+Set spkArgs = WScript.Arguments 
+arg1 = spkArgs(0)
+set speech =  Wscript.CreateObject("SAPI.spvoice") 
+speech.speak arg1
+
+Using the sprintf() command i combined the total string for the system() command. 
+sprintf(command, "cmd /c spraak.vbs \"Welcome\"");
+system(command);
+
+The code used here works like a charm. But when i try to use a variable as my argument ("Welcome"). It only says "Empty".
+char text = "\"Welcome\""
+sprintf(command, "cmd /c spraak.vbs %s", text);
+system(command);
+
+What could be the problem?
+Full C code below:
+#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+    printf("Test\n");
+    char text[] = "\"Welcome\"";
+    char command[] = "";
+    printf("%s\n", text);
+         sprintf(command, "cmd /c spraak.vbs \"Welcome\"");
+         system(command);
+        sprintf(command, "cmd /c spraak.vbs %s", text);
+        system(command);
+    printf("Test2\n");
+    return 0;
+}The problem is this:
+char command[] = "";
+
+That creates an array of a single character, and that single character is the string terminator '\0'. It's equal to
+char command[1] = { '\0' };
+
+When you use sprintf you write out of bounds, and you will have undefined behavior.
+To solve this use a fixed size for the array, and use snprintf to avoid buffer overflows:
+char command[128];
+snprintf(command, sizeof command, "cmd /c spraak.vbs %s", text);sprintf needs an already allocated buffer of sufficient size to put its result in. Your char command[] = "" however, is an array of characters of length 1 (just the terminating null), which is too short to take the full result.
+You might want to try using
+char command[50];
+
+instead. Please note, that in a real application, the 50 should be determined appropriately according to the data to be stored. To this end, you could use snprintf instead of sprintf to compute the required buffer size.Should a cast be used to truncate a long variable?I have a 16 bits unsigned variable. I need to split it in 8 bits chunks.
+Is doing the following enough:
+chunk_lsb = (uint8)variable;
+chunk_msb = (uint8)(variable >> 8);
+
+Or should I use a mask:
+chunk_lsb = (uint8)(variable & 0xFFu);
+chunk_msb = (uint8)((variable >> 8) & 0xFFu);
+
+I know that both approaches work, I'm just looking for the best way to do it, if there is one. Maybe there's none and just use the cast to reduce calculations is the best way? What do you guys think?It isn't clear what type variable is. Without that specified, we can only speculate.
+But in general, you should avoid bit shifting on signed integer types, as that leads to various forms of poorly-defined behavior. This in turn means that you have to be careful with small integer types too, because they get promoted to signed int. See Implicit type promotion rules.
+The specific case of (uint8)((variable >> 8) & 0xFFu); is safe if variable is unsigned. Otherwise it is unsafe, since right-shifting a negative value leads to implementation-defined behavior (arithmetic or logical shift).
+variable << 8 will invoke undefined behavior on 16 bit systems in case variable is a small integer type, or an int16_t.
+The safest, most portable way no matter left/right shift is therefore this:
+chunk_lsb = variable;
+chunk_msb = ((unsigned int)variable >> 8);
+
+Though you might want to be overly explicit in order to silence all compiler warnings:
+chunk_lsb = (uint8_t) (variable & 0xFFu);
+chunk_msb = (uint8_t) ( (unsigned int)variable>>8 & 0xFFu );Since uint8 is unsigned, you don't have to do the masking:
+
+6.3.1.3 Signed and unsigned integers
+
+When a value with integer type is converted to another integer type other than _ Bool , if the value
+  can be represented by the new type, it is unchanged.
+Otherwise, if the new type is unsigned, the value is converted by repeatedly adding or subtracting
+  one more than the maximum value that can be represented in the new type until the value is in the
+  range of the new type. 60)
+Otherwise, the new type is signed and the value cannot be represented in it; either the result is
+  implementation-defined or an implementation-defined signal is raised.
+
+
+However, most likely both will result in the same compiler output. I usually add the mask because it makes clear what code is supposed to do, and makes the cast unnecessary.Should a cast be used to truncate a long variable?
+
+If chunk_lsb is an 8 bit object (narrower than variable), use cast or mask (not both).  Useful in quieting pedantic warnings about range reduction.  I prefer the mask - unless the compiler is picky.
+uint8_t chunk_lsb = (uint8_t) variable;
+// or 
+uint8_t chunk_lsb = variable & 0xFFu;
+
+Otherwise use the mask.
+unsigned chunk_lsb = variable & 0xFFu;Maybe there's none and just use the cast to reduce calculations is the best way?
+
+General speaking, the asm code will be the same, so in terms of speed, it does not matter which one you use:
+
+masking: https://godbolt.org/z/Olrw3x
+casting: https://godbolt.org/z/EEdvQZ
+
+
+What do you guys think?
+
+IMO, the first one is clearer, in terms of readability, but I cannot figure out a coding standard or guideline which supports my preference. Anyway, I would use a const variable if your preference is the second one, to remove magic numbers and make clearer that the purpose is masking (assuming that you have chosen a correct name for the const variable).Ask compiler to treat array as array(not pointer) when passing it to a functionI want to use sizeof operator after passing an array to a function but C language is considering it as pointer not an array.
+Can we implement a functionality to solve this purpose ?
+void foo(char array[])
+{
+    printf("sizeof array = %u\n", sizeof(array)); /* I know array is pointer here */
+}
+
+int main(void)
+{
+    int array[5];
+    foo(array);
+}Not possible and using an array subscript [] can be confusing to people not knowing that it will behave as a pointer. The approach that I take is to pass length as another argument or create a struct with pointer and length:
+struct {
+    char * buffer;
+    size_t length;
+} buffer_t;
+
+I don't like the array in the struct or typedef approach as it restricts the data to a fixed size.You can't ask the compiler for that. It is not polite to do what you ask it to.
+Instead you can add another parameter to your function definition to recieve the size of the array. 
+void foo(char array[], size_t array_size)
+{
+    printf("sizeof array = %zu\n", array_size);
+}
+
+int main(void)
+{
+    int array[5];
+    foo(array, sizeof(array)) ;
+}
+
+Note: to print size_t use %zu in printf. 
+Note: to print number of elements, use: sizeof(array) / sizeof(*array)You can use a dedicated typedef, or as said in a remark an embedding struct :
+#include <stdio.h>
+
+typedef char A5[5];
+
+typedef struct S {
+  char a[5];
+} S;
+
+void foo(A5 a) /* of course can be "void foo(char a[])" but less clear */
+{
+  printf("%zu %zu\n", sizeof(A5), sizeof(a));
+}
+
+void bar(S s)
+{
+  printf("%zu\n", sizeof(s.a));
+}
+
+
+int main()
+{
+  A5 a;
+  S s;
+
+  foo(a);
+  bar(s);
+}
+
+Of course in case of the typedef you need to use typeof on it rather than on the var being a char*
+But all of that is a kind of hack, C is C ...Effect of non-divisible loop sizes at runtime on openMP SIMDAfter reading several different articles and not finding an answer I am going to introduce the problem and then ask the question. 
+I have a section of code that can be reduced down to a series of loops like look like the following.
+#pragma omp parallel for simd
+for(int i = 0; i < a*b*c; i++)
+{
+    array1[i] += array2[i] * array3[i];
+}
+
+Now most examples of SIMD use that I have encountered have a, b and c fixed at compile time, allowing for the optimisation to take place. However, my code requires that the values of a b and c are determined at run time. 
+Lets say that for the case of the computer I am using the register can fit 4 values, and that the value of abc is 127. My understanding of compilation time for this is that the compiler will vectorise everything that is wholly divisible by 4, then serialise the rest (please correct this if I am wrong). However this is when the compiler has full knowledge of the problem. If I were to now allow a run time choice of a, b and c and came to the value of 127, how would vectorisation proceed? Naively I would assume that the code behind the scenes is intelligent enough to understand this might happen have have both a serial and vector code and calls the most suitable. However, as this is an assumption, I would appreciate someone more knowledgeable on the subject to enlighten me further, as I don't want accidental overflows, or non-processing of data, due to a misunderstanding.    
+On the off chance this matters, I am using OpenMP 4.0 with a C gcc compiler, although I am hoping this will not change your answer as I will always attempt to use the latest OpenMP version and unfortunately may need to routinely change compiler.Typically, a compiler will unroll beyond the simd length.  For optimum results, particularly with gcc, you would specify this unroll factor, e.g. --param max-unroll-times=2 (if you don't expect much longer loops).  with a simd length of 4, the loop would consume 8 iterations at a time, leaving a remainder.  gcc would build a remainder loop, somewhat like Duff's device, which might have 15 iterations, and would calculate where to jump in at run time.  Intel compiler handles a vectorized remainder loop in a different way.  Supposing you have 2 simd widths available, the remainder loop would use the shorter width without unrolling, so that the serial part is as short as possible.  When compiling for the general case of unaligned data, there is a remainder loop at both ends, with the one at the beginning limited to the length required for alignment of the stored values.  With the combination omp parallel simd, the situation gets more complicated; normally, the loop chunks must vary in size, and one might argue that the interior chunks might be set up for alignment, with the end chunks smaller (not normally done).Reprompting user when negative float value inputso I'm a complete newb to C and I'm struggling with the language. I need to write a program that will re-prompt a user to input a number if they input a negative number untill they produce a positive one. I have the below so far, no error messages are showing but when I type in a negative float value it does not re-prompt me, it just displays the number. Any ideas?     
+#include <cs50.h>
+#include <stdio.h>
+#include <math.h>
+
+float get_positive_float(string prompt);
+
+int main(void)
+{
+    float f = get_float("Cash: ");
+    printf("%f\n", f);
+}
+
+float get_positive_float(string prompt)
+{
+    float n;
+    do {
+        n = get_float("%s", prompt);
+    } while (n < 0);
+    return n;
+}float get_positive_float(char const *prompt)
+{
+    float result;
+    while (prompt && printf(prompt), scanf(" %f", &result) != 1 || result < 0.f) {
+        fputs("Please only enter positive values!\n\n", stderr);
+        for (int ch; (ch = getchar()) != '\n' && ch != EOF;);  // clear the rest of the line
+    }
+    return result;
+}
+
+A version using the thingies from <cs50.h> might look like that:
+float get_positive_float(string prompt)
+{
+    float result;
+    while ((result = get_float(prompt)), result < 0.f) {
+        fputs("Please only enter positive values!\n\n", stderr);
+    }
+    return result;
+}
+
+The problem though is, that floating point numbers aren't suitable for amounts of money. Use an integer type and calculate in cents. For output divide by 100.Errors occurs while the final step of gcc makeI build gcc for arm from scratch. In the final step of building gcc occur errors. I'm counting on your help.
+bogdan@bogdan-VirtualBox:~/xtools/build2/final-gcc-2$ $gcc_src/configure --build=$buildmach --host=$targetmach --target=$targetmach --prefix=$installdir --with-sysroot=$sysrootdir --enable-languages=c --with-gnu-as --with-gnu-ld --disable-multilib --with-float=soft --disable-sjlj-exceptions --disable-nls --enable-threads=posix --disable-libmudflap --disable-libssp --enable-long-longx --with-shared --with-gmp=$installdir --with-mpfr=$installdir --without-isl
+
+make
+a lot of log
+checking how to run the C preprocessor... (cached) arm-none-linux-gnueabi-gcc -E
+checking for grep that handles long lines and -e... (cached) /bin/grep
+checking for egrep... (cached) /bin/grep -E
+checking for ANSI C header files... (cached) yes
+checking for sys/types.h... (cached) yes
+checking for sys/stat.h... (cached) yes
+checking for stdlib.h... (cached) yes
+checking for string.h... (cached) yes
+checking for memory.h... (cached) yes
+checking for strings.h... (cached) yes
+checking for inttypes.h... (cached) yes
+checking for stdint.h... (cached) yes
+checking for unistd.h... (cached) yes
+checking for minix/config.h... (cached) no
+checking whether it is safe to define __EXTENSIONS__... (cached) yes
+checking for arm-none-linux-gnueabi-gcc... (cached) arm-none-linux-gnueabi-gcc
+checking whether we are using the GNU C compiler... (cached) yes
+checking whether arm-none-linux-gnueabi-gcc accepts -g... (cached) yes
+checking for arm-none-linux-gnueabi-gcc option to accept ISO C89... (cached) none needed
+checking dependency style of arm-none-linux-gnueabi-gcc... (cached) gcc3
+checking for special C compiler options needed for large files... (cached) no
+checking for _FILE_OFFSET_BITS value needed for large files... (cached) 64
+checking whether arm-none-linux-gnueabi-gcc supports -Wall... (cached) yes
+checking for -static-libgcc... yes
+checking how to print strings... printf
+checking for a sed that does not truncate output... (cached) /bin/sed
+checking for fgrep... (cached) /bin/grep -F
+checking for ld used by arm-none-linux-gnueabi-gcc... (cached) arm-none-linux-gnueabi-ld
+checking if the linker (arm-none-linux-gnueabi-ld) is GNU ld... (cached) yes
+checking for BSD- or MS-compatible name lister (nm)... (cached) arm-none-linux-gnueabi-nm
+checking the name lister (arm-none-linux-gnueabi-nm) interface... (cached) BSD nm
+checking whether ln -s works... yes
+checking the maximum length of command line arguments... (cached) 1572864
+checking whether the shell understands some XSI constructs... yes
+checking whether the shell understands "+="... yes
+checking for arm-none-linux-gnueabi-ld option to reload object files... (cached) -r
+checking for arm-none-linux-gnueabi-objdump... (cached) arm-none-linux-gnueabi-objdump
+checking how to recognize dependent libraries... (cached) pass_all
+checking for arm-none-linux-gnueabi-ar... (cached) arm-none-linux-gnueabi-ar
+checking for arm-none-linux-gnueabi-strip... (cached) arm-none-linux-gnueabi-strip
+checking for arm-none-linux-gnueabi-ranlib... (cached) arm-none-linux-gnueabi-ranlib
+checking command to parse arm-none-linux-gnueabi-nm output from arm-none-linux-gnueabi-gcc object... (cached) ok
+checking for dlfcn.h... (cached) yes
+checking for objdir... (cached) .libs
+checking if arm-none-linux-gnueabi-gcc supports -fno-rtti -fno-exceptions... (cached) no
+checking for arm-none-linux-gnueabi-gcc option to produce PIC... -fPIC -DPIC
+checking if arm-none-linux-gnueabi-gcc PIC flag -fPIC -DPIC works... (cached) yes
+checking if arm-none-linux-gnueabi-gcc static flag -static works... (cached) yes
+checking if arm-none-linux-gnueabi-gcc supports -c -o file.o... (cached) yes
+checking if arm-none-linux-gnueabi-gcc supports -c -o file.o... (cached) yes
+checking whether the arm-none-linux-gnueabi-gcc linker (arm-none-linux-gnueabi-ld) supports shared libraries... yes
+checking whether -lc should be explicitly linked in... (cached) no
+checking dynamic linker characteristics... (cached) GNU/Linux ld.so
+checking how to hardcode library paths into programs... immediate
+checking whether stripping libraries is possible... yes
+checking if libtool supports shared libraries... yes
+checking whether to build shared libraries... yes
+checking whether to build static libraries... yes
+checking for int64_t... (cached) yes
+checking for uint64_t... (cached) yes
+checking for sys/wait.h that is POSIX.1 compatible... (cached) yes
+configure: creating ./config.status
+config.status: creating Makefile
+config.status: creating config.h
+config.status: config.h is unchanged
+config.status: executing depfiles commands
+config.status: executing libtool commands
+make[2]: вход в каталог «/home/bogdan/xtools/build2/final-gcc-2/lto-plugin»
+make  all-am
+make[3]: вход в каталог «/home/bogdan/xtools/build2/final-gcc-2/lto-plugin»
+WARNING: liblto_plugin.la is static, not copying to ../gcc/liblto_plugin.la
+make[3]: выход из каталога «/home/bogdan/xtools/build2/final-gcc-2/lto-plugin»
+make[2]: выход из каталога «/home/bogdan/xtools/build2/final-gcc-2/lto-plugin»
+Configuring in ./gcc
+configure: loading cache ./config.cache
+checking build system type... x86_64-pc-linux-gnu
+checking host system type... arm-none-linux-gnueabi
+checking target system type... arm-none-linux-gnueabi
+checking LIBRARY_PATH variable... ok
+checking GCC_EXEC_PREFIX variable... ok
+checking whether to place generated files in the source directory... no
+checking whether a default linker was specified... no
+checking whether a default assembler was specified... no
+checking for arm-none-linux-gnueabi-gcc... arm-none-linux-gnueabi-gcc
+checking for C compiler default output file name... a.out
+checking whether the C compiler works... yes
+checking whether we are cross compiling... yes
+checking for suffix of executables... 
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether arm-none-linux-gnueabi-gcc accepts -g... yes
+checking for arm-none-linux-gnueabi-gcc option to accept ISO C89... none needed
+checking whether we are using the GNU C++ compiler... yes
+checking whether arm-none-linux-gnueabi-g++ accepts -g... yes
+checking for arm-none-linux-gnueabi-gnatbind... no
+checking for arm-none-linux-gnueabi-gnatmake... no
+checking whether compiler driver understands Ada... no
+checking how to run the C++ preprocessor... /lib/cpp
+checking for grep that handles long lines and -e... /bin/grep
+checking for egrep... /bin/grep -E
+checking for ANSI C header files... no
+checking for sys/types.h... no
+checking for sys/stat.h... no
+checking for stdlib.h... no
+checking for string.h... no
+checking for memory.h... no
+checking for strings.h... no
+checking for inttypes.h... no
+checking for stdint.h... no
+checking for unistd.h... no
+checking minix/config.h usability... no
+checking minix/config.h presence... no
+checking for minix/config.h... no
+checking whether it is safe to define __EXTENSIONS__... no
+checking how to run the C preprocessor... arm-none-linux-gnueabi-gcc -E
+checking for inline... inline
+checking for special C compiler options needed for large files... no
+checking for _FILE_OFFSET_BITS value needed for large files... unknown
+checking for _LARGE_FILES value needed for large files... unknown
+checking size of void *... 0
+checking size of short... 0
+checking size of int... 0
+checking size of long... 0
+checking for long long... no
+checking for int8_t... no
+checking for int16_t... no
+checking for int32_t... no
+checking for int64_t... no
+checking for long long int... no
+checking for intmax_t... no
+checking for intptr_t... no
+checking for uint8_t... no
+checking for uint16_t... no
+checking for uint32_t... no
+checking for uint64_t... no
+checking for unsigned long long int... no
+checking for uintmax_t... no
+checking for uintptr_t... no
+configure: error: uint64_t or int64_t not found
+Makefile:4200: recipe for target 'configure-gcc' failed
+make[1]: *** [configure-gcc] Error 1
+make[1]: выход из каталога «/home/bogdan/xtools/build2/final-gcc-2»
+Makefile:891: recipe for target 'all' failed
+make: *** [all] Error 2
+
+Update
+Solution: 
+bogdan@bogdan-VirtualBox:~/xtools/build2/final-gcc-2$ $gcc_src/configure --build=$buildmach --target=$targetmach --prefix=$installdir CC=gcc --with-sysroot=$sysrootdir --enable-languages=c --with-gnu-as --with-gnu-ld --disable-multilib --with-float=soft --disable-sjlj-exceptions --disable-nls --enable-threads=posix --disable-libmudflap --disable-libssp --enable-long-longx --with-shared --with-gmp=$installdir --with-mpfr=$installdir
+With that another errors appeared:
+checking for x86_64-pc-linux-gnu-strip... no
+checking for strip... strip
+checking for x86_64-pc-linux-gnu-ranlib... ranlib
+checking command to parse nm output from gcc object... ok
+checking for sysroot... /home/bogdan/xtools/arm/sysroot
+checking for a working dd... /bin/dd
+checking how to truncate binary pipes... /bin/dd bs=4096 count=1
+checking for x86_64-pc-linux-gnu-mt... no
+checking for mt... mt
+checking if mt is a manifest tool... no
+checking for dlfcn.h... yes
+checking for objdir... .libs
+checking if gcc supports -fno-rtti -fno-exceptions... no
+checking for gcc option to produce PIC... -fPIC -DPIC
+checking if gcc PIC flag -fPIC -DPIC works... yes
+checking if gcc static flag -static works... yes
+checking if gcc supports -c -o file.o... yes
+checking if gcc supports -c -o file.o... (cached) yes
+checking whether the gcc linker (ld -m elf_x86_64) supports shared libraries... yes
+checking dynamic linker characteristics... GNU/Linux ld.so
+checking how to hardcode library paths into programs... immediate
+checking whether stripping libraries is possible... yes
+checking if libtool supports shared libraries... yes
+checking whether to build shared libraries... no
+checking whether to build static libraries... yes
+checking whether gcc __attribute__ ((mode (XX))) works... yes
+checking for recent GMP... yes
+checking usable gmp.h at link time... yes
+checking for GMP_NUMB_BITS and sizeof(mp_limb_t) consistency... no
+configure: error: GMP_NUMB_BITS and sizeof(mp_limb_t) are not consistent.
+You probably need to change some of the GMP or MPFR compile options.
+See 'config.log' for details (search for GMP_NUMB_BITS).
+Makefile:5126: recipe for target 'configure-mpfr' failed
+make[1]: *** [configure-mpfr] Error 1
+make[1]: выход из каталога «/home/bogdan/xtools/build/final-gcc»
+Makefile:891: recipe for target 'all' failed
+make: *** [all] Error 2Solution: bogdan@bogdan-VirtualBox:~/xtools/build2/final-gcc-2$ $gcc_src/configure --build=$buildmach --target=$targetmach --prefix=$installdir CC=gcc --with-sysroot=$sysrootdir --enable-languages=c --with-gnu-as --with-gnu-ld --disable-multilib --with-float=soft --disable-sjlj-exceptions --disable-nls --enable-threads=posix --disable-libmudflap --disable-libssp --enable-long-longx --with-shared --with-gmp=$installdir --with-mpfr=$installdirIs accessing global variable using macro advisable?I saw this piece of code in a C file: 
+Abcd.h file -
+#define X (&y) 
+
+Abcd.c file - 
+extern int y;
+
+Is it a common practice to use macro to access global variable address or field of global structure?
+Is it advisable to do so? If yes, why? If no, why?I don't think it's that bad...
+Some implementation do something similar with errno:
+extern int *__geterrno(void);
+
+#define errno (*__geterrno())I have seen macros used to simplify complex expressions, or to simplify accessing members of deeply nested structures, something like
+#define GET_NAME(foo) (foo)->bar->blah->name
+
+I've never seen anyone use a macro to just abstract away a & operation on a specific global object, though.  Without more context I can't say whether it's a good or bad idea.how to take input till "only" newline character or a space is inputted ?Basically how to run loop till you enter nothing as input?i am trying to create a looping which keeps looping till "only" newline charater is inputted or maybe just a space (until nothing is entered to the input line).
+ #include <stdio.h>
+    #include <stdlib.h>
+
+    int main()
+    {
+        int num;
+        while(1)
+        {
+            scanf("%d",&num);
+            if(num==NULL)
+                break;
+        printf("%d",num);
+        }
+        return 0;
+    }You can't do that with scanf (at least not easily). If you want to process user input, scanf is a bad choice (in fact, in all my years of developing in C, I've never used scanf; I recommend you avoid it altogether).
+num==NULL makes no sense: num is a number, but NULL is a pointer value. If you want to check whether scanf was successful, you need to check its return value.
+I'd do something like:
+char line[100];
+while (fgets(line, sizeof line, stdin)) {  // read input line by line
+    int num;
+    if (sscanf(line, "%d", &num) != 1) {  // the line didn't start with a valid integer
+        break;
+    }
+    printf("%d\n", num);
+}
+
+If you want to check specifically for an empty string, not just something that doesn't look like a number, you could use strspn:
+if (line[strspn(line, " \t\n")] == '\0') {
+    // line contains spaces / tabs / newlines onlyThere are other things that can be on a line other than an integer. Your code indicates an integer expected, but your text only indicates the line is blank or only contains a space.
+Given your text in the question:
+#include <stdio.h>
+#include <string.h>
+
+int main( void )
+{
+    char line[1024];
+
+    while( fgets( line, sizeof( line ), stdin ) )
+    {
+        if(   (strlen( line ) == 1 ) 
+          ||  (strlen( line ) == 2  && line[0] == ' '))
+        {
+            // all done
+            break;
+        }
+        else
+        {
+            // process line
+        }
+    } // end while
+}(C Programming) How do I use a data structure and function which are defined in another file?Say, I have a file dataStructure.c and dataStructure.h. (My data structure is a hash map.) These files contain the implementation of the data structure and methods for adding new entries to the structure as well as retrieving entries. 
+Here's an example: 
+// dataStructure.h
+
+struct node {
+    char *label;
+    int address;
+    struct node *next; // Points to the next node.
+};
+
+struct ourTable {
+    int size;
+    struct node **list; // List of all the (key, value) pairs.
+};
+
+// Then, here are methods to create table, add new entries and retrieving them.
+struct ourTable createTable(int size);
+
+void addEntry(struct ourTable *t, char *label, int address);
+
+unsigned retrieveAddress(struct ourTable* table, char *label);
+
+The function retrieveAddress basically just returns the address of that label. Since I am trying to implement a hash map, which is just a data structure of several (key, value) pairs. In my case, the key is label whereas value is address.
+unsigned retrieveAddress( struct ourTable* table, char *label)
+{
+    int bin = 0;
+    bin = hashFunction(table, label); // Hashing function
+
+    struct node *list = table->list[bin];
+    struct node *entryItem = list;
+    while(entryItem)
+    {
+        if (entryItem->label == label)
+        {
+            return entryItem->address; // Returns the address of that label.
+        }
+        entryItem = entryItem->next;
+    }
+    return NULL;
+}
+
+Then, I have another file, establishTable.c which just uses the methods implemented in dataStructure.h to create a table and then add new entries. This is what I wrote in that file:
+// establishTable.c
+
+#include "dataStructure.h"
+
+struct ourTable establishTable()
+{    
+    struct ourTable table = createTable(1000); // Create a table with a maximum of 1000 entries.
+    addEntry(&table, "word", 1234);
+}
+
+And what I want to do is to pass the structure ourTable with the new entries I inserted in establishTable.c to the main file main.c. To illustrate what I am trying to accomplish:
+// main.c
+
+#include "dataStructure.h"
+
+#include "establishTable.h"
+
+int main()
+{
+    // I'm not sure how to pass the data structure... Something like this:
+    struct ourTable table = establishTable(); 
+
+    // Get the retrieveLabel function from dataStructure.h and use it here.
+    printf("retrieved from the table at %u\n\n", retrieveAddress(&table,"word") );
+}
+
+I tried running the main.c. It doesn't show any errors but it just outputs 
+retrieved from the table at 0
+
+which just tells me that the table I already established was not passed on at all. The output should be 1234.
+So, how do I pass a data structure and the result of a function from another file to my main.c file? It works when I just do everything in establishTable.c but that is not my intention. I have tried the extern method as suggested in other threads, but nothing works.You forgot the return statement
+struct ourTable establishTable()
+{    
+    struct ourTable table = createTable(1000); // Create a table with a maximum of 1000 entries.
+    addEntry(&table, "word", 1234);
+    return table;
+}Pass a double** in a function that takes double as input in cI tried to pass the double** as a double like this :
+double calculErreurLocale(double erreurGlobale, double entree)
+{
+    return entree*(1-entree)*erreurGlobale;
+}
+
+double** matrice1()
+{
+    double** matrice_I;
+    int i;
+
+    matrice_I=malloc(sizeof(double*)*ligne);
+    for (i=0; i<ligne; i++)
+    {
+        matrice_I[i]=malloc(sizeof(double)*colonne);
+    }
+
+    //affiche_matriceFloat(matrice_I);
+    return matrice_I;
+}
+
+int main()
+{
+    double **matrice = matrice1();
+    matrice[0][0]=-1;
+    matrice[1][0]=-1;
+
+    calculErreurLocale(errGlobale, matrice);
+ return = 0;
+}
+
+Obviously I get an error. I tried to cast it or something like this :
+calculErreurLocale(errGlobale, (double) matrice);
+
+Then I get "error: pointer cannot be cast to type 'double'".
+Is my problem something else, maybe the design is not correct...As per your function definition for calculErreurLocale its expected that you pass an element of the 2-D array matrice. If you, however, want to pass the entire array into the function and then manipulate the same, I would suggest you change the function definition to double calculErreurLocale(double erreurGlobale, double** entree). The code snippet is too ambiguous to understand what you want to do with the code, but explicitly typecasting your array to a double value is not the answer.matrice is an array of pointers whereas your function
+expects a double. You can only pass it one element of
+the matrix at a time. For the first item in the first row:
+calculErreurLocale(errGlobale, matrice[0][0]);
+
+If you want to apply the function to each element instead,
+do it in a loop similar to what matrice1() does.Child process not exiting with fork()I am creating a simple Linux command shell in C. I am having trouble understanding where my code is having problems. "commands" is a list of strings of Linux commands that I want to be executed concurrently as the children processes of one parent. When all are done executing, I want the parent to exit the function. However, when I call exit(0), the for loop continues and parses the current command again, causing the args to be executed again in execvp. Am I using fork() and wait() correctly here? I have tried using waitpid() as well with no luck.
+void executeShell(char** commands){
+    char **arr = commands;
+    char *c;
+    pid_t pid, wpid;
+    int status = 0;
+
+    for (c = *arr; c; c=*++arr){
+        // printf("%d-\n", strcmp(command, "exit"));
+
+        if (strcmp(c, "exit") == 0){
+            EXIT = 1;
+            return;
+        }
+
+        printf("Running command \'%s\'...\n", c);
+
+        char** args = parseStringToTokenArray(c, " ");
+        free(args);
+
+        /* fork and execute the command */
+        pid = fork();
+        if(pid < 0){
+            perror("fork() error\n");
+            return;
+        }
+        /* child process executes command */
+        else if (pid == 0){
+            /* 'cd' is not a part of /bin library so handle it manually */
+            if (strcmp(args[0], "cd") == 0){
+                changeDirectory(args[1]);
+            }
+            else if (strcmp(args[0], "sdir") == 0){
+                searchDirectory(args[1]);
+            }else{
+                /* parse commands with arguments */
+                execvp(args[0], args);//execute the command
+            }
+            exit(0);// <-----command is finished, so why no exit?
+        }                                     
+    }                                          
+    /* wait for children to complete */          
+    while((wpid = wait(&status)) > 0);         
+}If execvp succeeds, the entire child process address space is replaced by the program invoked by execvp(). This means that the exit(0) will only ever be invoked following your two special cases i.e. cd and sdir. As far as your code is concerned execvp() should never return, unless there is an error.
+A further problem is that you free args immediately after allocating it and then go on to use it in your child processes. This is undefined behaviour.
+The only problem I see with your wait code is that, if any of the children block waiting for user input, the parent will block waiting for the child to exit.
+The cd code, has no effect on any process except the child in which it is executed. The parent's current directory is not affected. As you state in the comments, this can bet fixed by handling cd in the parent without forking.From recursive algorithm to an iterative oneI have to convert this recursive algorithm into an iterative one:
+  int alg(int A[], int x, int y, int k){
+    int val = 0;
+
+    if (x <= y){
+      int z = (x+y)/2;
+
+      if(A[z] == k){
+        val = 1;
+      }
+
+      int a = alg(A,x,z-1,k);
+
+      int b;
+
+      if(a > val){
+        b = alg(A,z+1,y,k);
+      }else{
+        b = a + val;
+      }
+
+      val += a + b;
+  }
+
+  return val;
+ }
+
+I tried with a while loop, but I can't figure out how I can calculate "a" and "b" variables, so I did this:
+  int algIterative(int A[], int x, int y, int k){
+   int val = 0;
+
+   while(x <= y){
+     int z = (x+y)/2;
+
+     if(A[z] == k){
+        val = 1;
+     }
+
+     y = z-1;
+   }
+  }
+
+But actually I couldn't figure out what this algorithm does.
+My questions are: 
+What does this algorithm do? 
+How can I convert it to iterative? 
+Do I need to use stacks?
+Any help will be appreciated.I am not sure that alg computes anything useful.
+It processes the part of the array A between the indexes x and y, and computes a kind of counter.
+If the interval is empty, the returned value (val) is 0. Otherwise, if the middle element of this subarray equals k, val is set to 1. Then the values for the left and right subarrays are added and the total is returned. So in a way, it counts the number of k's in the array.
+But, if the count on the left side is found to be not larger than val, i.e. 0 if val = 0 or 0 or 1 if val = 1, the value on the right is evaluated as the value on the left + val.
+
+Derecursivation might be possible without a stack. If you look at the sequence of subintervals that are traversed, you can reconstruct it from the binary representation of N. Then the result of the function is the accumulation of partials results collected along a postorder process.
+If the postorder can be turned to inorder, this will reduce to a single linear pass over A. This is a little technical.A simple way could be smt like this with the aid of a two dimensional array:
+int n = A.length;
+int[][]dp = new int[n][n];
+for(int i = n - 1;i >= 0; i--){
+    for(int j = i; j < n; j++){
+        // This part is almost similar to the recursive part.
+        int z = (i+j)/2;
+        int val = 0;
+        if(A[z] == k){
+          val = 1;
+        }
+
+        int a = z > i ?  dp[i][z - 1] : 0;
+
+        int b;
+
+        if(a > val){
+           b = (z + 1 <= j) ? dp[z + 1][j] : 0;
+        }else{
+           b = a + val;
+        }
+
+        val += a + b;
+        dp[i][j] = val; 
+    }
+}
+return dp[0][n - 1];
+
+Explanation: 
+Notice that for i, it is decreasing, and j, it is increasing, so, when calculate dp[x][y], you need dp[x][z - 1] (with z - 1 < j) and dp[z + 1][j] (with z >= i), and those values should already be populated.Add plugins to a C program [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 2 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+Good morning everyone, i ll be so happy and grateful if someone could help me and give me some information about how to make a C program that we can add to it plugins, how exactly we can make plugins and add them to a C program .
+Thank you so much for your help.No portably, no.
+In POSIX you can use dlopen() and friends to implement dynamic loading of code into which you can call. You need to decide how you want to make the main program's functionality available to the plug-in, it can be a bit messy.
+In Win32 the classical solution used to be LoadLibraryEx(), not sure if that is still considered acceptable; I don't do a lot of Windows development.
+For an example of an open-source program (i.e. you can read its source and learn how it's done) see the lightweight text editor/IDE called Geany.Having trouble understanding the Pointer-System of Boundary conditions on a simulation codeΗi, Im having some troubles understanding how boundary conditions are working on a simulation code (written mainly in c) integrating known equations for a certain box.
+It's for Physics, although the question is mainly programming.
+Let's say you got a grid 5x5 as for r x z
+At r=0, r=5 and z=0, z=5 the code must have known functions for the integrating quantities. For a common simulation, the code is solving for densityrho, pressure P and velocity V. 
+As it stands on page 53of THIS document, if we want for the quantity to be reversed/reflected we follow this code
+/* -- reflective boundary for r > 1 --*/
+d->Vc[RHO][k][j][i] = d->Vc[RHO][k][2*JBEG - j - 1][i];
+
+If we want d density / d [grid quantity] = 0 to be zero, so the same value on the beginning of the box, the code would be
+/* -- outflow boundary for r > 1 --*/
+d->Vc[RHO][k][j][i] = d->Vc[RHO][k][JBEG][i];
+
+If I want for the code to follow a certain derivative lets say
+d density / d [grid quantity] = A*[g q]**2/2
+
+or a known function
+density = B*[g q]**2/2
+
+how would I write the boundary condition using that system.Examples of non-separate compilation?From section 1.1 of "The C Book":
+
+At the coarsest level, an obvious feature is the multi-file structure
+  of a program. The language permits separate compilation, where the
+  parts of a complete program can be kept in one or more source files
+  and compiled independently of each other. The idea is that the
+  compilation process will produce files which can then be linked
+  together using whatever link editor or loader that your system
+  provides. The block structure of the Algol-like languages makes this
+  harder by insisting that the whole program comes in one chunk,
+  although there are usually ways of getting around it.
+
+Can anyone provide some basic examples / overview of programming in this nature ?Example Algol program, which does nothing useful but is here to illustrate the point:
+   begin
+   int x; x:=3;
+
+   procedure p;
+       begin
+       integer y; y:=4;
+
+       procedure q(n);
+          value n; integer n;
+          if n > 0
+          then q(n-1)
+          else begin
+              integer z; z:=x+y;
+              print(z)
+              end;
+
+       q(1)
+       end;
+
+    p; comment a parameterless procedure call;
+    end;
+
+The basic problem here is nested scopes. The procedure q depends on the surrounding blocks that define integers x and y. The procedure p likewise depends (by virtue of containing q) on the block that defines x.
+You'll see, then, that each part of this stupid example program is inseparable from the surrounding text.  This is the natural mode of expression to Algolers; to nest procedures in a way that makes sense for the program being written. In general this makes separate compilation quite complicated.  This differs from C-like languages which have no nested procedures (functions, whatever) because the only non-local identifiers they can refer to are file scope or global scope (if I have those terms correct).
+Here, the variables x and y are local to some procedure and are therefore on the stack. Just to make it more complicated, q is recursive, which makes the "distance down the stack" from its innermost invocation to the locations of x and y a variable quantity, so it's not just a matter of compiling a fixed value off some stack-frame pointer.
+Nevertheless, there were some systems that allowed separate compilation. As far as I recall, there were restrictions, such as the unit of compilation (a file, if you like) having to contain only procedures 'at the top level'. They might also have needed some extended syntax (like 'external procedure foo') to tell the compiler that something being referenced was not expected to be defined in the current file.I am not sure what the book means with "The block structure of the Algol-like languages makes this harder by insisting that the whole program comes in one chunk." But I can imagine that an Algol-like language allows or requires that functions and procedures are declared within the main program block, implying that there is only one program block and this will not allow partitioning the program in compilable units, as C does. But again, I don't know what the book means with that statement.
+Hypothetical example:
+AlgolMain
+Begin
+    procedure x
+    Begin
+        ....
+    End
+    ....
+EndCan anyone provide some basic examples / overview of programming in
+  this nature ?
+
+Have one file called add.c that contains the following code:
+int add(int a, int b){
+    return a+b;
+}
+
+Compile it with:
+gcc -c add.c
+
+This creates add.o. Now have a file with following code called main.c:
+#include <stdio.h>
+int add(int, int); // declares "add", but doesn't implement it!
+
+int main( int argc, char **argv){
+    printf("3 + 2 = %d\n", add(3,2));
+    return 0;
+}
+
+This declares add, but doesn't implement it. It won't run on its own. But you can still compile it with 
+gcc -c main.c
+
+And then you can link them with:
+gcc add.o main.o 
+
+If you run the resulting program (might be called a.exe` or something similar) you will get the following result:
+
+3 + 2 = 5
+
+The advantage of this is that you can modify one of the parts, recompile it, then link it again without having to touch the other parts. If you want a more detailed explanation on the matter, I recommend reading this answer.Smallest example of non separate compilation, the alone file m.c containing :
+int main() {}
+
+compilation : gcc m.cproducing the executable a.out
+
+In C we are free to put all in one file or in several files and also to compile in one or several steps, if this is your question
+Example with 2 functions in the alone file m.c :
+#include <stdio.h>
+
+void hw()
+{
+   puts("hello world");
+}
+
+int main()
+{
+   hw();
+}
+
+Compilation, we are also free to do in one or several steps
+
+gcc m.c producing the executable a.out
+or gcc -c m.c producing m.o then gcc m.o producing executable a.out
+
+Same program using several files, hw.c containing
+#include <stdio.h>
+#include "hw.h" /* not mandatory in current case but recommended to check signature compatibility */
+
+void hw()
+{
+   puts("hello world");
+}
+
+and hw.h containing
+#ifndef _HW_H
+#define _Hw_H
+extern void hw();
+#endif
+
+and m.c containing
+#include "hw.h"
+
+int main()
+{
+   hw();
+}
+
+Compilation, using one or several steps :
+
+gcc m.c hw.c producing executable a.out
+or gcc -c m.c hw.c producing objects m.o and hw.o, then gcc m.o hw.o to produce executable a.out
+or gcc -c m.c producing objects m.o then gcc -c hw.c producing object hw.o then gcc m.o hw.o to produce executable a.out
+
+It is also possible to create and use a library, here a static library containing only hw.o :
+
+gcc -c m.c hw.c producing objects m.o and hw.o (or two gcc commands, one by object)
+ar rcs hw.a hw.o to make the static library containing hw.o
+gcc m.o hw.a to produce the executable a.outHow to return or exit a function if meet the conditionI'm new to C and trying to write a double linked list for in C. I want to jump out of or return null value if the index out of the linked list counts but not exit the whole program. Just to print the error and return Null or something that user will recognise out of scope. I don't know if C can do it.
+Here is part of my code. free_node function is to return data of the node and release the node space. I just want to know what can I do to this pop function that I can deal with out of scope problem. 
+Thanks
+typedef struct node{
+    void *data;
+    struct node *next,*prev,*head,*tail;
+}Node;
+
+typedef Node *List;
+
+Node pop_node(List plist,long index){
+    Node *pnode;
+    pnode=direct_to_head(plist)->next;
+    if(index>list_count(plist)){
+        fprintf(stderr, "index out of link list scope.");
+        return;
+    }
+    while (pnode->next!=NULL && index-->0) {
+        pnode=pnode->next;
+    }
+
+    return free_node(pnode);
+}I want to jump out of or return null value ... I don't know if C can do it.
+
+The short answer is No
+You - as the designer - have decided that the function pop_node shall return an object of type Node (aka struct node). That means that the code shall always return an object of type Node. C does not allow you to suddenly return another type. Consequently something like return NULL; will not be allowed.
+
+I just want to know what can I do to this pop function that I can deal with out of scope problem.
+
+You could change the function signature to return a pointer to a Node and leave the copying/freeing to the caller. In that case you can use NULL as a value for indicating "no object available".If a function is declared to return void (that is, nothing), it can only return nothing. If a function is declared to return some other type T, that's all it can return.
+Consider:
+
+returning a pointer to type Node (which can be NULL)
+returning multiple values (as a struct containing them), one being a flag or error code
+returning a 2nd value through an additional pointer given to the function (again, one being a flag/code)
+using longjmp()
+
+Another variant of option 1 is to define a special global variable of type Node with a suitable/recognizable name, e.g. ErrorNode, and return a pointer to it. The caller can then compare the returned pointer with &ErrorNode to detect the error condition. It doesn't seem special at first sight, but if you end up needing to recognize several distinct error conditions (not too many, though), you may define several such variables (not too many because you'll need to use if/else instead of switch in order to distinguish them).Not nice but possible would be to define a Node with sort of a "Invalid-Node" value and in case there is no node to return just return the "Invalid-Node"-node.
+const Node InvalidNode = {(void*)-1, 
+  (struct node*)-1, (struct node*)-1, (struct node*)-1, (struct node*)-1
+};
+
+#define NODE_IS_INVALID(n) ( \
+  ((n).data == InvalidNode.data) && \
+  ((n).next == InvalidNode.next) && \
+  ((n).prev == InvalidNode.prev) && \
+  ((n).head == InvalidNode.head) && \
+  ((n).tail == InvalidNode.tail) \
+)
+
+Then change your function to look like this:
+Node pop_node(List plist,long index){
+  Node *pnode;
+  pnode=direct_to_head(plist)->next;
+  if(index>list_count(plist)){
+    fprintf(stderr, "index out of link list scope.");
+    return InvalidNode;
+
+    ...
+
+And call it like this:
+Node n = pop_node(...);
+if (NODE_IS_INVALID(n))
+{
+   /* handle error */
+}
+else
+{
+   /* use n here */
+}I have changed my function like this. I think I don't need to return pointer to node, I just need data from it. So I can free node while retrive my data.
+That's my whole double-cross link list code:
+//
+//  double_linklist.c
+//  tt
+//
+//  Created by tarrant on 2019/2/16.
+//  Copyright © 2019 tarrant. All rights reserved.
+//
+
+#include "double_linklist.h"
+
+static void c_free(void *p){
+    free(p);
+    p=NULL;
+}
+
+static Node *direct_to_index(List plist,long index){
+    Node *pnode;
+    unsigned int count = list_count(plist);
+    if (labs(index) > count+2){
+        fprintf(stderr, "index out of scope.");
+        return NULL;
+    }
+    if (index >=0){
+        if(plist->head==NULL){
+            pnode=plist;
+        }
+        else
+            pnode=plist->head;
+        while (true){
+            if(--index<0)
+                break;
+            else
+                if (pnode->next!=NULL)
+                    pnode=pnode->next;
+                else{
+                    fprintf(stderr, "invalid node %p.",pnode);
+                    return NULL;
+                }
+        }
+    }
+    else{
+        if(plist->tail==NULL){
+            pnode=plist;
+        }
+        else
+            pnode=plist->tail;
+        while (true){
+            if(++index>=0)
+                break;
+            else
+                if (pnode->prev!=NULL)
+                    pnode=pnode->prev;
+                else{
+                    fprintf(stderr, "invalid node %p.",pnode);
+                    return NULL;
+            }
+        }
+    }
+     return pnode;
+}
+
+static Node *direct_to_head(List plist){
+    return direct_to_index(plist, 0);
+}
+
+static Node *direct_to_tail(List plist){
+    return direct_to_index(plist, -1);
+}
+
+void empty_list(List plist){
+    Node *tmp,*current;
+    plist=direct_to_head(plist);
+    current=plist->next;
+    while (current->next!=NULL) {
+        if(current->data!=NULL){
+            c_free(current->data);
+        }
+        tmp=current;
+        current=current->next;
+        c_free(tmp);
+    }
+    current->prev=plist;
+    plist->next=current;
+}
+
+List init_list(void){
+    Node *head,*tail;
+    if((head = (Node *)calloc(1, sizeof(Node)))!=NULL){
+        tail = (Node *)calloc(1, sizeof(Node));
+        head->tail=tail;
+        head->data=(unsigned int *)calloc(1, sizeof(unsigned int));
+        head->next=tail;
+        if(tail!=NULL){
+            tail->prev=head;
+            tail->data=NULL;
+            tail->head=head;
+            return head;
+        }
+    }
+    fprintf(stderr, "No space in initing.");
+    return NULL;
+}
+
+
+bool isempty_node(const Node *pnode){
+    if(pnode->data==NULL)
+        return true;
+    return false;
+}
+
+bool free_node(Node *pnode){
+    unsigned int *count;
+    Node *next,*prev;
+    if(pnode->next==NULL ||pnode->prev==NULL){
+        fprintf(stderr, "You are empting head,tail or invaild node.");
+        return false;
+    }
+    count=direct_to_head(pnode)->data;
+    next=pnode->next;
+    prev=pnode->prev;
+    next->prev=prev;
+    prev->next=next;
+    c_free(pnode);
+    c_free(pnode->data);
+    --*count;
+    return true;
+}
+
+void free_all_empty_nodes(List plist){
+    Node *phead;
+    unsigned int count=0;
+    phead=direct_to_head(plist)->next;
+    while (phead->next!=NULL) {
+        if((phead->data==NULL)&&(free_node(phead)==false))
+            fprintf(stderr, "error in empting index %d",count);
+        phead=phead->next;
+        count++;
+    }
+}
+
+Node *pop_node(List plist,long index){
+    Node *pnode,*next,*prev;
+    if (index>=0)
+        index++;
+    else
+        index--;
+    pnode=direct_to_index(plist, index);
+    next=pnode->next;
+    prev=pnode->prev;
+    pnode->head=NULL;
+    pnode->tail=NULL;
+    next->prev=prev;
+    prev->next=next;
+    return pnode;
+}
+
+unsigned int list_count(List plist){
+    unsigned int *count;
+    Node *phead;
+    if(plist->head==NULL){
+        phead=plist;
+    }
+    else
+        phead=plist->head;
+    count=phead->data;
+    return *count;
+}
+
+void insert_list(const void *data,List plist,size_t size,long index){
+    Node *tmp,*current;
+    unsigned int *count;
+    if(data==NULL){
+        fprintf(stderr, "data is empty.");
+        return;
+    }
+    tmp=(Node *)calloc(1, sizeof(Node));
+    tmp->data=(void *)calloc(1, size);
+    if(tmp==NULL||tmp->data==NULL){
+        fprintf(stderr, "no space for allocation.\n");
+        return;
+    }
+    memcpy(tmp->data,data,size);
+    if (index<0)
+        index--;
+    current=direct_to_index(plist, index);
+    tmp->next=current->next;
+    current->next->prev=tmp;
+    current->next=tmp;
+    tmp->prev=current;
+    tmp->head=direct_to_head(current);
+    tmp->tail=direct_to_tail(current);
+    count=direct_to_head(plist)->data;
+    ++*count;
+}
+
+void append_list(const void *data,List plist,size_t size){
+    insert_list(data,plist,size,-1);
+}
+
+bool modify_node(Node *node,const void *data,size_t size){
+    if((data==NULL)||(node->prev==NULL)||(node->next)==NULL)
+        return false;
+    free(node->data);
+    node->data=(void *)malloc(size);
+    memcpy(node->data,data,size);
+    return true;
+}
+
+bool modify_list(const void *data,List plist,long index,size_t size){
+    Node *phead;
+    if(data==NULL)
+        return false;
+    if (index>=0)
+        index++;
+    else
+        index--;
+    phead=direct_to_index(plist, index);
+    return modify_node(phead,data,size);
+}
+
+void traverse_list(const List plist,void (*pfun)(void *pdata),int flag){
+    Node *pnode;
+    if(flag>=0){
+        pnode=direct_to_head(plist)->next;
+        while (pnode->next!=NULL) {
+            (pfun)(pnode->data);
+            pnode=pnode->next;
+        }
+    }
+    else{
+        pnode=direct_to_tail(plist)->prev;
+        while (pnode->prev!=NULL) {
+            (pfun)(pnode->data);
+            pnode=pnode->prev;
+        }
+    }
+}You want to jump within function - Have a look at goto statement. The goto statement is used to jump anywhere within function.
+goto lable;
+label:
+     statement;
+In your case print the error and jump to free_node statement. return keyword in C exit the function with return code.Signals in C while using switchcontextI've tried to implement a user-level thread library, using makecontext(), swapcontext() and getcontext() functions. I've read that a good practice is to use signals for schedule function (with a cyclic timer), but while a new thread is adding, block signals.
+My problem is that: I can implement function to block signals, but it does not work when I use context switching.
+void initSignals()
+{
+    printf("initSignals\n");
+    act.sa_handler = schedule;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    sigaction(SIGALRM, &act, &oact);
+}
+
+
+void blockSignals()
+{
+    printf("blockSignals\n");
+    //sigset_t sig_mask;
+    sigemptyset(&sig_mask);
+    sigaddset(&sig_mask, SIGALRM);
+    sigprocmask(SIG_BLOCK, &sig_mask, NULL);
+}
+
+void unblockSignals()
+{
+    printf("unblockSignals\n");
+    //sigset_t sig_mask;
+    sigemptyset(&sig_mask);
+    sigaddset(&sig_mask, SIGALRM);
+    sigprocmask(SIG_UNBLOCK, &sig_mask, NULL);
+    runTimer();
+}
+
+About sigset_t sig mask now it is global, but I tried to set it like a local variable too. 
+Moreover I tried to use another signals SIGPROF, SIGVTALRM, because my cyclic timer looks like:
+void runTimer()
+{
+    printf("runTimer\n");
+    it.it_interval.tv_sec = 1;
+    it.it_interval.tv_usec = 0;
+    it.it_value.tv_sec = 1;
+    it.it_value.tv_usec = 0;
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+
+And itimer allow to use this 3 types of alarm...
+So the question is: how to block signals while code is using context switching functions? Is it possible? Maybe another functions exist which can do that?
+I thought that signals are being used for all processes, so I was surprised that it is not working...C program which returns the sum of the digits of an integer#include <stdio.h>
+int main()
+{
+
+int sum=0, prod=1, a, b;
+
+printf("Enter a number: \n");
+
+scanf("%d",&a);
+
+while (a!=0)
+
+sum = sum + a%10;
+    a = a/10;
+
+while (b!=0)
+
+prod = prod + b%10;
+    b = b/10;
+
+
+printf("Sum=%d\nProd=%d\n", sum, prod);
+
+
+return 0;
+}
+
+This C program returns the sum and product of the digits of a given integer, but i want someone to break it down for me, and also when i ran it, it doesn't work, so can someone correct me, please.% is the modulus operation, i.e. it gives you the reminder of the division by the divisor. In your case the operation % 10 effectively returns the last digit of the number. You sum this digit to the prod variable which represents the total sum of digits. Once you have summed the current digit you perform the next main operation / 10 which is integer divison and just removes the last digit of the number.Your code is very badly indented and necessary block delimiters {} are missing. Also b is not initialized and you compute the sum, not the product of the digits.
+Here is a corrected version:
+#include <stdio.h>
+
+int main() {
+    int n, sum, prod, a, b;
+
+    printf("Enter a number: \n");
+
+    if (scanf("%d", &n) != 1)
+        return 1;
+
+    a = n;
+    sum = 0;
+    while (a != 0) {
+        sum = sum + a % 10;
+        a = a / 10;
+    }
+
+    b = n;
+    prod = 1;
+    while (b != 0) {
+        prod = prod * (b % 10);
+        b = b / 10;
+    }
+
+    printf("Sum=%d\nProd=%d\n", sum, prod);
+
+    return 0;
+}As you're reading the number from the user, read a string.
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char buf[999];
+    while (fgets(buf, sizeof buf, stdin)) { // read a string rather than scanf an integer
+        buf[strcspn(buf, "\n")] = 0; // remove trailing newline
+        char *p = buf;
+        int invalidflag = (*p == 0);
+        unsigned sum = 0;
+        unsigned product = 1;
+        while (*p) {
+            if (isdigit((unsigned char)*p)) {
+                sum += *p - '0';
+                product *= *p - '0';
+            } else {
+                invalidflag = 1;
+                break;
+            }
+            p++;
+        }
+        if (invalidflag) {
+            printf("input = \"%s\" ==> INVALID INPUT\n", buf);
+        } else {
+            printf("input = \"%s\"; sum = %d; product = %d\n", buf, sum, product);
+        }
+    }
+    return 0;
+}
+
+See ideone.com/ZLkOfJPointer to an array of pointers referencing functions, how do I change pointer values and call functions?int *(*(*functions_array)[4](); 
+int *function() { /*code */ };
+
+I know that with a Pointer referencing a function int *(*func)(); I can just assign pointer value of a function to func func = &function; and then call with func();.
+What's the closest I could get to this behavior but with addition of arrays ?You probably want this:
+#include <stdio.h>
+
+int function1(void)
+{
+  printf("function 1\n");
+  return 1;
+};
+
+int function2(void)
+{
+  printf("function 2\n");
+  return 2;
+};
+
+int(*FunctionPointer)(void);             // a function pointer
+int(*ArrayOfFunctionPointers[4])(void);  // an array of 4 function pointers
+
+
+int main()
+{
+  FunctionPointer = function1;
+  FunctionPointer();                     // will call function1
+
+  FunctionPointer = function2;
+  FunctionPointer();                     // will call function2
+
+  ArrayOfFunctionPointers[0] = function1;
+  ArrayOfFunctionPointers[1] = function2;
+
+  for (int i = 0; i < 2; i++)
+  {
+    ArrayOfFunctionPointers[i]();
+  }
+}
+
+Output:
+function 1
+function 2
+function 1
+function 2First thing's first, the declaration you show is ill-formed. Not surprisingly, given how hard the declarator syntax in C can be. If you wanted an array of function pointers (something I strongly suspect), then the raw spelling is like this:
+int *(*functions_array[4])();
+
+Not much more readable, but at least syntactically correct. You can now index into it to obtain a function pointer for your use. E.g:
+functions_array[0] = function; 
+functions_array[0](); // Call the function
+
+But if you really wanted a pointer to an array (for reasons I can't fathom), the raw declarator is this:
+int *(*(*functions_array_p)[4])();
+
+With the now less appealing indexing to match:
+(*functions_array_p)[0] = function; 
+(*functions_array_p)[0](); // Call the function
+
+The parenthesis are required due to the regular precedence of * and [].
+But the way to make working with it and defining it easier, is by introducing some type aliases. Primarily, for the function type:
+typedef int* function_type();
+
+Now the array declaration takes this far more readable form:
+function_type* functions_array[4];
+
+The asterisk in plain sight is inline with the generally good practice of not hiding away pointer semantics.
+And for a pointer to an array:
+function_type* (*functions_array)[4];
+
+The declarator is still fairly regular looking.
+
+
+1. As an aside, an empty parameter list in a C function declaration does not mean the function takes no arguments. It's an obsolescent feature providing a function with no prototype. The way forward is (void).Adding a new data into a char array of readingsI'm designing the firmware for ESP32 using the ESP-IDF and FreeRTOS. 
+I want to convert the reading of a sensor into a char array and store it in the Non-Volatile Storage. When a new reading is taken, it is to be added to the front of the char array pushing the older readings to the right.
+I'm doing the array manipulation in this way:
+#define MAX_BYTES 100
+char oldData[MAX_BYTES];
+char newData[15];
+sprintf(newData, "%.2f", Totalmass);
+strcat(newData, ",");
+int newlen = strlen(newData);
+int looper = (sizeof(oldData) - newlen - 1);
+for(int i = looper; i >= 0; i--)    {
+    oldData[i + newlen] = oldData[i];
+}
+looper = strlen(newData);
+for(int i = 0; i < looper; i++) {
+    oldData[i] = newData[i];
+}
+printf("strlen final Data:\n", strlen(oldData));
+printf("Final Data: %s\n", oldData);
+
+Now coming to the problem I'm facing:
+After the length of oldData exceeds 100 i.e, MAX_BYTES, the length of oldData is 100 + the length of the newest reading. On printing my final array, I see that the newest data, gets concatenated to the front(which is desirable), but it also adds to the end of the array. This is probably why my data length exceeds by MAX_BYTES by the length of my newest data.
+OUTPUT:
+strlen final Data: 112
+Final Data: -3129344.00,0.00,0.00,0.00,0.00,0.00,2796202.00,-8388604.00,133152.00,0.00,0.00,0.00,0.00,0.00,0.00,-3129344.00,
+
+If you'll see the above output, the length exceeds MAX_BYTES by 12, which is the length of the latest reading i.e, "-3129344.00,". And that data occurs in the array in the beginning as well as the end of the array. 
+
+Why is this unwanted behavior occuring? Can anyone notice if I'm doing something wrong?
+This question is just for my curiosity. Why isnt the array overflowing even if the length exceeds its size? I noticed that the code crashed earlier when it exceeds the size by a larger amount.
+
+Thanks in advance for anyone going through my question!requirement of mc56f8367 header filesi am new to embedded programming i like to program a bldc motor with mc56f8367 with IDE
+CodeWarrior® Development Studio for 56800/E Digital Signal Controllers (Classic IDE) v8.3
+but i m unable to find header files for the particular microcontroller and i am using a 64 bit windows 7 os and there some progress to be taken for the perfect functioning of codewarrior, is there any other version that support 64 bit Windows 7, containing header files or any other way to download header filesCheck for updates on that IDE, maybe the device was introduced later. (e.g. "CodeWarrior for MCUs" which got an update to 11.1 last year)
+Check, if NXP provides some examples or extra libs
+Check for a more generic header, maybe it has some device specific extensions, depending on some compiler switches (incl the target switch) enabling this code part.
+You should be able to write such a header or register definitions yourself. It's not so much rocket science but rather tedious work of reading the processor manual and writing the header definitions.Modifying a program to run as command line arguments in CFull disclosure, this is an assignment for a class I have to do. We have a program that checks if two words are anagrams. We are supposed to modify it so that we can enter the words as command lines in a program. For instance: (./a.out hello elloh: is an anagram... ./a.out hello world: Not an anagram).
+Here is the original program: 
+#include <stdio.h>
+#define N 26
+
+int main()
+{
+
+
+    char ch;
+    int letter_counts[N]= {0};
+    int i;
+    int count =0;
+
+    printf("enter a word: ");
+
+    while((ch=getchar())!= '\n')
+
+    {
+        letter_counts[ch - 'a']++;
+
+    }
+
+    for(i =0;i<N;i++)
+        printf("%d", letter_counts[i]);
+
+
+    printf("enter the second word: ");
+    while((ch=getchar())!= '\n')
+
+    {
+        letter_counts[ch - 'a']--;
+
+    }
+
+    for(i =0;i<N;i++)
+        printf("%d", letter_counts[i]);
+
+    for(i =0;i<N;i++)
+        if(letter_counts[i]==0)
+            count++;
+
+
+    if(count == N)
+        printf("The words are anagrams.\n");
+    else
+
+        printf("The words are NOT anagrams.\n");
+
+
+    return 0;
+}       
+
+Now here is what I have so far:
+#include <stdio.h>
+#define N 26
+
+/*
+  This program is a modified version of anagram.c so that the words run as command-line arguments.   
+*/
+int main(int argc, char *argv[])
+{
+  if(argc != 3)
+  {
+    printf("Incorrect number of arguments");
+    return 0;
+
+  }
+  char ch;
+    int letter_counts[N]= {0};
+    int i;
+    int count =0;
+  //int k;
+  //for (k = 1; i < argc; i++) 
+  //{
+    while((ch=getchar())!= '\n')
+      {
+          letter_counts[ch - 'a']++;
+    }
+
+      for(i =0;i<N;i++)
+          printf("%d", letter_counts[i]);
+
+      while((ch=getchar())!= '\n')  
+      {
+          letter_counts[ch - 'a']--;
+      }
+
+      //for(i =0;i<N;i++)
+        //printf("%d", letter_counts[i]);
+
+      for(i =0;i<N;i++)
+          if(letter_counts[i]==0)
+              count++;
+
+    int k;
+    int j;
+    for (k = 1; i < argc; i++)
+    {
+      for (j = 0; j < N; j++)
+      {
+        if (count == N) 
+        {
+          printf("%s and %s are anagrams\n", argv[k], argv[k + 1]);
+          break;
+        } 
+        else
+          printf("The words are NOT anagrams. \n");
+      }
+    }
+
+    if(count == N)
+          printf("The words are anagrams.\n");
+     else
+        printf("The words are NOT anagrams.\n");
+  //}
+
+
+
+
+    return 0;
+}       
+
+The output (if the number of arguments is correct) is always :
+0000000000000000000000000
+0000000000000000000000000
+These are anagrams
+
+What am I doing wrong here and what is the best way to go about this?
+Thank you for any help I really appreciate it.You are using getchar() which reads from STDIN, which isn't what you want to do if you're getting your words from command-line arguments. Instead you want to look at argv:
+for (char *c = argv[1]; *c != NULL; c++) {
+    letter_counts[*c - 'a']++;
+}
+
+and
+for (char *c = argv[2]; *c != NULL; c++) {
+    letter_counts[*c - 'a']--;
+}
+
+More about argc and argv: http://crasseux.com/books/ctutorial/argc-and-argv.htmlTo not solve your homework for you I'll show you how to use argc and argv on a different program that just checks if the first parameter reversed equals the second:
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("Usage: %s first_word second_word\n\n", argv[0]);
+        return EXIT_SUCCESS;
+    }
+
+    char const *first = argv[1];
+    char const *second = argv[2];
+
+    size_t first_length = strlen(first);
+    size_t second_length = strlen(second);
+
+    if (first_length != second_length) {
+        puts("The words are NOT semordnilaps.\n");
+        return EXIT_SUCCESS;
+    }
+
+    for (size_t first_index = first_length, second_index = 0; first_index; --first_index, ++second_index) {
+        if (first[first_index - 1] != second[second_index]) {
+            puts("The words are NOT semordnilaps.\n");
+            return EXIT_SUCCESS;
+        }
+    }
+
+    puts("The words are semordnilaps.\n");
+}Modified program torun from command line argumement. Below is working code snippet for you. 
+Here we pass two command line arguments with program name. while ((ch = argv[1][len]) != '\0') retrieve the char by char from first arguments and  while ((ch = argv[2][len]) != '\0') retrieve the same from the second and rest of the logic remains same.
+#include <stdio.h>
+#define N 26
+
+int main(int argc, char *argv[])
+{
+    if( argc != 3)
+    {
+        printf("Incorrect argumemts\n");
+        return 0;
+    }
+    char ch;
+    int letter_counts[N]= {0};
+    int i;
+    int count =0;
+
+    int len=0;
+    while ((ch = argv[1][len]) != '\0')
+    {
+        letter_counts[ch - 'a']++;
+        len++; /* moving index */
+    }
+
+    for(i =0;i<N;i++)
+        printf("%d", letter_counts[i]);
+
+    len=0;
+    while ((ch = argv[2][len]) != '\0')
+    {
+        letter_counts[ch - 'a']--;
+        len++; /* moving index */
+    }
+
+    for(i =0;i<N;i++)
+        printf("%d", letter_counts[i]);
+
+    for(i =0;i<N;i++)
+        if(letter_counts[i]==0)
+            count++;
+
+    if(count == N)
+        printf("The words are anagrams.\n");
+    else
+
+        printf("The words are NOT anagrams.\n");
+
+
+    return 0;
+}How multiple conditions inside if statement worksIf multiple conditions are used in a single if statement then the testing of those conditions are done
+a) from left to right 
+b) from right to left
+c) randomly
+d) noneThe if-else conditions are evaluated left to right. The right condition will be evaluated only when the first condition is 'false' in case of 'or'.
+if(false && condition) -> second condition doesn't get evaluated.
+if(false || condition) -> second condition gets evaluated.
+
+Similarly, The right condition will be evaluated only when the first condition is 'true' in case of 'and'.
+if(true && condition) -> second condition gets evaluated.
+if(true || condition) -> second condition doesn't get evaluated.
+
+Hope that answers your question.You cannot really have "multiple conditions" in an if statement. An if statement should have exactly one condition. This condition may be a combination of conditions, but in the eyes of the if statement, it is only one condition.
+What this mean is that it is nothing special about how a condition inside an if statement is evaluated. It is evaluated the same way as if it were executed anywhere else.
+This boils down to two different concepts: Operator associativity and Short circuiting.
+Associativity
+The logical operators have left to right associativity. That means that cond1 && cond2 will evaluate cond1 before it evaluates cond2.
+Short circuiting
+Short circuiting means that if cond1 is false, then cond2 will never be evaluated in the expression cond1 && cond2. Same goes if cond1 is true in the expression cond1 || cond2What %qu format stands for in printf()What %qu format stands for in printf().
+Know that %u is unsigned, %qu never came across. When googled found all other formats apart from %quIt's not standard, it's used in some Unixes (mostly BSD) to represent an unsigned quadword (64 bits). Hence the q as a type modifier, like l for long.It's an old BSDism that should not be used, from before C had long long types. From the FreeBSD man page for printf, you can see that, at least on FreeBSD, it was corresponding to the nonstandard type u_quad_t, and that it's marked as deprecated. I'm not sure if u_quad_t was ever formally specified as being unsigned long long, but the portable replacement is using the ll modifier with type unsigned long long, or using the PRIu64 macro with type uint64_t.Code returning different outputs using gotoI'm writing a function that takes an input n and creates a 1D array of size (2n-1)^2 to simulate a square. I.e. for an input of n = 1, there is just one point, for an input of n = 2, it would look like
+0 1 2
+3 4 5
+6 7 8
+
+and for n = 3 it would look like
+0 1 2 3 4
+5 6 7 8 9
+10 11 12 13 14
+15 16 17 18 19
+20 21 22 23 24
+
+where each number is a point.
+The function terminates when the current location is detected at being on an edge and the point attempts to move off of the square's grid.
+The purpose of this is to simulate how many points are visited for squares of different sizes, from n=2^0 up to n=2^8 and to return the fraction of how many points are visited over the total amount of points in the square.
+The function generates a random number and checks the modulus of it against 4, and if it returns 0, the location is moved up 1, if it returns 1, the location is moved right, 2 goes down, and 3 goes left.
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+double two_d_random (int n) {
+       int tot_points = (2 * n - 1)*(2 * n - 1);
+       int value = (n*n)+((n-1)*(n-1))-1; //center
+       int length = 2 * n - 1; //length of side
+       int *array = (int *)malloc (sizeof (int) * tot_points);     
+       int count = 0;
+       array[value] = 1;
+
+   while (1 == 1) {
+          int r = rand () % 4;
+          array[value] = 1;
+          if (r == 0) {//UP
+                 if ((value >= 0) && (value < length)) {
+                       goto a;
+                       }
+                 else {
+                     array[value] = 1;
+                       value -= length;
+                       }
+                 }
+          else if (r == 1) {//RIGHT
+                 if ((value % length) == (2*n-2)){
+                       goto a;
+                       }
+                 else {
+                     array[value] = 1;
+                       value += 1;
+                       }
+                 }
+          else if (r == 2) {//DOWN
+                 if ((value < tot_points) && (value >= (tot_points - length))) {
+                       goto a;
+                       }
+                 else {
+                     array[value] = 1;
+                       value += length;
+                       }
+                 }
+          else if (r == 3) {//LEFT
+                 if (value % length == 0) {
+                       goto a;
+                       }
+                 else {
+                     array[value] = 1;
+                       value -= 1;
+                       }
+                 }
+          }
+
+a:
+   for (int i = 0; i < tot_points; i++) {
+          if (array[i] == 1) {
+                 count += 1;
+                 }
+          }
+
+   free (array);
+   return 1.0 * count / tot_points;
+
+
+   }
+
+int main ()
+   {
+   int trials = 1000;
+
+   srand (12345);
+   for (int n = 1; n <= 256; n *= 2)
+          {
+          double sum = 0.;
+          for (int i = 0; i < trials; i++)
+                 {
+                 double p = two_d_random(n);
+                 sum += p;
+                 }
+          printf ("%d %.3lf\n", n, sum / trials);
+          }
+   return 0;
+   }
+
+My current problem is that while I run it on my machine, I get a range of values I'm not expecting: 
+
+However, when a colleague runs it on their machine, they get the following which is what I expected: 
+
+I realize this is a large amount to ask at one point. I also realize that I should not use goto. I've put a lot of time into this however and I've no idea how to fix this. Any help is greatly appreciated.You need to initialise your array.  When calling malloc() it just returns a chunk of un-initialised memory.  Either initialise it, or use calloc() instead, to get pre-zeroed memory.
+double two_d_random( int n )
+{
+    int tot_points = ( 2 * n - 1 ) * ( 2 * n - 1 );
+    int value = ( n * n ) + ( ( n - 1 ) * ( n - 1 ) ) - 1;      //center
+    int length = 2 * n - 1;     //length of side
+    int *array = (int *) malloc( sizeof( int ) * tot_points );
+    int count = 0;
+
+    // Initialise the array to zero
+    for ( int i=0; i<tot_points; i++ )
+    {
+        array[i] = 0;
+    }
+
+    array[value] = 1;
+
+    while ( 1 == 1 )
+    {
+        int r = rand() % 4;
+        array[value] = 1;
+        if ( r == 0 )
+
+With this modification, I get results similar to what you reported as desired:
+1 1.000
+2 0.367
+4 0.221
+8 0.154
+16 0.122
+32 0.101
+64 0.085
+128 0.077
+256 0.071How to use strstr() in C to count keywords from another file?I am attempting to get my program to read strings from another file, parse them for certain keywords, and then add to a counting variable whenever they appear in the other file. However, I can't seem to get anything but the number of lines to count. What could I be doing wrong here?
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// check that fp is not null omitted but needed
+const char getLine[1] = "";
+const char getFor[4] = "for";
+char line[500];
+int lineCount = 0;
+int forCount = 0;
+int x = 0;
+int main() {
+    FILE* fp = fopen("file.txt", "r");
+    if (fp == NULL) {
+        perror("Error opening file");
+        return(-1);
+    }
+        while (fgets(line, 499, fp) != NULL) {
+            strstr(line, getLine);
+            lineCount++; //Essentially counting the number of lines in file.
+        }
+
+    printf("Line count is %d.\n", lineCount);
+    memset(line, 0, sizeof(line)); //Resetting the memory of line.
+    while (fgets(line, 499, fp) != NULL) {
+        char *findFor;
+        findFor = strstr(line, getFor);
+        if (findFor != NULL) { //Attempting to count each time an instant of 'for' appears.
+            forCount++;
+        }
+
+    }
+
+    printf("For count is %d.\n", forCount);
+    fclose(fp);
+}The code is reading through the whole file to count the lines, but then trying to read through it again (without a rewind() / fseek()).  So on the second loop the file is at end-of-file.
+It's not necessary to count the lines, and the "for"s in two separate loops, just do it in one.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// check that fp is not null omitted but needed
+const char getFor[4] = "for";
+char line[500];
+int lineCount = 0;
+int forCount = 0;
+
+int main(  )
+{
+    FILE *fp = fopen( "file.txt", "r" );
+    if ( fp == NULL )
+    {
+        perror( "Error opening file" );
+        return ( -1 );
+    }
+
+    while ( fgets( line, sizeof( line ), fp ) != NULL )
+    {
+        char *findFor;
+        findFor = strstr( line, getFor );
+        if ( findFor != NULL )
+        {                       
+            // Attempting to count each time an instance of 'for' appears.
+            forCount++;
+        }
+        lineCount++;
+    }
+
+    printf( "Line count is %d.\n", lineCount );
+    printf( "For count is %d.\n", forCount );
+    fclose( fp );
+
+    return 0;
+}
+
+Also you're not counting the number of "for"s in the file, you're counting the number of lines with "for" in them.  If a line has multiples, it's just counted as one.Why does my C code keep returning 0's in the command prompt?Upper case letters are supposed to become lowercase, lowercase to uppercase, numbers are incremented by 1, and 9 becomes 0. When standard input is included, my code works, but the command line keeps returning 0 every time I press enter
+#include <stdio.h>
+int main()
+{
+    char c;
+    int i;
+    for (i=0;i<=2132;i++)
+    {
+        c = getchar();
+        if(c>='a' && c<='z')
+        {
+            c-=32;
+        }
+        else if(c>='A' && c<='Z')
+        {
+            c+=32;
+        }
+        else if(c>='0' && c<'9')
+        {
+            c++;
+        }
+
+        else if(c='9')
+        {
+            c-=9;
+        }
+    putchar(c);
+    }
+    return 0;
+}The mistake happened in line else if(c='9'). 
+Notice that in all the other cases you are using comparison, whereas here you are assigning c to '9'. The difference is that you used = instead of ==, and hence if c is digit nine, all four if/else if statements evaluate to false.
+Use (c == '9') to check if character c is equal to digit nine.different type variables with same identifier linked togethera.h
+void addr(void);
+
+a.c
+#include <stdio.h>
+
+int x;
+
+void addr(void) {
+    printf("a:x=%p\n", &x);
+}
+
+b.c
+#include <stdio.h>
+#include "a.h"
+
+char x;
+
+int main(void) {
+    addr();                 /* a:x=0x601044 */
+    printf("b:x=%p\n", &x); /* b:x=0x601044 */
+
+    return 0;
+}
+
+Why the compiler or linker is not complaining about two extern declarations with different type and same identifier (x), and they are silently linked together?
+Environment:
+$ gcc --version
+gcc (Ubuntu 4.8.4-2ubuntu1~14.04.3) 4.8.4
+$ gcc -o test -Wall -std=c11 a.c b.cThe declaration int x; in a.c and char x; in b.c are only tentative definitions of identifier x. 
+The C11 standard draft N1570 states: 
+
+6.9.2 External object definitions
+  ...
+  2 A declaration of an identifier for an object that has file scope without an initializer, and without a storage-class specifier or with the storage-class specifier static, constitutes a tentative definition.
+
+If instead you initialize x in both the files (something like int x = 2; in a.c and char x = '1'; in b.c, they become "complete" definitions and then you will have multiple definition error from linker.
+Something like:
+Error   LNK1169 one or more multiply defined symbols found  
+Error   LNK2005 x already defined in a.objIntroduction
+The C standard does not define the behavior of defining an identifier with external linkage twice. Some behavior is commonly defined as an extension to C, notably on Unix systems. However, this extension relies on the definitions having compatible types; the result of defining int x; and char x; is generally not defined.
+Discussion
+Defining an identifier with external linkage twice violates a constraint in the C standard, in C 2018 6.9 5 (bold added):
+
+If an identifier declared with external linkage is used in an expression (other than as part of the operand of a sizeof or _Alignof operator whose result is an integer constant), somewhere in the entire program there shall be exactly one external definition for the identifier; otherwise, there shall be no more than one.
+
+In your program, x is used in the expression &x, so the above constraint applies: There must be exactly one external definition for x. When a constraint is violated, the resulting behavior is not defined by the C standard, per C 2018 4 2.
+Why then does int x; and char x; behave differently from int x = 0; and char x = 0;? One might think they should be the same because the former are tentative definitions (because they have no storage-class specifier or initializer) and C 2018 6.9.2 2 says:
+
+If a translation unit contains one or more tentative definitions for an identifier, and the translation unit contains no external definition for that identifier, then the behavior is exactly as if the translation unit contains a file scope declaration of that identifier, with the composite type as of the end of the translation unit, with an initializer equal to 0.
+
+There are two reasons. The first is the rule about violating a constraint resulting in behavior not defined by the C standard is an overriding rule; it takes priority over the rule about tentative definitions.
+The second is that, although the C standard does not define the behavior, other documents may define it. As noted in C 2018 J.5.11 (which is an informative section rather than a normative part of the standard), a common extension to the C language is to permit multiple external definitions. Generally, the types of the definitions should agree, and only one should be initialized.
+For example, the Systems V Application Binary Interface
+describes how multiple definitions may be reconciled in cases where there are mixed strong and weak definitions or there are mixed common and non-common definitions. The compiler cooperates with this extension to C by producing an object file that marks identifiers differently according to whether they have regular definitions or just tentative definitions. For example, compiling a file containing char x; with Apple LLVM 10.0.0 and clang-1000.11.45.5 for x86_64 produces a symbol x marked for the common section, but compiling a file containing int x = 0; produces a symbol x marked for a general section. (When the nm command is applied to the object file produced by the compiler, it shows C and S for these sections, respectively.)
+Summary
+The result is:
+
+Defining x twice is not defined by the C standard.
+The compiler and linker extend the C standard to allow multiple tentative definitions of x along with at most one regular definition.
+In spite of the extension, the behavior of defining x with int in one place and char in another place is improper but is not diagnosed by the linker.Porting a function from C to OPENCLI have this function written in C:
+void SimpleGraphDrawing(unsigned char *image, int dim[2],double range[2][2])
+{
+    for (int j=0;j<dim[1];j++)
+        for (int i=0;i<dim[0];i++)
+        {
+            float x=range[0][0]+(i+0.5)*(range[0][1]-range[0][0])/dim[0]; 
+            float y=range[1][0]+(j+0.5)*(range[1][1]-range[1][0])/dim[1]; 
+            float val=(x*x+y*y-1);
+            val=val*val*val-x*x*y*y*y;
+            image[j*dim[0]+i]=(val>0)*255; 
+        }
+}
+
+And I want to port it to OPENCL.
+This is my new function:
+void SimpleGraphDrawingGPU(OpenCLContext &context, unsigned char *image, int dim[2],double range[2][2])
+{
+    cl_int error;
+    int blocking = true;
+    SetConsoleColor(15);
+    cl_int myKernel = GRAPH_DRAWING;
+
+    cl_mem imageKernel = clCreateBuffer(context.GetContext(), CL_MEM_READ_WRITE, dim[0]*dim[1] * sizeof(char), NULL, &error);
+    cl_mem dimKernel = clCreateBuffer(context.GetContext(), CL_MEM_READ_WRITE, 2*sizeof(int), NULL, &error);
+    cl_mem rangeKernel = clCreateBuffer(context.GetContext(), CL_MEM_READ_WRITE, 4 * sizeof(double), NULL, &error);
+
+    error = clEnqueueWriteBuffer(context.GetCommandQueue(0), imageKernel, blocking, 0, dim[0] * dim[1]* sizeof(int), image, 0, NULL, NULL);
+    error = clEnqueueWriteBuffer(context.GetCommandQueue(0), dimKernel, blocking, 0, 2*sizeof(int), &dim, 0, NULL, NULL);
+    error = clEnqueueWriteBuffer(context.GetCommandQueue(0), rangeKernel, blocking, 0, 4 * sizeof(double), &range, 0, NULL, NULL);
+
+    error = clSetKernelArg(context.GetKernel(myKernel), 0, sizeof(cl_mem), &imageKernel);
+    error = clSetKernelArg(context.GetKernel(myKernel), 1, sizeof(cl_mem), &dimKernel);
+    error = clSetKernelArg(context.GetKernel(myKernel), 2, sizeof(cl_mem), &rangeKernel);
+
+    size_t globalWorkSize[1] = { 1024 };
+    error = clEnqueueNDRangeKernel(context.GetCommandQueue(0), context.GetKernel(myKernel), 1, NULL, globalWorkSize, NULL, 0, NULL, NULL);
+
+    error = clReleaseMemObject(imageKernel);
+    error = clReleaseMemObject(dimKernel);
+    error = clReleaseMemObject(rangeKernel);
+    ;
+}
+
+This is also the function from MyKernels:
+__kernel void GRAPH_DRAWING ()
+{
+
+}
+
+The output is really strange and I have no idea how to fix it: "PROGRAM -33"-33 is invalid device. You should watch this example to see how they manage and handle OCL devices: https://software.intel.com/en-us/articles/gemmThe name of a 2-D array in CI am learning pointers and arrays in C and Here is a question that confused me for a while:
+So the name of a 1D int array is a constant pointer to int, which points to the first element in that array. So when we evaluate the name of a 1D array, we should get the address of the first element in the array. 
+For a 2D int array, the array name is a pointer to the first array of int. So what will be the value of a 2D int array's name? I think it should be the address of the first array in this 2D array. But how is the address of an array defined in C? Is it just the address of the first element in that array?So the name of a 1D int array is a constant pointer to int
+
+This is wrong, and it is often taught badly. An array is an array. Here is some code for analogy:
+int x = 5;
+double d = x + 1.2;
+
+In the second line x is converted to double for purposes of addition. This does not change x which is still an int, the result of conversion is "temporary" and only exists until the addition is finished.   The conversion is demanded by the conditions of the + operator that both arithmetic operands must be brought to a common type (double in this case).
+In the array case, say we have char *p = arrayname + 1 , then arrayname is still an array. But it is converted to a temporary pointer so that the addition can occur (the + operator requires this, it can add a pointer and an integer). The temporary pointer points to the first element of the array, but it is not correct to say that the temporary pointer is the array.
+Most operators invoke this conversion of an array to a temporary pointer, but some do not.  So it is not correct to say that arrayname is a pointer because it may be used with an operator that does not convert the array to a pointer, e.g. sizeof arrayname. 
+The result of converting an array to a pointer is a pointer to the first element of that array. This is always true even if the first element is itself an array.
+
+But how is the address of an array defined in C? Is it just the address of the first element in that array?
+
+No. Every variable has an address, this applies to arrays and non-arrays. If you understand the address of an int then you also understand the address of a 2x2 array of char.Let's clear up some things:
+int a = 24;
+
+The above is many things:
+
+a declaration: we declare a variable named a of type int.
+a definition: an object of type int is created.
+an initialization: this object is initialized with the value 24
+
+So let's recap: an object of type int is created with the value 24 and the variable a names it.
+Now let's apply the same to the following:
+int a1[3] = {0, 1, 2};
+
+
+a declaration: we declare a variable named a1 of type int[3] (aka array of 3 integers).
+a definition: an object of type "array of 3 integers" is created
+an initialization: the object is initialized with {0, 1, 2}
+
+The variable a1 names that object.
+
+So the name of a 1D int array is a constant pointer to int, which
+  points to the first element in that array.
+
+Wrong. I know you might have been told or read this, but it is incorrect. An array is not a pointer!! Arrays and pointers are different types. That being said, for convenience and historical reasons, in most situations (but not all!) an array decays to a pointer to the first element:
+int a1[3] = {0, 1, 2};
+int* p = a1; // here a1 decays to a pointer to its first element
+
+In the above snippet p points to the element 0 of the array a1
+You can view 2D or 3D or nD array the same way:
+T a2[3] = {l0, l1, l2};
+
+Let's say T is a type. The above is an "array of 3 Ts".
+
+if T is int then we have int a2[3] = {0, 1, 2} - an array of 3 integers. We call this an 1D int array.
+but if T is int[2] then the above becomes int a2[3][2] = {{00, 01}, {10, 11}, {20, 21}} - you can see it as "an array of 3 Ts" or "an array of 3 int[2]" or "an array of 3 arrays of 2 integers".
+
+And we can apply the same decaying rule:
+int a2[3][2] = {{00, 01}, {10, 11}, {20, 21}};
+
+int (*p2)[2] = a2; // a2 decays to a pointer to its first element.
+                   // Its first element is an array of 2 int.
+                   // So a2 decays to `int (*)[2]` -  a pointer to an array of two elements.
+
+
+In the above a2 points to the element {00, 01} of the array.An arrays name is not a pointer. In most cases when the name of an array is used, it gets implicitly *converted* to a pointer to its first element, it is said, that the array decays into a pointer.
+The name of an array does not decay to a pointer when it is the argument of the address-of operator (&), the sizeof-operator and when a string literal (which is an array of some character type) is used to initialize an array *).
+That said, a two-dimensional arrays
+T arr[COLS][ROWS];
+
+first element is an array of type T[ROWS]. So arr decays to a pointer of type T(*)[ROWS] which points to the first element of arr.
+
+
+
+*) If you might want to add that arrays also do not decay when they're the operand of the _Alignof-operator or read that somewhere else:
+@EricPostpischi: Arrays cannot be operands of _Alignof. Including _Alignof in the exceptions for array conversion was an error in the C 2011 standard. _Alignof operands can only be types, not expressions.When a 2D array decays to a pointer, you have a pointer to an array.  Here's an example of what this would look like:
+int arr[5][6];
+int (*p)[6] = arr;An array is not a pointer. An array's name, when used in an expression, "decays" into a pointer to the first element.
+Strictly speaking, C only has one-dimensional arrays, and a 2D array is really just an array of arrays.
+1D array:
+
+The first element of int arr [x], is an int. 
+When arr is used in an expression, you get a pointer to that element, int*.
+When doing pointer arithmetic on this pointer, each item has the size of the first element = sizeof(arr[0]).
+
+2D array:
+
+The first element of int arr [x][y] is an int [y]. 
+When arr is used in an expression, you get a pointer to that element, int (*)[y]. 
+When doing pointer arithmetic on this pointer, each item has the size of the first element = sizeof(arr[0]).
+
+So it's the same rule. The int(*)[y] array pointer follows the same rules of pointer arithmetic as the ordinary pointer. But you can de-reference it one step further to get individual int in the array of arrays."So what will be the value of a 2D int array's name?"
+"I actually understand that an array is not a pointer. In my question,
+what I actually mean is that when the name of an array is used in an
+expression, the compiler will generate the pointer constant."
+
+You have to be careful here. As a follow-on to your comment below your question, there are nuances in how the array/pointer conversion rules apply that effect the type that results from the conversion. That will dictate whether and how you can use the array name in an expression.
+
+"... the compiler will generate the pointer constant."
+
+No. The compiler does not generate a pointer constant, the compiler follows C11 Standard - 6.3.2.1 Other Operands - Lvalues, arrays, and function designators(p3). When the array name is used in an expression, the expression is evaluated with the address that results from the conversion of the array to a pointer (subject to the 4-exceptions stated in paragraph 3).
+The rule regarding array/pointer conversion does not depend on number of dimensions, the rule is applied the same regardless. However, the type of the pointer that results from the conversion does depend on the number of array dimensions. That is critical and that will dictate whether your use of the array name is valid.
+One way to help cement what is happening in the conversion is take it step-by-step. Start with a 1D array and work your way up.
+6.3.2.1 - 1D Array Conversion To Pointer On Access
+When you have a simple array, e.g.
+int array[10];
+
+On access to array, is converted to a pointer to the first element, e.g., the address of the element, &array[0]. (which is simply a pointer to int, or with formal type int *)
+6.3.2.1 - 2D Array Conversion To Pointer On Access
+With a 2D array, rule applies just the same, e.g.
+int array[10][10];
+
+Here array, a 2D array, is essentially an array of 10 - int[10] arrays (an array of 1D arrays). On access array[10][10] is converted to a pointer to the first array of 10-int in exactly the same manner, &array[0][0] (which results in a pointer to an array of int[10] or with formal type int (*)[10]) It is not a pointer-to-pointer (e.g. int**), it is very specifically a pointer to an array of int[10].
+(note the important difference between int *[10] (an array of 10 pointers which on access will become a pointer-to-pointer) and int (*)[10] (a pointer to array of 10 int))
+Answer
+"So ... the value of a 2D int array's name when used in an expression" -- is the address of the first 1D array of integers that make up the 2D array with formal type int (*)[N] (where N is the number of elements per-row).
+Nuance In How The Standard Is Applied
+The type is critical for the proper use of the array name. With a 2D array, the resulting address is a pointer to an array. What results if you dereference that pointer? (Answer: an array) What happens when you access that array through the derefernced pointer? (hint: the conversion on access rules apply again). You must know what the pointer type resulting from the conversion will be in order to properly use the array name in an expression.
+An Example May Help
+Or it may not, but working with the pointer types that result from the array access and pointer conversion may help things sink in. Below, the example declares a simple 4x3 2D array of int. It then declares a pointer (p) of proper type to allow the array name to be used in an expression assigning the array address to the pointer. The pointer initialized with the array name is then used to further initialize an integer pointer (ip) to the first element in the first array.
+The example then outputs the address for each element, and then using the pointer p outputs the address of the beginning of each row-array that makes up the 2D array. Finally the code enters a validation loop comparing the addresses of each element by (1) array index, (2) the address held by pointer p using an offset, and (3) address held by ip. The purpose being the use of each of the different pointers resulting from the expression assigning the array name to then reference each element and ensuring the addresses held by each pointer agree.
+#include <stdio.h>
+
+int main (void) {
+    
+    int array[ ][3] = { {1, 2, 3},      /* 2D array values */
+                        {3, 4, 5},
+                        {5, 6, 7},
+                        {7, 8, 9} },
+        (*p)[3] = array,                /* pointer to array */
+        *ip = *p;                       /* integer poiner */
+    size_t  size = sizeof array,
+            nele = size / sizeof **array,
+            nrow = size / sizeof *array,
+            ncol = sizeof *array / sizeof **array;
+    
+    printf ("2D array statistics:\n\n"
+            "  size: %zu  (bytes)\n  nele: %zu  (ints)\n"
+            "  nrow: %zu\n  ncol: %zu\n",
+            size, nele, nrow, ncol);
+    
+    puts ("\naddress of each array element:\n");
+    for (size_t i = 0; i < nrow; i++) {
+        for (size_t j = 0; j < ncol; j++)
+            printf ("  %p", (void*)&array[i][j]);
+        putchar ('\n');
+    }
+    
+    puts ("\naddress of each 1D array:\n");
+    for (size_t i = 0; i < nrow; i++)
+        printf ("  %p\n", (void*)p[i]);
+    
+    puts ("\nvalidating each array element address by index & pointer:\n");
+    for (size_t i = 0; i < nrow; i++) {
+        for (size_t j = 0; j < ncol; j++) {
+            if (ip != &array[i][j] || ip != *p + j) {
+                fprintf (stderr, "address validation failed for "
+                        "array[%zu][%zu]\n(%p != %p || %p != %p)\n",
+                        i, j, (void*)ip, (void*)&array[i][j],
+                        (void*)ip, (void*)(p + j));
+                return 1;
+            }
+            ip++;
+        }
+        p++;
+    }
+    puts ("  done!");
+
+    return 0;
+}
+
+Example Use/Output
+$ ./bin/array_2d_access
+2D array statistics:
+
+  size: 48  (bytes)
+  nele: 12  (ints)
+  nrow: 4
+  ncol: 3
+
+address of each array element:
+
+  0x7ffe7c9a9780  0x7ffe7c9a9784  0x7ffe7c9a9788
+  0x7ffe7c9a978c  0x7ffe7c9a9790  0x7ffe7c9a9794
+  0x7ffe7c9a9798  0x7ffe7c9a979c  0x7ffe7c9a97a0
+  0x7ffe7c9a97a4  0x7ffe7c9a97a8  0x7ffe7c9a97ac
+
+address of each 1D array:
+
+  0x7ffe7c9a9780
+  0x7ffe7c9a978c
+  0x7ffe7c9a9798
+  0x7ffe7c9a97a4
+
+validating each array element address by index & pointer:
+
+  done!
+
+Let me know if that helped and whether you have any further questions.Thread Program on Linux (Posix Thread)I want to modify the multithread program on the Linux operating system using this Pthread API.
+#include <pthread.h>
+#include <stdio.h>
+
+int sum;
+void *runner(void *param);
+
+int main(int argc, char *argv[]) {
+    pthread_t tid
+        pthread_attr_t attr;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: a.out <integer value>\n");
+        return -1;
+    }
+    if (atoi(argv[1]) < 0) {
+        fprintf(stderr, "%d must be >=0\n", atoi(argv[1]));
+        return -1;
+    }
+
+    pthread_attr_init(&attr);
+    pthread_create(&tid, &attr, runner, argv[1]);
+    pthread_join(tid, NULL);
+
+    printf("sum = %d\n", sum);
+}
+
+void *runner(void *param);
+{
+    int i, upper = atoi(param);
+    sum = 0;
+
+    for (i = 1; i <= upper; i++)
+        sum += i;
+
+    pthread exit(0);
+}
+
+I want to change that program into a program that has 2 threads that work together to add a number. But i don't know how to change it, Thanks again for any help that can be offered. I am sorry,because I'm not good at explaining.first there is 3 errors : the pthread tid declaration has no ";", then there is one at the end of your runner()* function declaration, and last but not least, a underscore is missing on the last line pthread_exit(0)
+beware ahah
+ok for vars :
+    pthread_t tid;
+    pthread_t tid2;
+    pthread_attr_t attr;
+    pthread_attr_t attr2;
+
+and  in the code after the ifs, add this :
+pthread_attr_init(&attr);
+pthread_attr_init(&attr2);
+pthread_create(&tid, &attr, runner, argv[1]);
+pthread_create(&tid2, &attr2, runner, argv[2]); // not sure for argv[2]?
+
+not sure for argv[2], it depends if it's 2 different numbers?
+pthread_join are  no use, they are here only for pausing threads, i think that if you want them to work in parallel, you need to only do "pthread_create" and they should work in parallel (but was i saw on my CS class on parallel programming 3 years ago, it will never be "real real" parallel because only the OS can control this and you need to be some kind of a super root to be able to really control the threads
+I mean
+it won't be faster because it will not be real parallel progI'm not exactly sure what you want, but a really quick and dirty solution based on the existing code is below. I'm assuming you just want two thread to sum a single variable to the input.
+An explanation of what's going on: I had to fix some minor syntax issues you have in your code, one big one being the semicolon at the end of the runner function definition. I added a mutex to define a critical section in the runner's for loop. It makes sure only 1 thread can update the sum. I'm assuming you want the sum to equal the input, so we just increment it by 1 and check before incrementing whether the value is still below. Like I said, it's quite quick and dirty, not really the ideal solution. To create two threads, we just call the thread create function twice in main.
+See https://computing.llnl.gov/tutorials/pthreads/#Mutexes for more important about mutexes and the pthread library.
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int sum = 0; // set it once globally
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+void *runner(void *param);
+
+int main(int argc, char *argv[]) {
+    pthread_t tid1, tid2;
+    pthread_attr_t attr;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: a.out <integer value>\n");
+        return -1;
+    }
+    if (atoi(argv[1]) < 0) {
+        fprintf(stderr, "%d must be >=0\n", atoi(argv[1]));
+        return -1;
+    }
+
+    pthread_attr_init(&attr);
+    pthread_create(&tid1, &attr, runner, argv[1]);
+    pthread_create(&tid2, &attr, runner, argv[1]);
+    pthread_join(tid1, NULL);
+    pthread_join(tid2, NULL);
+
+    printf("sum = %d\n", sum);
+}
+
+void *runner(void *param) {
+    int i, upper = atoi(param);
+    // sum = 0;
+
+    int t = pthread_self();
+
+    for (i = 1; i <= upper; i++) {
+        pthread_mutex_lock(&mtx);
+        if (sum < upper) {
+            printf("%d incrementing\n", t);
+            sum += 1;
+        }
+        pthread_mutex_unlock(&mtx);
+    }
+
+    pthread_exit(0);
+}
+
+Compile with cc -o main main.c -pthread.Floating point multiplication overflowI have the rules below for floating point multiplication.
+My question is how can I know when E is out of range to know it's overflow?
+I know that if the result is normalized we can apply E = exp - bias, and if it is de-normalized, E = 1 - bias. Based on exp, I know it's normalized or de-normalized so I can calculate the maximum value of E but in this case, I don't have exp yet, I can't calculate the range of E so how can I know if an overflow occurs or not?If you don't know the maximum range of anything, then you can't know if it will/won't overflow (or cause underflow).
+However:
+
+if you assume that output has the same range as input/s, then you can assume something can't overflow. For example, consider "E1+E2 = 10 + (-1) = 9" where you say it can't overflow because 9 is between 10 and -1.
+for things like homework and uni assignments, whenever necessary information is missing you can assume whatever you like and state your assumption/s (e.g. "I've assumed that this is IEEE double floating point where the exponent field is 8 bits with a bias of 128, and therefore has the range is -128 to +127"); and then claim that the exponent will/won't overflow if your assumption is correct.
+for real software, you can find out what the range is (e.g. by checking float.h).How can I read a multi-line TXT file with varying formats in C?I have an input text file which looks something like this:
+1(1.230000e+00)
+2(1.230000e+00)
+(1.230000e+00 1.230000e+00)
+3(1.230000e+00)
+(1.230000e+00 1.230000e+00)
+.
+.
+.
+
+I want to be able to read each line separately and distinguish between them. For example, for the first line, I want to store 100 in one variable as an int and I want to store 1.230000e+00 in another variable as a double. This is what I have tried:
+fscanf(fp, "%d(%le)\n", &varInt, &varDouble);
+
+This works for the first line. But how can I loop through and do this for all the lines AND also read the 3rd line using:
+fscanf(fp, "(%le %le)\n", &varDouble1, &varDouble2);
+
+To give some context, after reading each line, I will do some processing and then read the next line. Depending on the format of the line, I will do different type of processing.
+Any help is appreciated! Thank you!fscanf(3) is almost unusable unless the input is strictly controlled.  It's hard to distinguish between I/O errors and parsing errors.  That's why it's much more common to read each line with fgets(3), and then scan it with sscanf(3).  
+Because sscanf returns the number of elements parsed, you can use that to determine if a scan works as expected.  No need to peek at the input: if you got what you expected, you're done, else try scanning some other way.  Here's a working example:
+#include <assert.h>
+#include <err.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int
+main( int argc, char *argv[] ) {
+  if( argc < 2 ) {
+    errx(EXIT_FAILURE, "syntax: %s filename", argv[0]);
+  }
+
+  FILE *input = fopen(argv[1], "r");
+  if( !input ) {
+    err(EXIT_FAILURE, "could not open '%s'", argv[0]);
+  }
+
+  static char line[128];
+  int n;
+
+  while( fgets(line, sizeof(line), input) != NULL ) {
+    double d1, d2;
+    int quantum;
+
+    if( 2 == sscanf(line, "%d(%lf)", &quantum, &d1) ) {
+      printf( "ok: %d\t%7.2f\n", 100 * quantum, d1 );
+    } else if( 2 == sscanf(line, "(%lf %lf)", &d1, &d2) ) {
+      printf( "ok: %7.2f\t%7.2f\n", d1, d2 );
+    } else {
+      printf( ">>> %s\n", line );
+    }
+
+  }
+
+  if( !feof(input) ) {
+    err(EXIT_FAILURE, "error reading %s", argv[1]);
+  }
+
+  return EXIT_SUCCESS;
+}
+
+If you discover other patterns, it's easy to add them.  Note that when fgets fails, the program returns success only if we reached end of file.If you generate the file, add fixed size prefix for the length of line. E.g. 016:1(1.230000e+00)\n. Then read 4 bytes with fread, convert string to int with strtol and read rest of line (\n is included in length). Finally split the values with strtok( str, "( )" ).As mentioned in the comments, you can read a full line and then determine the format of the line and parse the line accordingly. The following code does what you want. However, production worthy code would probably more robustly interpret the format of each line.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+char *GetStringNoBeginWhitespace( char *str )
+{
+    static const char whitespace[] = " \f\n\r\t\v";
+
+    return(str + strspn(str, whitespace));
+}
+
+int main(int argc, char *argv[])
+{
+    char *line = NULL;
+    FILE *fp;
+    char buffer[255];
+
+    int i;
+    double d,d1;
+
+    fp = fopen("data.txt", "r");
+
+    while(fgets(buffer, 255, fp))
+    {
+        buffer[strlen(buffer)-1] = 0x00;
+        line = GetStringNoBeginWhitespace( buffer );
+        if( line )
+        {
+            fputs(line, stdout);
+            if( isdigit((int)line[0] ))
+            {
+                printf("\tFormat is x(.......)\n");
+                if( sscanf(line,"%d(%le)\n", &i, &d) == 2 )
+                {
+                    printf("      %d %le\n", i, d);
+                }
+                else
+                {
+                    printf("\tUnknown format....\n");
+                }
+            }
+            else if( line[0] == '(' )
+            {
+                printf("\tFormat is ( ...... ....... )\n");
+                if( sscanf(line, "(%le %le)\n", &d, &d1) == 2 )
+                {
+                    printf("      %le %le\n", d, d1);
+                }
+                else
+                {
+                    printf("\tUnknown format....\n");
+                }
+            }
+            else
+            {
+                printf("\tUnknown format....\n");
+            }
+        }
+    }
+
+    fclose(fp); 
+    return(0);
+}
+
+Output:
+jnorton@ubuntu:~/source$ ./a.out 
+1(1.230000e+00) Format is x(.......)
+      1 1.230000e+00
+2(1.230000e+00) Format is x(.......)
+      2 1.230000e+00
+(1.230000e+00 1.230000e+00) Format is ( ...... ....... )
+      1.230000e+00 1.230000e+00
+3(1.230000e+00) Format is x(.......)
+      3 1.230000e+00
+(1.230000e+00 1.230000e+00) Format is ( ...... ....... )
+      1.230000e+00 1.230000e+00
+data.txt file:
+1(1.230000e+00)
+2(1.230000e+00)
+(1.230000e+00 1.230000e+00)
+3(1.230000e+00)
+(1.230000e+00 1.230000e+00)How to get original ip instead of proxy's IP in TCP?There are three host, clients A, Proxy B and Server C:
+A->B->C.
+In this example, how can I get A's IP address on server C? 
+This is TCP protocol.Monitoring performance counters during execution of a specific functionFor some context, I'm profiling the execution of Memcached, and I would like to monitor dTLB misses during the execution of a specific function. Assuming that Memcached spawns multiple threads, each thread could potentially be executing the function in parallel. One particular solution I discovered, Perf features toggle events (Using perf probe to monitor performance stats during a particular function), should let me achieve this by setting probes on function entry and exit and toggling the event counter on/off on each probe respectively.  
+My question is:
+(a) From my understanding, perf toggle events was included as part of a branch to Linux kernel 3.x. Has this been incorporated in recent LTS releases of Linux kernel 4.x? If not, are there any other alternatives? 
+(b) Another workaround I found is described here: performance monitoring for subset of process execution. However I'm not too sure if this will work correctly for the problem at hand. I'm concerned since Memcached is multi-threaded, having each thread spawn a new child process may cause too much overhead.
+Any suggestions?I could only find the implementation of the toggle events feature in the /perf/core_toggle repo, which is maintained by the developer of the feature. You can probably compile that code and play with the feature yourself. You can find examples on how to use it here. However, I don't think it has been accepted yet in the main Linux repo for any version of the kernel.
+If you want to measure the number of one or more events, then there are alternatives that are easy to use, but require adding a few lines of code to your codebase. You can programmatically use the perf interface or other third-party tools that offer such APIs such as PAPI and LIKWID.Trouble with reading .WAV file in CI am trying to read a 5-second .wav file full of "silence" to test the code in C. I was able to read the header however when trying to extract the date field where the content shoul be (which I believe should be zero) it generates some numbers. According to the images below.
+Here is my C code:
+#include <stdio.h>
+#include <stdlib.h>
+
+char buff[10000];
+int main(){
+
+    int i;
+    FILE * fp;
+    FILE *flog;
+
+    if ((fp = fopen("Silencio2.wav", "rb")) == NULL){
+        printf("Fail!");
+        exit(1);
+    }
+
+
+    fseek(fp, 44, 0); // read from 44 byte to the end.
+    fread(buff,sizeof(int),1024,fp);
+    flog = fopen("Silencio2.txt","w"); // make a log file to generate chart
+
+    // print in hex to console and decimal to log file.
+    for(i = 0; i < 5000 ; i++){
+     printf("%i == %hhx \n",i,buff[i]);
+     fprintf(flog,"%d\n",buff[i]);
+     buff[i] = 0;
+    }
+    fclose(flog);
+    return 0;
+}
+
+.Wav Header Reading Image:
+
+As we can see the program correctly reads the header by bringing the coherent information, RIFF, WAVE, FMT, 1 channel, 16bit, 16khz and the beginning of the date (40 ~ 44).
+Source that I'm using to read the .wav file: http://soundfile.sapp.org/doc/WaveFormat/
+Characteristics of the .wav file:
+Bitrate: 16 bit PCM;
+Channels: 1;
+SampleRate: 16khz.
+Time: 5s;
+Generated by Audacity with the function of generating silence.
+After saving this log in txt I am pasting in matlab and reading the original file on it, in order to print the comparative chart between the 2 to validate my data, however I am getting the following output:
+1st Graph Processing of matlab with the function readaudio();
+2nd Graph log generated by my code.
+
+Script Matlab:
+[Sile2,Fs] = audioread('Silencio2.wav');
+title('Gerado pelo MATLAB');
+subplot(2, 1, 2);
+plot(CodeSile2);
+title('Meu código');
+subplot(2, 1, 1);
+plot(Sile2);
+
+The question that remains is: Are my results consistent? For besides the divergence of magnitude of the signal there is also a noise, that I do not know how to explain the reason of it. Since the signal was generated through a generator of silence.
+PS: Yes I know the libsnd but how I want to make a embed system with this code in a stm32 / esp32, the less libraries use, better.Searching for a keyword in a txt file and logging it with C [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 2 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I'm attempting to use C to search a file that contains C code. It is meant to search through the entire file, find certain keywords or characters (Such as looking for Ints, Longs, For loops, etc.) and logs them by incrementing a counter, as well as counting all the total lines of code. Then it's meant to provide the total number of each so percentages can be calculated based upon how often a keyword appears in the file.
+However, i'm having trouble getting the code to recognize the keywords. How should I get this to read the total lines of the code, as well as look for keywords?
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define _CRT_SECURE_NO_WARNINGS
+
+/*  Count and compute:
+
+    number of total lines
+    number and percentage of blank lines
+    number and percentage of comments (start with // or /*)
+    number and percentages of ints, longs, floats, doubles, char
+    number and percentages of if's
+    number and percentage of else's
+    number and percentage of for's
+    number and percentage of switch
+    number and percentage of semicolons
+    number and percentage of structs
+    number and percentage of arrays (contains [ or ], divide count by 2)
+    number of blocks (contains { or }, divide count by 2)
+*/
+
+
+int main(void)
+{
+    int lineCount = 0;  // Line counter (result) 
+    int forCount = 0; // For counter
+    int intCount = 0;
+    char c;
+
+    FILE *ptr_file;
+    char buf[1000];
+
+    ptr_file = fopen("file.txt", "r");
+    if (!ptr_file)
+        return 1;
+
+    while (fgets(buf, 1000, ptr_file) != NULL) {
+
+
+        for (c = getc(ptr_file); c != EOF; c = getc(ptr_file)) {
+            if (c == '\n') // Increment count if this character is newline 
+                lineCount = lineCount + 1;
+        }
+    }
+    fclose(ptr_file);
+    //End of first scan
+    ptr_file = fopen("file.txt", "r");
+    if (!ptr_file)
+        return 1;
+
+    while (fgets(buf, 1000, ptr_file) != NULL) {
+        for (c = getc(ptr_file); c != EOF; c = getc(ptr_file)) {
+            if (c == 'for') // Increment count if this character is for
+                forCount = forCount + 1;
+        }
+    }
+    fclose(ptr_file);
+    //End of second scan
+    ptr_file = fopen("file.txt", "r");
+    if (!ptr_file)
+        return 1;
+
+    while (fgets(buf, 1000, ptr_file) != NULL) {
+        for (c = getc(ptr_file); c != EOF; c = getc(ptr_file)) {
+            if (c == 'int') // Increment count if this character is for
+                intCount = intCount + 1;
+        }
+    }
+
+    fclose(ptr_file);
+    printf("\nThe file has %d lines\n", lineCount);
+    printf("\nThe file has %d fors\n", forCount);
+    printf("\nThe file has %d ints\n", intCount);
+}You need to use sscanf and parse it line by line.
+For each item found keeping a tally should be no issue.
+But as you discussed (asked for help on that other forum) the function you need is this one.Getting an exact answer may require more complex parsing than you think: consider for a moment that a long may also be declared as a long int, and that either long long or long long int are also valid variable declarations. Furthermore, you can declare several variables on the same line, and you don't want to count instances where int is part of a longer word.
+For a quick approximation, the Linux tools grep, and wc can be helpful:
+
+wc -l filename will list the number of lines of a file
+grep "for" filename | wc -l will list the number of lines in which a for is included
+
+Note that these are approximations: if for occurs more than once on a line, or for is part of another word like forth, one instance will still be counted.substituting printf with write for signal handlingI just found out that printf isn't safe in signal handler. So I tried to use the write function to print to the console but it didn't work. For example, how would I use write() function to do something like this printf("ID: %d Exit: %d", x, y);
+But I am confused on how to use format specifiers in the write function. Any help would be much appreciated.The write function doesn't support the use of format specifiers.  It just takes a pointer to a memory buffer of a given size and writes the bytes directly.
+You can safely use the sprintf function to construct a string, then pass that string to write:
+char str[100];
+sprintf(str, "ID: %d Exit: %d", x, y);
+write(1, str, strlen(str));The use of the free functionI want to know please where i have to use the "free" function?
+does I use it when i already use the "malloc" function or I use it with any declared pointer?
+Note: in the two cases the liste type is defined as below: 
+typedef struct Node * liste; 
+
+Node is a also a structure:
+struct Node { 
+    int value; 
+    Node *N;
+};
+
+First case    
+liste l; 
+free (l);
+
+second case 
+liste l;
+l=(node*)malloc(sizeof(node));
+free (l);
+
+thank you in advance !The man page for free states the following:
+
+The free() function frees the memory space pointed to by ptr, which
+  must have been returned by a previous call to malloc(), calloc() or
+  realloc(). Otherwise, or if free(ptr) has already been called before,
+  undefined behavior occurs. If ptr is NULL, no operation is performed.
+
+In your first case, the use of free is invalid because l is not initialized.  The second case is valid (assuming liste is a typedef for a pointer) because l is assigned an address returned by malloc.C programming: Generating a random number (x) that is between -2,2 and then updating xIm trying to write a program to randomly generate a number (term x) between [-2,2]. I then want to update the term using a while loop.
+I know how to use drand48() and srand() but I know I cant use drand48() for this since it only computes numbers between 0 and 1.
+Im only about a month in to using C so im still pretty confused about it all.
+Thanks!If you call drand48(), you get the range [0.0, 1.0).
+(This is a half-open interval, because drand won't return 1.0, only things very close to 1.)
+If you multiply the return value drand48() by 4, you get the range [0.0, 4.0).
+If you subtract 2 from 4*drand48(), you get the range [-2.0, 2.0).
+So, therefore:
+4*drand48() - 2
+
+PS: I assume you're trying to generate a real number, not an integer. If you're trying to get an integer, use the rand() solution that @WeatherVane posted.Error when I try to access structure with pointersstruct cars {
+   char  color[50];
+   int maxSpeed;
+   float consumption;
+};
+
+
+int main() 
+{
+  struct cars car1;
+  struct cars car2;
+  struct cars * car3;
+
+  //Car 1
+  strcpy( car1.color, "red");
+  car1.maxSpeed = 140;
+  car1.consumption = 6.6;
+
+  //Car 2
+  strcpy( car2.color, "blue");
+  car2.maxSpeed = 150;
+  car2.consumption = 7.3;
+
+  //Car 3
+  strcpy( car3->color, "green");
+  car3->maxSpeed = 145;
+  car3->consumption = 7.0;
+
+  return 0;
+}
+
+the code compiles normally as: gcc -std=c99 .....
+but when I execute return segmentation fault
+seems like the structure is not allocated or I access the structure in an improper way.The pointer car3 has not been set to point to anything, so it value is indeterminate.  When you then attempt to read this invalid value and dereference it as a pointer, you invoke undefined behavior which in this case causes your code to crash.
+You can either point car3 to an existing struct instance:
+car3 = &car2;
+
+In which case going through car3 will give you exactly what is stored in car2.  Or you can dynamically allocate memory for car3 to point to:
+car3 = malloc(sizeof *car3);
+
+Then be sure to free(car3) when you're done using it.You need to add this line:
+car3 = malloc(sizeof *car3);
+
+This allocates memory for one instance of car.C/C++ indexed jump into a set of NOPsI want to produce delays with a one clock resolution so my thoughts are to have 255 NOPs one after the other and then jump to the last one minus the delay required.  So 0 would jump past the last NOP, 1 to the last NOP, and 255 to the first NOP.
+I've used indexed function calls before but can't find anything on indexed gotos like this.  I also thought of using a switch statement but that seemed to have other instructions in the way.
+Any suggestions gratefully received.Nick ODell has a nice solution, but the compiler has no way of knowing that all of your cases will have exactly one byte of code. That will not be known until the assembler pass. So the compiler has to produce something that would work no matter how much code was produced in each of your cases, and the indirect jump table is really the only way to do that.
+Thus, I think in order to get the "ideal" code, with one byte per nop, you're going to have to write the jump logic in assembly as well.
+Here's what I came up with (for gcc / amd64 / gas on Linux).  Here it is on godbolt.
+#include <stdlib.h>
+
+#define N 1000
+
+#define xstr(s) str(s)
+#define str(s) #s
+
+
+void delay(unsigned ticks) {
+  if (ticks <= N) {
+    asm("movq $1f, %%rax \n"
+    "addq %0, %%rax \n"
+    "jmp *%%rax \n"
+    "1: \n"
+    ".rept " xstr(N) " \n"
+    "nop \n"
+    ".endr \n"
+    : : "g" ((unsigned long)(N-ticks)): "ax");
+  } else {
+    abort();
+  }
+}
+
+int main(void) {
+  delay(4);
+  return 0;
+}
+
+Note that it has to be compiled with -no-pie.  If you want it to work as a position-independent executable, you probably need the trick like call 2f ; 2f: popq %rax to get the absolute program address into a register.
+Of course, there's always the question whether the overhead of actually getting to this code will mess up the accuracy of your delay time...
