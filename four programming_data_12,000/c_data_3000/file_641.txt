@@ -1,0 +1,3674 @@
+how to interpret "shift/reduce" conflicts in bisonI'm writing a small bison / flex calculator but I'm not able to understand and debug the verbose output
+This is the code which is causing the errors:
+%token NUM
+%token NAME
+
+%%
+input:    '\n'
+          | line '\n'
+;
+
+line:     expr                    {printf("%.10g\n", $1);}
+          | NAME '=' expr         {Assign(table, yyname, $3);}
+;
+
+expr:     NUM                     {$$ = $1;}
+          | NAME                  {$$ = Lookup(table, yyname);}
+          | expr '+' expr         {$$ = $1 + $2;}
+          | expr '-' expr         {$$ = $1 - $2;}
+          | expr '*' expr         {$$ = $1 * $2;}
+          | expr '/' expr         {$$ = $1 / $2;}
+          | expr '^' expr         {$$ = pow($1, $2);}
+          | '(' expr ')'          {$$ = $2;}
+
+The verbose error output is:
+state 20
+
+7 expr: expr . '+' expr
+7     | expr '+' expr .
+8     | expr . '-' expr
+9     | expr . '*' expr
+10     | expr . '/' expr
+11     | expr . '^' expr
+
+'+'  shift, and go to state 13
+'-'  shift, and go to state 14
+'*'  shift, and go to state 15
+'/'  shift, and go to state 16
+'^'  shift, and go to state 17
+
+'+'       [reduce using rule 7 (expr)]
+'-'       [reduce using rule 7 (expr)]
+'*'       [reduce using rule 7 (expr)]
+'/'       [reduce using rule 7 (expr)]
+'^'       [reduce using rule 7 (expr)]
+$default  reduce using rule 7 (expr)
+
+...
+
+state 24
+
+7 expr: expr . '+' expr
+8     | expr . '-' expr
+9     | expr . '*' expr
+10     | expr . '/' expr
+11     | expr . '^' expr
+11     | expr '^' expr .
+
+'+'  shift, and go to state 13
+'-'  shift, and go to state 14
+'*'  shift, and go to state 15
+'/'  shift, and go to state 16
+'^'  shift, and go to state 17
+
+'+'       [reduce using rule 11 (expr)]
+'-'       [reduce using rule 11 (expr)]
+'*'       [reduce using rule 11 (expr)]
+'/'       [reduce using rule 11 (expr)]
+'^'       [reduce using rule 11 (expr)]
+$default  reduce using rule 11 (expr)
+
+I'm pretty new to using bison so any help on this would be appreciated, thanks in advanceA "conflict" in bison tells you the grammar in question is not LALR(1) -- there is something about it that can't find a unique parse for an input with only 1 token lookahead.
+The verbose grammar file tells you exactly where the conflict is, but to understanbd it, you need to understand how a shift-reduce parser recognizes inputs.  A shift-reduce parser is basically a state machine coupled to a stack (a push-down automata or PDA), where the state machine tracks which possible (partial) rule productions have been recognized so far, and the stack holds states that have been deferred.
+In your specific example, you have the state rules:
+7 expr: expr . '+' expr
+7     | expr '+' expr .
+8     | expr . '-' expr
+9     | expr . '*' expr
+10     | expr . '/' expr
+11     | expr . '^' expr
+
+which tells you the state represents having partially recognized any of those rules up to the point where a . appears.  So it might have recognized the entire rule expr + expr or it might be just the initial expr of one of the other rules.  This is indicative of an ambiguity in the grammar.  Whenever you have an input of the form
+A + B * C
+
+or
+3 + 5 - 7
+
+it can recognize it as two binary operations, but it doesn't know which one binds tighter -- should it be (A + B) * C or A + (B * C)Chris Dodd's answer tells you what is wrong.  This answer is about how to fix it.
+You can fix this by introducing a bunch of sub-productions of the expr production, and this is what you will often see in formal specifications, e.g.
+atom:   NUM | NAME | '(' expr ')'
+pow:    atom '^' atom
+muldiv: pow '*' pow | pow '/' pow
+/* etc */
+
+And with more complicated grammars, sometimes you have to do it this way.  But in this case, it's easier to use Bison's operator precedence feature.  Add these lines to the first section of your .y file:
+%left '+' '-'
+%left '*' '/'
+%left '^'
+
+This tells the parser generator that all of the arithmetic operators are left-associative (that is, treat a + b + c as (a + b) + c), that * and / have higher precedence than + and - (that is, treat a + b * c as a + (b * c)), and that ^ has higher precedence still.  This is enough extra information to eliminate all the conflicts.Bison operates in part by maintaining a stack of symbols, and repeatedly choosing between
+
+shifting the next symbol from its input to the top of the stack, OR
+reducing some number of symbols from the top of the stack to another symbol, according to one of the grammar rules.
+
+It uses the current contents of the stack and the type of the next input symbol (if any), to make that choice.
+It is very easy to write grammar rule sets that are ambiguous, in the sense that they afford states where either shifting or reducing could be viable.  This is a "shift/reduce" conflict, and there are many such states in your case.  Consider this input:
+1 + 2 * 3
+
+Supposing that tokens 1, 2, and 3 are parsed as NUMs, we have this:
+stack                input                         action
+(empty)              `NUM` `+` `NUM` `*` `NUM`     shift
+`NUM`                `+` `NUM` `*` `NUM`           reduce (1)
+`expr`               `+` `NUM` `*` `NUM`           shift (2)
+`expr` `+`           `NUM` `*` `NUM`               shift (3)
+`expr` `+` `NUM`     `*` `NUM`                     reduce (1)
+`expr` `+` `expr`    `*` `NUM`                       !!
+
+And there we have two viable alternatives: Bison could reduce the three symbols at the top of the stack to an expr, or it could shift the * onto the stack.  In fact, although it is not always the case with a shift / reduce conflict, either alternative could lead to a successful parse, but the choice matters because it can -- and in your case does -- affect the interpretation of the input.  Performing the reduction at this point leads to interpreting the input as equivalent to (1 + 2) * 3, whereas performing the shift leads, in a couple more steps, to interpreting the input as equivalent to 1 + (2 * 3).
+Without other guidance, Bison defaults to shifting in these cases.  That more often leads to a successful parse, but not always, and sometimes it leads to a successful but wrong parse.  Bison's default will get it right in the above example, but would get it wrong (relative to our usual expectations for operator precedence) with 1 * 2 + 3.
+Writing unambiguous grammar rules is a distinctly non-trivial exercise.  In this case, it would require breaking the symmetry of your rules for expressions, so that the left- and right-hand operands are represented by different symbols.  To take operator precedence into account, you will also need to differentiate between different types of expressions based on the top-level operator, if any, with which they are formed.
+Notes:
+(1) There is no rule for handling a NUM except to reduce it to an expr.
+(2) an expr could also be reduced to a line, but Bison can take the next token type into account to see that performing such a reduction would leave it in a state from which it could not proceed.
+(3) There is no rule to reduce a group of symbols ending with a +.cs50 pset4 - edge detection filter not working - sobel operatorThe following code i have written has the purpose of detecting the edges in a pixel using the sobel operator. However, it fails all of the tests given by check50 (tool offered by cs50). The output image is also the exact same as the input.
+before you continue reading, visit the pset's link
+
+note: I'm supposed to form a 3x3 grid around the pixel I want to filter so that I can iterate over each value in the GX and GY values. I've used ints hh and ww to do this.
+
+       // Detect edges
+        void edges(int height, int width, RGBTRIPLE image[height][width])
+        {
+            int sqrtRedd;
+            int sqrtGreenn;
+            int sqrtBluee;
+        
+        //make copy of image
+            RGBTRIPLE copy[height][width];
+        
+            for(int h = 0; h < height; h++)
+            {
+                for(int w = 0; w < width; w++)
+                {
+                    copy[h][w] = image[h][w];
+                }
+            }
+        
+        //loop through pixels
+            for(int h = 0; h < height; h++)
+            {
+                for(int w = 0; w < width; w++)
+                {
+                    int GXred = 0;
+                    int GYred = 0;
+                    int GXgreen = 0;
+                    int GYgreen = 0;
+                    int GXblue = 0;
+                    int GYblue = 0;
+                    
+                    for(int hh = -1; hh <= 1; hh++)
+                    {
+                        for(int ww = -1; ww <= 1; ww++)
+                        {
+                            if( h + hh >= 0 && h + hh < height && w + ww >= 0 && w + ww < width)
+                            {
+                                //form 3x3 grid
+                            GXred += ww * copy[2 - hh * hh][2 - ww * ww].rgbtRed;
+                            GYred += hh * copy[2 - hh * hh][2 - ww * ww].rgbtRed;
+     
+    
+                       
+                        GXgreen += ww * copy[2 - hh * hh][2 - ww * ww].rgbtGreen;
+                        GYgreen += hh * copy[2 - hh * hh][2 - ww * ww].rgbtGreen;
+                        
+                        GXblue += ww * copy[2 - hh * hh][2 - ww * ww].rgbtBlue;
+                        GXblue += hh * copy[2 - hh * hh][2 - ww * ww].rgbtBlue;
+                        
+                            }
+                        }
+                    }
+                    
+                    int red = round(sqrt(GXred * GXred + GYred * GYred));
+                    int green = round(sqrt(GXgreen * GXgreen + GYgreen * GXgreen));
+                    int blue = round(sqrt(GXblue * GXblue + GYblue * GYblue));
+                    
+                    if(red > 225)
+                    {
+                        red = 225;
+                    }
+                    
+                    else if(green > 225)
+                    {
+                        green = 225;
+                    }
+                    
+                    else if(blue > 225)
+                    {
+                        blue = 225
+                    }
+                    
+                    image[h][w].rgbtRed = red;
+                    image[h][w].rgbtGreen = green;
+                    image[h][w].rgbtBlue = blue;
+                    
+                }
+            }
+                
+            return;
+        }
+
+RGBTRIPLE:
+typedef struct
+{
+    BYTE  rgbtBlue;
+    BYTE  rgbtGreen;
+    BYTE  rgbtRed;
+} __attribute__((__packed__))
+RGBTRIPLE;
+
+These are the error messages given by check50:
+    :( edges correctly filters middle pixel
+        expected "210 150 60\n", not "143 105 30\n"
+    :( edges correctly filters pixel on edge
+        expected "213 228 255\n", not "164 144 79\n"
+    :( edges correctly filters pixel in corner
+        expected "76 117 255\n", not "58 77 64\n"
+    :( edges correctly filters 3x3 image
+        expected "76 117 255\n21...", not "58 77 64\n164 ..."
+    :( edges correctly filters 4x4 image
+        expected "76 117 255\n21...", not "58 77 64\n164 ..."
+
+As you can see, the output values are way off and not even near what they should actually be. the problem is: I don't know if these errors are caused by a) my way of trying to find the GX and GY values from the kernels or b)by the way i'm applying the sobel operator.
+I've tried finding GX and GY values in other ways (didn't work) such as:
+                         if(hh == -1)
+                         {
+                            GYred += copy[h - 1][w + ww].rgbtRed * -1;
+                            GYgreen += copy[h - 1][w + ww].rgbtGreen * -1;
+                            GYblue += copy[h - 1][w + ww].rgbtBlue * -1;
+                         }
+                         
+                         else if( hh == 0)
+                         {
+                             GYred += copy[h][w + ww].rgbtRed * 0;
+                             GYgreen += copy[h][w + ww].rgbtGreen * 0;
+                             GYblue += copy[h][w + ww].rgbtBlue * 0;
+                         }
+                         
+                         else if(hh == 1)
+                         {
+                             GYred += copy[h + 1][w + ww].rgbtRed * 1;
+                             GYgreen += copy[h + 1][w + ww].rgbtGreen * 1;
+                             GYblue += copy[h + 1][w + ww].rgbtBlue * 2;
+                         }
+                         
+                         else if(hh == 2)
+                         {
+                             GYred += copy[h + 2][w + ww].rgbtRed * 2;
+                             GYgreen += copy[h + 2][w + ww].rgbtGreen * 2;
+                             GYblue += copy[h + 2][w + ww].rgbtBlue * 2;
+                         }
+                         
+    //start setting GX values
+                         if(ww == -2)
+                         {
+                             GXred += copy[h + hh][w - 2].rgbtRed * -2;
+                             GXgreen += copy[h + hh][w - 2].rgbtGreen * -2;
+                             GXblue += copy[h + hh][w - 2].rgbtBlue * -2;
+                         }
+                         
+                         else if(ww == -1)
+                         {
+                             GXred += copy[h + hh][w - 1].rgbtRed * -1;
+                             GXgreen += copy[h + hh][w - 1].rgbtGreen * -1;
+                             GXblue += copy[h + hh][w - 1].rgbtBlue * -1;
+                         }
+                         
+                         else if(ww == 0)
+                         {
+                             GXred += copy[h + hh][w].rgbtRed * 0;
+                             GXgreen += copy[h + hh][w].rgbtGreen * 0;
+                             GXblue += copy[h + hh][w].rgbtBlue * 0;
+                         }
+                         
+                         else if(ww == 1)
+                         {
+                             GXred += copy[h + hh][w + 1].rgbtRed * 1;
+                             GXgreen += copy[h + hh][w + 1].rgbtGreen * 1;
+                             GXblue += copy[h + hh][w + 1].rgbtBlue * 1;
+                         }
+
+I've been stuck on this pset for almost a week now and so at this point I don't know what else to try.You have quite some parts that do not really make sense or are missing.
+
+You do not apply the sobel factors anywhere. Just taking the offset inside your 3x3 grid does not yield the correct values,
+You only limit 1 color channel in case of overflow,
+You limit to 225 instead of 255,
+You mixed GXblue and GYblue, same for GXgreen and GYgreen.
+
+I have prepared a new version that should do the trick.
+Now tested and with test data from initially failed test for 4x4 image.
+
+#include <stdio.h>
+#include <math.h>
+
+typedef unsigned char BYTE;
+
+typedef struct
+{
+    BYTE  rgbtBlue;
+    BYTE  rgbtGreen;
+    BYTE  rgbtRed;
+} __attribute__((__packed__))
+RGBTRIPLE;
+
+// Detect edges
+void edges(int height, int width, RGBTRIPLE image[height][width])
+{
+    int sqrtRedd;
+    int sqrtGreenn;
+    int sqrtBluee;
+
+    //make copy of image
+    RGBTRIPLE copy[height][width];
+    for(int h = 0; h < height; h++)
+    {
+        for(int w = 0; w < width; w++)
+        {
+            copy[h][w] = image[h][w];
+        }
+    }
+
+    //loop through pixels
+    for(int h = 0; h < height; h++)
+    {
+        for(int w = 0; w < width; w++)
+        {
+            int GXred = 0;
+            int GYred = 0;
+            int GXgreen = 0;
+            int GYgreen = 0;
+            int GXblue = 0;
+            int GYblue = 0;
+            
+            int index = 0;
+            int factorsX[] = {-1,  0,  1, -2, 0, 2, -1, 0, 1};
+            int factorsY[] = {-1, -2, -1,  0, 0, 0,  1, 2, 1};
+
+            //form 3x3 grid
+            for(int hh = -1; hh <= 1; hh++)
+            {
+                for(int ww = -1; ww <= 1; ww++)
+                {
+                    int x = w+ww;
+                    int y = h+hh;
+                    if( y >= 0 && y < height && x >= 0 && x < width)
+                    {
+                        GXred += factorsX[index] * copy[y][x].rgbtRed;
+                        GYred += factorsY[index] * copy[y][x].rgbtRed;
+
+                        GXgreen += factorsX[index] * copy[y][x].rgbtGreen;
+                        GYgreen += factorsY[index] * copy[y][x].rgbtGreen;
+
+                        GXblue += factorsX[index] * copy[y][x].rgbtBlue;
+                        GYblue += factorsY[index] * copy[y][x].rgbtBlue;
+                    }                   
+                    index++;
+                }
+            }
+
+            int red = round(sqrt(GXred * GXred + GYred * GYred));
+            int green = round(sqrt(GXgreen * GXgreen + GYgreen * GYgreen));
+            int blue = round(sqrt(GXblue * GXblue + GYblue * GYblue));
+
+            if(red > 255)
+            {
+                red = 255;
+            }
+            if(green > 255)
+            {
+                green = 255;
+            }
+            if(blue > 255)
+            {
+                blue = 255;
+            }
+
+            image[h][w].rgbtRed = red;
+            image[h][w].rgbtGreen = green;
+            image[h][w].rgbtBlue = blue;
+        }
+    }
+
+    return;
+}
+
+int main(void)
+{
+    RGBTRIPLE test_4x4[4][4] = {
+        {{0, 10, 25}, {0, 10, 30}, {40, 60, 80}, {50, 60, 80}},
+        {{20, 30, 90}, {30, 40, 100}, {80, 70, 90}, {80, 80, 90}},
+        {{20, 20, 40}, {30, 10, 30}, {50, 40, 10}, {50, 40, 100}},
+        {{50, 20, 40}, {50, 20, 40}, {50, 40, 80}, {50, 40, 80}},
+    };
+
+    edges(4, 4, test_4x4);
+    for(int h = 0; h < 4; h++)
+    {
+        for(int w = 0; w < 4; w++)
+        {
+            printf("%d %d %d\n", test_4x4[h][w].rgbtBlue, test_4x4[h][w].rgbtGreen, test_4x4[h][w].rgbtRed);
+        }
+    }
+
+    return 0;
+}strlen of char array & putcharI am compiling and running this code:
+// hello, world!, without printf
+
+#include <stdio.h>
+#include <string.h>
+
+char a[7] = "hello, ";
+char b[7] = "world!\n";
+
+void putCharArray(char *ray) {
+  for (int i = 0 ; i < strlen(ray) ; i++ ) 
+    { putchar(ray[i]);  }    
+}
+
+void main() {
+    putCharArray(a);
+}
+
+on Ubuntu 20 using gcc. When it runs it outputs:
+hello, world!
+
+
+So it seem like it runs past the 'a' array and right
+into the 'b' array.
+Would someone please explain how that is? Please and
+thank you.The both character arrays
+char a[7] = "hello, ";
+char b[7] = "world!\n";
+
+do not contain strings because the sizes of the arrays are not enough large to include as an initializer the terminating zero character '\0'. So calling the function strlen invokes undefined behavior.
+You should declare the arrays like
+char a[] = "hello, ";
+char b[] = "world!\n";
+
+or like (specifying the sizes of the arrays at least not less than 8)
+char a[8] = "hello, ";
+char b[8] = "world!\n";
+
+Or you could change the function the following way
+void putCharArray( const char *ray, size_t n ) {
+  for (size_t i = 0 ; i < n ; i++ ) 
+    { putchar(ray[i]);  }    
+}
+
+and call it like
+putCharArray( a, sizeof( a ) );
+
+Pay attention to that according to the C Standard the function main without parameters shall be declared like
+int main( void )C: Access Violation after numerous uses of fseekMy program goes through this section of my code many times without a problem. Then, in the middle of the file, the file pointer gets set to placeholder (the original address is erased) and i get an access violation when trying to fseek backwards by 1 character.
+I debugged it several times and there does not appear to be any places where i wiped out the file pointer or set it to another value before coming to this fseek. As i said before, this section of my code runs many times without a problem, but this error seems very random and i can not think of a reason why it is happening.
+Is there a limit on the number of times you can use fseek? Do i need to do something else if i plan to use it a lot? Will a certain number of uses wipe out the value of the file pointer?
+I am not fseeking from the beginning of the file or anything crazy like that, it is smack dab in the middle and i am only trying to move back one character.
+Exception thrown at 0x77A460C5 (ntdll.dll) in Hw04.exe: 0xC0000005: Access violation writing location 0x656D6F87.
+ch = fgetc(input);
+if (isInvisibleChar(ch) || isalpha(ch) || isdigit(ch) || ch == EOF) {
+    if (id == getId(".")) {
+        emit(11, 0, 3);
+        strcpy(token, ".");
+    }       
+    printf("%s\t%d\n", token, id);
+    sprintf(temp, "%d ", id);
+    strcat(lexemeList, temp);
+    sprintf(temp, "%s ", names[id - 1]);
+    strcat(symbolList, temp);
+    foundTok = 1;
+}
+if (!isInvisibleChar(ch)) {
+    fseek(input, -1L, SEEK_CUR); //<-----------The Access Violation is here
+}
+
+note - This problem happens with and without the if statement around the fseekBased on the access violation address (all valid ascii characters), I'm 100% certain that you are experiencing memory corruption somewhere.
+You're using a lot of strcpy and sprintf. The first thing I recommend is that you use strncpy and snprintf. I also recommend that any buffers you use, double or quadruple their size, as it's clear however much space you allocated wasn't enough.
+Memory corruption bugs are inherently difficult to predict - the reason why it's occurring so randomly is because there is a condition occurring outside the bounds of a typically running program. Here's the wiki page for memory corruption if you need a refresher:
+https://en.wikipedia.org/wiki/Memory_corruptionPossible incorrect use of Pointers in ctypes. Unable to get expected responseGiven the following c code snippet
+#include<stdio.h>
+#include "mcp2221_dll_um.h"
+
+int main(void) {
+    wchar_t LibVersion[10];
+    int response = 0;
+    int error = 0;
+
+    response = Mcp2221_GetLibraryVersion(LibVersion);
+
+    if(response == 0) {
+        printf("Library (DLL) version: %ls \n",LibVersion);
+    } else {
+        error = Mcp2221_GetLastError();
+        printf("Version can't be found, version: %d, error %d\n", response, error);
+
+    }
+}
+
+with the function signature as defined in mcp2221_dll_um.h file
+MCP2221_DLL_UM_API int CALLING_CONVENTION Mcp2221_GetLibraryVersion(wchar_t *version); 
+
+I compile the source using gcc: gcc -o test test.c -L. -lmcp2221_dll_um_x64
+and run the executable: ./text.exe
+then I get the following output: Library (DLL) version: 2.2b
+GREAT it works as expected!
+Now I would like to use python and ctypes to produce the same results.
+So I wrote the following python code snippet
+from ctypes import *
+
+library = WinDLL("./mcp2221_dll_um_x64.dll")
+library.Mcp2221_GetLibraryVersion.restype = c_int
+library.Mcp2221_GetLibraryVersion.argtypes = [POINTER(c_wchar_p)]
+
+LibVersion = c_wchar_p()
+
+results = library.Mcp2221_GetLibraryVersion(LibVersion)
+
+print("results: ", results)
+print("LibVersion: ", LibVersion)
+
+and run the code: python test.py
+and get the following output
+results: 0
+LibVersion: c_wchar_p(27584762469223794)
+
+The results 0 tells me the request was successful, but I am not sure how I can convert the LibVersion into a readable string which equals 2.2b like I get from running the c sample.
+Please help me out here, I am using pointers the wrong way? or some other mistake?c_wchar_p is a pointer and equivalent to wchar_t* in C.  Just use .argtypes = [c_wchar_p].
+Another issue is the API being called is using the wchar_t* buffer as an out parameter, so you need to allocate a buffer to pass.  This should work:
+from ctypes import *
+
+library = WinDLL("./mcp2221_dll_um_x64.dll")
+library.Mcp2221_GetLibraryVersion.restype = c_int
+library.Mcp2221_GetLibraryVersion.argtypes = c_wchar_p,
+
+LibVersion = create_unicode_buffer(10)
+results = library.Mcp2221_GetLibraryVersion(LibVersion)
+
+print("results: ", results)
+print("LibVersion: ", LibVersion.value)
+
+Note that LibVersion.value displays the null-terminated Unicode string in the buffer.  If you needed to access the raw data you can use indexing or just copy the whole array out to a string with slicing:
+>>> s=ctypes.create_unicode_buffer(10)
+>>> s
+<ctypes.c_wchar_Array_10 object at 0x000001E63085C7C8>
+>>> s.value
+''
+>>> s[:]
+'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'What is the difference to declare a pointer before the malloc [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Do I cast the result of malloc?
+
+                                (28 answers)
+                            
+
+Closed last year.
+
+
+
+I am learning about malloc function & I see this difference but I cannot understand it
+What is the difference between
+ptr = (*int) malloc(sizeof(int)*N)
+
+and
+ptr = malloc(sizeof(int)*N)In C cast of the malloc is considered the bad practice.
+C++ is more type strict and you need to cast if you want to assign pointer with pointer of other type. But I would rather avoid direct use of the malloc (and generally pointers) in the C++ program.
+In both I would rather use object in the sizeof operator
+ptr = malloc(sizeof(*ptr)*N);How is isalnum() getting his return value in C? [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed last year.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+For a school assignement i have to reproduce the behaviour of the isalnum() function in C. My issue is in getting the same int returned. How is isalnum() determining the value of the positive int it can return ?Build it from other functions in ctype.h:
+#include <ctype.h>
+
+int my_isalnum(int c)
+  {
+  return isalpha(c) | isdigit(c);
+  }Readers Writers - who is getting preferenceThe code is:
+Semaphore rsem = 1;
+Semaphore wsem = 1;
+Semaphore mutex_rc = 1;
+Semaphore mutex wc = 1;
+Semaphore other_readers = 1;
+int rc = 0;
+int wc = 0;
+
+void reader(void)
+{
+    while(true)
+    {
+        down(other_readers);
+        down(rsem);
+        down(mutex_rc);
+        rc++;
+        if(rc == 1)
+            down(wsem);
+        up(mutex_rc);
+        up(rsem);
+        up(other_readers);
+        read_data_base();
+        down(mutex_rc);
+        rc--;
+        if(rc == 0)
+            up(wsem);
+        up(mutex_rc);
+    }
+}
+
+
+
+void writer()
+{
+    while(true)
+    {
+        down(mutex_wc);
+        wc++;
+        if(wc == 1)
+            down(rsem);
+        up(mutex_wc);
+        down(wsem);
+        write_data_base();
+        up(wsem);
+        down(mutex_wc);
+        wc--;
+        if(wc == 0)
+            up(rsem);
+        up(mutex_wc);
+    }
+}
+
+I have to tell who is getting the preference. I understand semaphores and what they are used for but I can't tell who is getting the preference here.
+And what is the reason for the other_readers semaphore?
+What is the approach to such problems?"Error: attempt to move .org backwards" using Xtensa XCC, GCC works fineHere is a minimal reproducible example:
+/*
+ * Example for Xtensa xt-xcc compiler "error: attempt to move .org backwards".
+ */
+
+struct k_dict
+{
+    char *m_name_dict;
+    char *p_name_dict;
+    union
+    {
+        float f_value;
+        int i_value;
+        char* s_value;
+    };
+};
+
+struct k_mode
+{
+    const char*  m_name;
+          int    p_number;
+    const struct k_dict *p;
+    const struct k_dict pars[];
+};
+
+struct k_dict P1[] =
+{
+    {.m_name_dict="M1", .p_name_dict="P1", .s_value="string"},
+    {.m_name_dict="M2", .p_name_dict="P2", .i_value=5       },
+    {.m_name_dict="M3", .p_name_dict="P3", .f_value=48.0    }
+};
+
+struct k_mode mode_default =
+{
+    .m_name   = "default",
+    .p_number = 1,
+    .p        = P1,
+    .pars =
+    {
+        {.m_name_dict = "m", .p_name_dict="p", .s_value="s"}
+    }
+};
+
+
+int main( int argc, char **argv )
+{
+    return 0;
+}
+
+Compiling this using Tensilica Xtensa xt-xcc compiler gives assembler error:
+"xt-xcc" -c -g -O0 -std=c11 -fmessage-length=0 -DPROC_hifi3_tv_car_5 -DCONFIG_hifi3_tv_car_5 --xtensa-system=hifi3_tv_car_5/config --xtensa-core=hifi3_tv_car_5 --xtensa-params= "\"HelloWorld/main.c\"" -o "\"HelloWorld/bin/hifi3_tv_car_5/Debug/main.o\"" 
+/Temp/cc0s#6c7c.a32040: Assembler messages:
+/Temp/cc0s#6c7c.a32040:39: Error: attempt to move .org backwards
+xt-xcc ERROR: XtensaTools/bin/xt-as.exe returned non-zero status 1   
+
+Where could this come from?
+Note: GCC works fine.Seems like C11 is not supported by xt-xcc, even there is no warning reported by the compiler when the -std=c11 flag is added.
+From the Xtensa manual: "Support for the C11 standard can be enabled with the -std=c11 option only with the Clang front end. (...) Starting with the RG-2017.7 release, XCC includes an alternative compiler front end based on Clang version 3.4 from the LLVM project. In future versions, the Clang front end will replace GCC. The Clang front end is selected by using the -clang compiler option."
+Using Clang the above code compiles fine.The issue comes from the code generated for initialization of mode_default:
+        .data
+        .org 0x0
+        .align  16
+        .global mode_default
+        .type   mode_default, @object
+        .size   mode_default, 12
+mode_default:   # 0x0
+        .long   .L_g_7
+        # offset 4
+        .long   1
+        .long   P1 +0
+        .long   .L_g_8
+        .long   .L_g_9
+        .long   .L_g_10
+        # end of initialization for mode_default
+        .org 0x10
+
+and it looks like a bug in the compiler. Interestingly, I observe the same issue with both xt-xcc and xt-xcc -clang.Printf format string maximum width value (padding) %(??)d%nWhat is the maximum width value I can put in the %d format specifier? For example:
+int c=0;   
+printf("%1234567899d%n",0,&c);
+printf("%d",c);
+
+When I use large values the written value of c is 0. Why is that?Although it's not stated explicitly, the type of the field width is most likely an int.  This is because if the field width is given as * then an int argument is expected.
+Section 7.21.6.1p5 of the C standard regarding the fprintf function (any by extension printf) states the following regarding field witdh:
+
+As noted above, a field width, or precision, or both, may be indicated
+by an asterisk.  In this  case,  an int argument  supplies  the
+field  width  or  precision.   The  arguments specifying  field
+width,  or  precision,  or  both,  shall  appear  (in  that  order)
+before  the argument  (if  any)  to  be  converted.   A negative
+field  width  argument  is  taken  as  a - flag followed  by  a
+positive  field  width.   A  neg  ative  precision  argument  is
+taken  as  if  the precision were omitted.
+
+I tested this on CentOS 7 and Ubuntu 18, and the largest width I could specify was 2147483614 which is 33 less than the max value for a signed 32 bit int.  If I use anything larger the first printf prints nothing and c remains 0.
+Go generally speaking, the largest value you can expect for c would be INT_MAX, however the exact value will vary based on the implementation.What is the maximum width value I can put in the %d format specifier?
+
+The limit may be as small as 4095.
+
+Aside from issues with specifying a width outside the positive int range, long output can incur environmental limits.
+
+
+Environmental limits  (fprintf)
+The number of characters that can be produced by any single conversion shall be at least 4095.  C17dr § 7.21.6.1 15
+
+As I see this, an attempt to "%(some large value)d" print more than 4K (or some greater implementation limit) characters is UB.
+
+Also for output to a text file:
+
+Environmental limits
+An implementation shall support text files with lines containing at least 254 characters, including the terminating new-line character. The value of the macro BUFSIZ shall be at least 256.  C17dr § 7.21.2 9
+
+Although stdout with printf() is not a file,  with re-directed output and freopen(), printf() may be subject to the above constraint.
+Then printing an int with many digits can form a line exceeding 254 and some weak file system may not handle long lines.
+Such a small 254 limit for a line length I have never seen, so I only include it as a reference, yet do not see it as a modern true limitation.Divisible Problem on Hackerearth Partially AcceptedHiii,
+I completed challenge in Hackerearth using C but solution partially accepted. I tried to change data type also but still same problem. Someone plz check my solution. Thanku in advanced.
+Question is:-
+You are given an array A of size N that contains integers. Here, N is an even number. You are required to perform the following operations:
+Divide the array of numbers in two equal halves
+Note: Here, two equal parts of a test case are created by dividing the array into two equal parts.
+Take the first digit of the numbers that are available in the first half of the array (first 50% of the test case)
+Take the last digit of the numbers that are available in the second half of the array (second 50% of the test case)
+Generate a number by using the digits that have been selected in the above steps
+Your task is to determine whether the newly-generated number is divisible by 11.
+My solution is:-
+#include <stdio.h>
+#include <math.h>
+
+int main(){
+    int N;
+    scanf("%d",&N);
+    int A[N];
+
+    for(int i = 0;i < N;i++)
+        scanf("%d",&A[i]);
+    
+    long int sum = 0;
+    for(int i = 0;i < N/2;i++){
+        int digits =(int)log10(A[i]);
+        int first_digit = (int)(A[i] / pow(10,digits));
+        sum = (sum*10) + first_digit;
+    }
+
+    for(int i = N/2;i < N;i++){
+        int last_digit = A[i] % 10;
+        sum = (sum*10)+last_digit;
+    }
+
+    sum % 11 == 0? printf("OUI"):printf("NON");
+    return 0;
+}The problem says that N will be upto 100,000.
+Dealing with such many digits, the calculation of sum will cause overflow.
+You should divide sum by 11 and take modulo after each update of sum.You shouldn't use floating-point numbers or built-in integer types for this kind of problems, because their precisions wouldn't be enough. An integer number is divisible by 11 if the alternating sum of its decimal digits is divisible by 11. So a simple solution would be:
+#include <stdio.h>
+#include <string.h>
+
+int main (void)
+{
+    int sum = 0, sign = 1;
+    int n, i;
+
+    scanf("%d", &n);
+
+    for (i = 0; i < n; ++i) {
+        char num[100];
+        scanf("%s", num);
+        sum += sign * (num[i < n / 2 ? 0 : strlen(num) - 1] - '0');
+        sign = -sign;
+    }
+
+    puts(sum % 11 == 0 ? "OUI" : "NON");
+    return 0;
+}
+
+Note: Error checking and input validation is omitted for brevity.why '\0' is not pushed to stack to indicate the end of string?I'm new to C, sorry if my question sounds dumb.
+We know that for string like this below(from https://www.tutorialspoint.com/cprogramming/c_strings.htm:
+char greeting[] = "Hello";
+
+C will append special character \0 in the memory to indicate the end of the string as picture below shows:
+
+So I just did an experiment to prove \0 is in memory, below is my code:
+C code:
+int main()
+{
+   char str[] = "dd";
+   printf("%s", str);
+   return 0;
+}
+
+assembly code:
+//only show relevant code
+main:
+   subq $24, %rsp
+   movw $25700, (%rsp)  //decimal 25700 is 0x6464 where hex 64(decimal 100) is 'd' in ascii
+   movb $0, 2(%rsp)
+   ...
+   call printf
+   ...
+
+so you can see that the assembly code only push "dd" to stack, what about \0? it doesn't get pushed to stack? then how does C know the second 'd' is the end of the string?Output is not shown in Cchar DayName(int day_th)
+{
+  const char *DayName[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday" };
+  return *DayName[day_th];
+}
+
+int main()
+{
+  int day_th=2;
+  printf("What is your favorite day of the week? 1 is Sunday and 7 is Saturday: \n");
+  printf("Day %d is a %s", day_th, DayName(day_th-1));
+  return 0;
+}
+
+I am writing a code that have output like "Day 2 is Monday". I am using VS 2019 and the compiler does not raise any errors. However, when I hit run, only "What is your favorite day ... line" is shown but not the "Day 2 is Monday". Pleases help! Many thanks.You invoked undefined behavior by passing data having wrong type to printf: char is passed where char* is expected (%s).
+The function DayName should return the elements of the array const char* without dereferencing them.
+#include <stdio.h>
+
+const char* DayName(int day_th)
+{
+  const char *DayName[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday" };
+  return DayName[day_th];
+}
+
+int main()
+{
+  int day_th=2;
+  printf("What is your favorite day of the week? 1 is Sunday and 7 is Saturday: \n");
+  printf("Day %d is a %s", day_th, DayName(day_th-1));
+  return 0;
+}Taking input of unknown size of array#include <stdio.h>
+int main() 
+{
+    int a[50],i,n=0;
+    while(scanf("%d",&a[n++])!=EOF);
+    n--;
+    for(i=0;i<n;i++)
+    {
+        printf("%d ",a[i]);
+    }
+    return 0;
+}
+
+Let,
+Input: 5 6 7 8 9
+Output: 5 6 7 8 9
+My question is why the above code works in Online C Compiler and gives proper EOF(-1)
+But while running the code in offline C IDE like Codeblocks, it results in an infinite loop of input as it is not giving any EOF, and what to do to get a similar result in an offline compiler?The scanf() function returns the number of input values it scanned.
+In case of input error or failure it returns EOF.
+As suggested in the comments you can compare the scanf() return value to 1 in order to see if it had a valid input. So if your input is anything other than an int it will end the loop.
+Also making sure n is still within the array bounds before calling the scanf() is a good idea.
+So you can write the code like this
+#include <stdio.h>
+
+int main ()
+{
+    int a[50], n = 0;
+
+    while((n < 50) && (scanf("%d", &a[n++]) == 1));
+
+    n--;
+
+    for (int i = 0; i < n; i++)
+    {
+        printf("%d", a[i]);
+    }
+    
+    return 0;
+}Two threads giving different output from same function RT Linuxi have a 2 threads and a function, im calling the same function "no_elements()" from  two threads
+the function is
+int front = -1, rear = -1;
+int no_elements()
+{
+
+int q_size = 0;
+
+if (front == 0)
+{
+    
+    q_size = rear + 1;
+
+    return q_size;
+}
+else if (front != 0 && rear != 0)
+{
+    
+    q_size = (rear - front) + 1;
+    return q_size;
+}
+else if (rear == 0 && front != 0)
+{
+    
+    q_size = (SIZE - front)+1;
+    return q_size;
+}
+else if (rear == -1 || front == -1 )
+    {
+        q_size = 0;
+        printf("empty---- ---------------------------------------------------------------------");
+        return q_size;
+    }
+
+}
+
+and the two threads call the same function
+iret1 = pthread_create(&thread1, NULL, producer,(void*) message1);
+iret2 = pthread_create(&thread2, NULL, consumer,(void*) message2);
+
+Producer and consumer functions are
+void *producer(void *ptr) // enque function
+{
+char *message;
+printf("%s \n", message);
+enQueue(data);
+printf("No of elements%d\n",no_elements());
+}
+
+second function is
+void *consumer(void *ptr) // enque function
+{
+char *message;
+printf("%s \n", message);
+printf("No of elements%d\n",no_elements());
+}
+
+and enqueue function is
+void enQueue(double *element)
+{
+
+ if (isFull())
+ printf("\n Queue is full!! \n");
+ else
+ {
+
+     int i=0;
+    if (front == -1)
+{
+    front = 0;
+}
+rear = (rear + 1) % SIZE;
+
+memcpy(items[rear].value, element, sizeof (items[rear].value)); // better: sizeof struct
+
+printf("front is  %d--",front);
+printf("rear is  %d\n",rear);
+
+
+ }
+}
+
+but the first thread gives correct result and second one gives the initialized value of front and rear.
+here front and rear are global variables, they are manipulated in first thread by enqueue function, then i call the function no_elements() which returns a value which is correct.
+but at the same time the second thread returns the initialized values of front and rear
+what can be wrong?
+can this be done?
+   void enQueue(double *element)
+   {
+    pthread_mutex_lock(&lock);
+
+   if (isFull())
+    printf("\n Queue is full!! \n");
+    else
+   {
+
+   int i=0;
+   if (front == -1)
+   {
+  front = 0;
+  }
+  rear = (rear + 1) % SIZE;
+
+ memcpy(items[rear].value, element, sizeof (items[rear].value)); // better: 
+ sizeof struct
+
+printf("front is  %d--",front);
+printf("rear is  %d\n",rear);
+
+
+ }
+ pthread_mutex_unlock(&lock);
+}Calling your no_elements() function and / or your enqueue() function from multiple threads that are concurrently alive produces several data races, therefore the behavior of your program is undefined.  The data races arise from those functions accessing shared variables front, rear, and items (at least) without any kind of synchronization, given that some of the accesses are writes.  You must protect shared variables against concurrent access, typically by creating a mutex that each thread must successfully lock before accessing those variables.  Threads must also be sure to unlock the mutex at some point after access in order to afford other threads the opportunity to lock it.The results of accessing an object while another thread is, or might be, accessing it are undefined. You have this problem with both front and read. So the results of your program are undefined and may be totally unpredictable.
+It is the responsibility of the programmer to ensure that threads do not access the same object at the same time. There are lots of tools for this purpose and the first version of enQueue uses none of them.When you call pthread_create, what actually executes next is indeterminate. From the pthread_create man page:
+
+Unless real-time scheduling policies
+are being employed, after a call to pthread_create(), it is
+indeterminate which thread—the caller or the new thread—will next
+execute.
+
+If you extend this to your scenario, where you are creating two threads, it's even more indeterminate what the order of execution is. In other words, you have no way of knowing whether producer or consumer will start executing first.
+You can fix this by rewriting the pthread code like this:
+iret1 = pthread_create(&thread1, NULL, producer,(void*) message1);
+pthread_join(&thread1, NULL);
+iret2 = pthread_create(&thread2, NULL, consumer,(void*) message2);
+pthread_join(&thread2, NULL);
+
+EDIT: additional note - if you need the threads to be created and run simultaneously, then you can use a mechanism like a semaphore to delay the consumer thread before the producer thread. I don't think that a mutex, while absolutely correct in protecting the sanity of your variables, will still gaurantee the order of thread execution. The only other way is by assigning priorities to the tasks.."Segmentation fault (core dumped)" error when using malloc functionThe "Segmentation fault (core dumped)" error occurs when using the malloc function. I learned that malloc's initialization value is filled with trash memory. Is Segmentation fault error occurring in this part?
+#include <stdio.h>
+#include <stdlib.h>
+
+int chnum;
+
+char *getstr(void)
+{
+    char *str1 = (char *)malloc(sizeof(char) * chnum);
+    printf("Write a string: ");
+    gets(str1);
+    return str1;
+}
+
+int main(void)
+{
+    printf("What is the maximum length of a string? ");
+    scanf("%d",chnum);
+    char *set = getstr();
+    printf("string : %s \n",set);
+    free(set);
+    return 0;
+}Casting result of the malloc is considered as a bad practice.
+Do no use global variables to pass the data between the functions. Use function parameters for it
+You do not have to sizeof(char) as it is by definition 1
+Always check the result of malloc
+Do not use gets use fgets instead
+Always check the result of scanf.
+In scanf pass the pointer to the object not the object itself.
+Check result of the function which can fail (getstr)
+
+#include <stdio.h>
+#include <stdlib.h>
+
+char *getstr(size_t chnum)
+{
+    char *str1 = malloc(chnum);
+    if(str1)
+    {
+        printf("Write a string: ");
+        fgets(str1, chnum, stdin);
+        printf("\n");
+    }
+    return str1;
+}
+
+int main(void)
+{
+    size_t chnum;
+    printf("What is the maximum length of a string? ");
+    if(scanf("%zu", &chnum) == 1)
+    {
+        printf("\n");
+        fgetc(stdin);
+        char *str = getstr(chnum);
+        if(str) 
+        {
+            printf("string : %s \n",str);
+            free(str);
+        }
+    }
+    return 0;
+}How are variadic variables represented on the stack?I was trying to implement my own variadic function using this code.  Instead I got UB.
+#include <stdio.h>
+
+void test(int a, ...)
+{
+    char* arg_a = (char*)&a;
+    char* arg_b = arg_a + sizeof(int);
+    printf("%c", *arg_b);
+}
+
+int main(){
+    test(1, 'a');
+}
+
+So why does this program not print the letter a?  Is it not expected that argument 1 ( of test()) will be written in the function stack frame in a low address ex: 0000 0004 (since 0000 0000 will be reserved for return address) then followed by arg_a in the higher address following first arg?
+I guess this result is because of something of compiler optimization, or is there is something else?Is it not expected that argument 1 ( of test()) will be written in the function stack frame in a low address ex: 0000 0004 (since 0000 0000 will be reserved for return address) then followed by arg_a in the higher address following first arg?
+
+This is how it used to work a long time ago, but essentially all ABIs for full-fat processors (as opposed to microcontrollers), defined since the mid-1990s, put the first several arguments in registers instead, to make function calls faster.  They do this whether or not the callee is variadic.  You can't access registers with pointer arithmetic, so the thing you're trying to do is flat-out impossible.  Because of this change, if you look at the contents of the stdarg.h provided by any current-generation compiler, you will see that va_start, va_arg, and va_end are defined using compiler intrinsics, something like
+#define va_start(ap, last_named_arg) __builtin_va_start(ap, last_named_arg)
+// etc
+
+
+You might have been confused into thinking that arguments still go on the stack because most of the 32-bit x86 ABIs were defined in the late 1980s (contemporary to the 80386 and 80486) and they do put all the arguments on the stack. The only exception I remember offhand is Win32 "fastcall".  The 64-bit x86 ABIs, however, were defined in the early 2000s (contemporary to the AMD K8) and they put arguments in registers.
+Your code will not work reliably even if you compile it for 32-bit x86 (or any other old ABI that does put all the arguments on the stack), because it breaks the rules in the C standard about offsetting pointers.  The pointer arg_b doesn't point to "whatever happens to be in memory next to a", it points to nothing.  (Formally, it points one element past the end of a one-element array, because all non-array objects are treated as the sole element of a one-element array for pointer arithmetic purposes.  You are allowed to do the arithmetic that computes this pointer, but not to dereference it.)  Dereferencing arg_b gives the program undefined behavior, which means the compiler is allowed to arbitrarily "miscompile" it.STM32F - Cube Program Ends suddenlyI was trying to blink the led on my STM32F446RE Nucleo Board. The Onboard LED is on A port 5th PIN. Program gives me the following error and also doesnt include my driver (gpio_drive.c) file. Here are the errors.
+fatal error: stm32f4xx_gpio_driver.c: No such file or directory
+And when i delete that and debug without that directory i get the following error:
+WWDG_IRQHandler() at startup_stm32f446retx.s:116 0x80002bc
+Infinite_Loop:
+b Infinite_Loop
+.size Default_Handler, .-Default_Handler
+Here is the main code:
+#include "stm32f4xx_gpio_driver.h"
+
+void delay(void){
+
+    for(uint32_t i = 0; i < 5000; i++);
+
+
+}
+
+
+int main(void){
+
+
+
+    GPIO_Handle_t GpioLed;
+
+    GpioLed.pGPIOx = GPIOA;
+
+    GpioLed.GPIO_PinConfig.GPIO_PinNumber = GPIO_PIN_NO_5;
+    GpioLed.GPIO_PinConfig.GPIO_PinSpeed = GPIO_SPEED_FAST;
+    GpioLed.GPIO_PinConfig.GPIO_PinMode = GPIO_MODE_OUT;
+    GpioLed.GPIO_PinConfig.GPIO_PinOPType = GPIO_OP_TYPE_PP;
+    GpioLed.GPIO_PinConfig.GPIO_PinPuPdControl =GPIO_NO_PUPD;
+
+    GPIO_PeriClockControl(GPIOA,ENABLE);
+
+    GPIO_Init(&GpioLed);
+
+    while(1){
+
+
+        GPIO_ToggleOutputPin(GPIOA,GPIO_PIN_NO_5);
+        delay();
+
+    }
+
+    return 0;
+
+}
+
+Here is my gpio.h file
+/*
+ * stm32fxx_gpio_driver.h
+ *
+ *  Created on: 20 Tem 2020
+ *      Author: hkn_d
+ */
+
+#ifndef INC_STM32F4XX_GPIO_DRIVER_H_
+#define INC_STM32F4XX_GPIO_DRIVER_H_
+
+#include "stm32f4xx.h"
+
+
+/*
+ *
+ * @GPIO_PIN_NUMBERS
+ * GPIO Possible Pin Numbers
+ */
+#define GPIO_PIN_NO_0       0
+#define GPIO_PIN_NO_1       1
+#define GPIO_PIN_NO_2       2
+#define GPIO_PIN_NO_3       3
+#define GPIO_PIN_NO_4       4
+#define GPIO_PIN_NO_5       5
+#define GPIO_PIN_NO_6       6
+#define GPIO_PIN_NO_7       7
+#define GPIO_PIN_NO_8       8
+#define GPIO_PIN_NO_9       9
+#define GPIO_PIN_NO_10      10
+#define GPIO_PIN_NO_11      11
+#define GPIO_PIN_NO_12      12
+#define GPIO_PIN_NO_13      13
+#define GPIO_PIN_NO_14      14
+#define GPIO_PIN_NO_15      15
+
+
+/*
+ *
+ * @GPIO_PIN_MODES
+ *
+ *
+ *GPIO Possible Pin Modes*/
+#define GPIO_MODE_IN        0
+#define GPIO_MODE_OUT       1
+#define GPIO_MODE_ALTFN     2
+#define GPIO_MODE_ANALOG    3
+#define GPIO_MODE_IT_FT     4
+#define GPIO_MODE_IT_RT     5
+#define GPIO_MODE_IT_RFT    6
+
+/*
+ * @GPIO_OP_TYPES
+  GPIO Output Types, Push Pull - Open Drain
+*/
+#define GPIO_OP_TYPE_PP     0
+#define GPIO_OP_TYPE_OD     1
+
+/*
+ * @GPIO_SPEEDS
+   GPIO Possible Pin Output Speeds
+ */
+
+#define GPIO_SPEED_LOW      0
+#define GPIO_SPEED_MEDIUM   1
+#define GPIO_SPEED_FAST     2
+#define GPIO_SPEED_HIGH     3
+
+/*
+ *
+ * @GPIO_PUPD
+ * GPIO Pin pull-up and pull-down configuration macros
+ */
+#define GPIO_NO_PUPD        0
+#define GPIO_PU             1
+#define GPIO_PD             2
+
+
+
+
+
+
+
+typedef struct{
+    uint8_t GPIO_PinNumber;             /*< Possible values from @GPIO_PIN_NUMBERS>*/
+    uint8_t GPIO_PinMode;               /*< Possible values from @GPIO_PIN_MODES>*/
+    uint8_t GPIO_PinSpeed;              /*< Possible values from @GPIO_SPEEDS>*/
+    uint8_t GPIO_PinPuPdControl;        /*< Possible values from @GPIO_PUPD*/
+    uint8_t GPIO_PinOPType;             /*< Possible values from @GPIO_OP_TYPES>*/
+    uint8_t GPIO_AltFunMode;            /*< Possible values from @GPIO_PIN_NUMBERS>*/
+
+}GPIO_PinConfig_t;
+
+typedef struct {
+
+    GPIO_RegDef_t *pGPIOx; //Base address of GPIO port
+    GPIO_PinConfig_t GPIO_PinConfig;
+
+
+}GPIO_Handle_t;
+
+/*Init - Deinit*/
+void GPIO_Init(GPIO_Handle_t *pGPIOHandle);
+void GPIO_DeInit(GPIO_RegDef_t *pGPIOx);
+
+/*Peripheral Clock Setup*/
+void GPIO_PeriClockControl(GPIO_RegDef_t *pGPIOx, uint8_t EnorDis);
+
+/*Data Read & Write*/
+uint8_t GPIO_ReadFromInputPin(GPIO_RegDef_t *pGPIOx, uint8_t PinNumber);
+uint16_t GPIO_ReadFromInputPort(GPIO_RegDef_t *pGPIOx);
+void GPIO_WriteToOutputPin(GPIO_RegDef_t *pGPIOx, uint8_t PinNumber, uint8_t Value);
+void GPIO_WriteToOutputPort(GPIO_RegDef_t *pGPIOx, uint8_t Value);
+void GPIO_ToggleOutputPin(GPIO_RegDef_t *pGPIOx, uint8_t PinNumber);
+
+/*IRQ Configuration and ISR handling*/
+void GPIO_IRQConfig(uint8_t IRQNumber, uint8_t IRQPriority, uint8_t EnorDi);
+void GPIO_IRQHandling(uint8_t PinNumber);
+
+
+
+
+
+
+
+
+
+#endif /* INC_STM32F4XX_GPIO_DRIVER_H_ */
+
+Here is my gpiao.c file that i can't include (possible its because of i can not include this file):
+/*
+ * stm32f4xx_gpio_driver.c
+ *
+ *  Created on: 20 Tem 2020
+ *      Author: hkn_d
+ */
+
+
+#include "stm32f4xx_gpio_driver.h"
+#include "stm32f4xx.h"
+
+/*****************************************
+ * @fn      GPIO_Inıt
+ *
+ * @brief   This function initialize the GPIO on address.
+ *
+ * @param   [*pGPIOHandle]  Pointer of GPIO Handle Address
+ *
+ * @return  none
+ *
+ * @Note    none
+ *
+ */
+
+void GPIO_Init(GPIO_Handle_t *pGPIOHandle){
+            uint32_t    temp;
+        //Deciding whether it is interrupt signal or not
+        if(pGPIOHandle->GPIO_PinConfig.GPIO_PinMode<=GPIO_MODE_ANALOG)
+        {
+            temp = (pGPIOHandle->GPIO_PinConfig.GPIO_PinMode << (2 *pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber));
+            pGPIOHandle->pGPIOx->MODER &= ~(0x3 <<pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);  //Clearing Bits
+            pGPIOHandle->pGPIOx->MODER |= temp;
+        }
+
+        else{
+
+        }
+
+            temp = 0;
+
+            temp = (pGPIOHandle->GPIO_PinConfig.GPIO_PinSpeed << (2 *pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber));
+            pGPIOHandle->pGPIOx->OSPEEDER &= ~(0x3 <<pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);  //Clearing Bits
+            pGPIOHandle->pGPIOx->OSPEEDER |= temp; //initialize speed
+            temp = 0;
+
+            temp = (pGPIOHandle->GPIO_PinConfig.GPIO_PinPuPdControl << (2 *pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber));
+                    pGPIOHandle->pGPIOx->PUPDR &= ~(0x3 <<pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);  //Clearing Bits
+                    pGPIOHandle->pGPIOx->PUPDR |= temp; //initialize pull up/push down
+
+
+            temp = (pGPIOHandle->GPIO_PinConfig.GPIO_PinOPType << pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);
+            pGPIOHandle->pGPIOx->OTYPER &= ~(0x1 <<pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);  //Clearing Bits
+            pGPIOHandle->pGPIOx->OTYPER |= temp; //initialize output type (open drain, push pull)
+
+                if(temp == (pGPIOHandle->GPIO_PinConfig.GPIO_PinMode == GPIO_MODE_ALTFN)){
+                //Configure Alt. Functionality
+                    uint32_t    tempa;
+                    if(pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber <= GPIO_PIN_NO_7){
+                    tempa = (pGPIOHandle->GPIO_PinConfig.GPIO_AltFunMode << (4 *pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber));
+                    pGPIOHandle->pGPIOx->AFRL &= ~(((0xF)) <<pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);  //Clearing Bits
+                    pGPIOHandle->pGPIOx->AFRL   |= tempa; //Alternate Function Low Registers
+                    }
+                    else{
+                    tempa = 0;
+                    tempa = (pGPIOHandle->GPIO_PinConfig.GPIO_AltFunMode << (4 *pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber));
+                    pGPIOHandle->pGPIOx->AFRH &= ~(0xF <<pGPIOHandle->GPIO_PinConfig.GPIO_PinNumber);  //Clearing Bits
+                    pGPIOHandle->pGPIOx->AFRH   |= tempa; //Alternate Function High Registers
+                    }
+            }
+                else{
+
+                }
+
+
+
+
+}
+
+
+/*Interrupt part will be discussed later.
+ *
+ * @fn      GPIO_Deinit
+ *
+ * @brief   This function deinitializes the GPIO on address.
+ *
+ * @param[**pGPIOx] Pointer to GPIO Register Definitions
+ *
+ * @return  none
+ *
+ * @Note    none
+ *
+ */
+
+void GPIO_DeInit(GPIO_RegDef_t *pGPIOx){
+            if(pGPIOx == GPIOA)
+            {
+            GPIOA_REG_RESET();
+            }
+            else if(pGPIOx == GPIOC){
+            GPIOC_REG_RESET();
+            }
+            else if(pGPIOx == GPIOD){
+            GPIOD_REG_RESET();
+            }
+            else if(pGPIOx == GPIOE){
+            GPIOE_REG_RESET();
+            }
+            else if(pGPIOx == GPIOF){
+            GPIOF_REG_RESET();
+            }
+            else if(pGPIOx == GPIOG){
+            GPIOG_REG_RESET();
+            }
+            else if(pGPIOx == GPIOH){
+            GPIOH_REG_RESET();
+            }
+            else if(pGPIOx == GPIOB){
+            GPIOB_REG_RESET();
+            }
+        }
+
+
+
+
+
+
+/*****************************************
+ * @fn      GPIO_PeriClockControl
+ *
+ * @brief   This function controls GPIO peripheral clock.
+ *
+ * @param1[**pGPIOx]    Pointer to GPIO Register Definitions
+ *
+ * @param2[EnorDis] ENABLE or DISABLE macros
+ *
+ * @return  none
+ *
+ * @Note    none
+ *
+ */
+
+void GPIO_PeriClockControl(GPIO_RegDef_t *pGPIOx, uint8_t EnorDi){
+
+        if(EnorDi == ENABLE){
+            if(pGPIOx == GPIOA)
+            {
+            GPIOA_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOC){
+            GPIOC_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOD){
+            GPIOD_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOE){
+            GPIOE_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOF){
+            GPIOF_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOG){
+            GPIOG_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOH){
+            GPIOH_PCLOCK_EN();
+            }
+            else if(pGPIOx == GPIOB){
+                        GPIOB_PCLOCK_EN();
+                        }
+        }
+        else{
+            if(pGPIOx == GPIOA)
+            {
+            GPIOA_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOC){
+            GPIOC_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOD){
+            GPIOD_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOE){
+            GPIOE_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOF){
+            GPIOF_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOG){
+            GPIOG_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOH){
+            GPIOH_PCLOCK_DI();
+            }
+            else if(pGPIOx == GPIOB){
+            GPIOB_PCLOCK_DI();
+            }
+
+        }
+
+}
+
+/*****************************************
+ * @fn      GPIO_ReadFromInputPin
+ *
+ * @brief   This function reads from the decided pin.
+ *
+ * @param1[*pGPIOx]     Pointer to GPIO Register Definitions
+ *
+ * @param2[PinNumber]   ENABLE or DISABLE macros
+ *
+ * @return  uint8_t
+ *
+ * @Note    none
+ *
+ */
+uint8_t GPIO_ReadFromInputPin(GPIO_RegDef_t *pGPIOx, uint8_t PinNumber){
+        uint8_t value;
+
+        value = (uint8_t)   ((pGPIOx->IDR   >> PinNumber) & 0x00000001);
+
+        return value;
+
+}
+
+/*****************************************
+ * @fn      PIO_ReadFromInputPort
+ *
+ * @brief   This function reads from the decided port.
+ *
+ * @param1[*pGPIOx]     Pointer to GPIO Register Definitions
+ *
+ *
+ * @return  uint16_t
+ *
+ * @Note    none
+ *
+ */
+uint16_t GPIO_ReadFromInputPort(GPIO_RegDef_t *pGPIOx){
+
+            uint16_t value;
+
+            value = (uint16_t) pGPIOx->IDR;
+
+            return value;
+
+
+}
+/*****************************************
+ * @fn      GPIO_WriteToOutputPin
+ *
+ * @brief   This function writes to the decided output pin.
+ *
+ * @param1[*pGPIOx]     Pointer to GPIO Register Definitions
+ *
+ * @param2[PinNumber]   8 bit variable for Pin Number
+ *
+ * @param3[Value]       Value to be written
+ *
+ * @return  none
+ *
+ * @Note    none
+ *
+ */
+void GPIO_WriteToOutputPin(GPIO_RegDef_t *pGPIOx, uint8_t PinNumber, uint8_t Value){
+
+        if(Value == GPIO_PIN_SET){
+            pGPIOx->ODR |= ( 1<<PinNumber);
+
+        }
+        else{
+            pGPIOx->ODR &= ~( 1<<PinNumber);
+
+        }
+
+
+}
+
+/*****************************************
+ * @fn      GPIO_WriteToOutputPort
+ *
+ * @brief   This function writes to the decided output port.
+ *
+ * @param1[*pGPIOx]     Pointer to GPIO Register Definitions
+ *
+ * @param2[Value]       Value to be written
+ *
+ * @return  none
+ *
+ * @Note    none
+ *
+ */
+void GPIO_WriteToOutputPort(GPIO_RegDef_t *pGPIOx, uint8_t Value){
+
+            pGPIOx->ODR = Value;
+
+
+
+
+
+}
+
+/*****************************************
+ * @fn      GPIO_ToggleOutputPin
+ *
+ * @brief   This function toggles the decided pin.
+ *
+ * @param1[*pGPIOx]     Pointer to GPIO Register Definitions
+ *
+ * @param2[PinNumber]   8 bit variable for Pin Number
+ *
+ * @return  none
+ *
+ * @Note    none
+ *
+ */
+void GPIO_ToggleOutputPin(GPIO_RegDef_t *pGPIOx, uint8_t PinNumber){
+
+        (pGPIOx->ODR) = (pGPIOx->ODR ^ ( 1 << PinNumber));
+
+}Processing binary data containing different lengthSo I have some binary data that I read, process and need to "split" into different variables, like this:
+int *buffer;
+buffer = malloc(size); 
+fread(buffer,size,1,file);
+buffer = foo(buffer);
+
+The result looks something like this in my debugger:
+01326A18 5F4E8E19 5F0A0000
+
+I want the first byte ( 01 ) to be int a.
+The following 4 bytes are the first timestamp b (should be 5F186A32)
+The following 4 bytes are the second timestamp c (should be 5F198E4E)
+The 0A is supposed to be int d.
+My Problem is that I can put the 1 into a, with (*buffer) & 0xff;, but I'm not able to read the first timestamp correctly since its from second to 5th byte and not align with the int declaration of the buffer.
+If I print *(buffer +1) it gives me the second int and prints "198E4E5F"
+It would be better if I were able to target n byte from every position in my data.
+thx in advance.Something like this will work on most little-endian platforms.  Just fread the same way.
+struct {
+  uint8_t a;
+  uint32_t timeStamp1;
+  uint32_t timeStamp2;
+  uint8_t d;
+} buffer __attribute__((packed));
+assert(sizeof buffer == 10);  /* check packing */If you set your buffer type as char* this will make it point to the 1 byte of chunks. Then if try to get buffer+2, it will return the second byte of the buffer, unlike int pointer which will return the 8th byte of the buffer. Do not forget to update your size in malloc call, since you get your memory with 1 byte chunks in this case. Also this link may be helpful.How can I use Binary search to print all the duplicates strings in a sorted array?Just Using the Binary Search, how to get requested element with the duplicates, as the duplicates will be one after the other,what should be the conditions in the search?
+Lets say this is the given array,entered by the user, and we have to search if "efg" exists, we don't know the indexes, neither how many times it'ss repeating,but  if it exists, print the number of times its repeating times.
+array[][10]={"abc","efg","efg","jkl","jkl","jhk"}You can use upper_bound to find the first element after "efg" greater than it and lower_bound to find the first instance of "efg".
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
+int main()
+{
+    vector<string> V{ "abc", "efg", "efg", "jkl", "jkl", "jhk" };
+    cout << upper_bound(V.cbegin(), V.cend(), "efg") - lower_bound(V.cbegin(), V.cend(), "efg") << endl;
+}
+
+Edit: To improve on it, you can first use lower_bound to check if the string exists in the array. If it does then use upper_bound to calculate the no. of instances.How can I use Binary search to print all the duplicates strings in a sorted array?
+
+A simple, probably non-optimal algorithm to find the range:
+First use binary search to find the first occurrence. This variant of binary search is called "lower bound".
+Then, use binary search to find the last occurrence. This variant of binary search is called "upper bound". Here, we can optimise a bit by limiting the search to start from the found lower bound rather than beginning of the original  linerly untilrange.
+
+However, there is no need to implement it yourself since the standard library has you covered: std::equal_range.
+
+That said, if your intention is to iterate the elements afterwards, then there is no need to search for the end because you'll encounter it while iterating. In such case, simply find the beginning with lower_bound, then iterate the elements linearly while performing the desired operation ("print" in your example) until non-equal element is found.Why is pointing one position beyond a valid object acceptable for pointers?In the textbook "Modern C" by Jens Gustedt, I read for pointers that "A pointer must point to a valid object or one position beyond a valid object or be null.". Why is pointing to one position beyond a valid object acceptable? E.g.:
+int array[5] = {0};
+int* p = array;
+p = array + 5 // points to a valid location
+p = array + 6 // points to an invalid locationSupporting “one beyond the last” makes working with arrays simpler. For example, if a function is called with a pointer Start to some element, it might want to prepare an end pointer End and use a loop such as:
+for (ElementType *p = Start; p < End; ++p)
+
+To do this, End must be a valid pointer.
+We might consider instead setting End to be the last element to be processed, rather than one beyond it, and using:
+for (ElementType *p = Start; p <= End; ++p)
+
+However, note that, after the final element is processed, p will be incremented to beyond End. Then, in order for p <= End to be a valid expression, p must be a valid pointer. So, we need to be able to do address arithmetic up to one beyond the last element of an array.Your code comments express a probable misunderstanding.  With ...
+
+int array[5] = {0};
+int* p = array;
+p = array + 5 // points to a valid location
+
+
+... p does not point to a valid location.  It is allowed and well defined to evaluate array + 5, and that produces a value that p can store, but undefined behavior results from any attempt to dereference that pointer value.
+Such a value for p is sometimes useful as an exclusive upper bound on the addresses of elements of array, or for indexing array backwards (with strictly negative indexes), but you may not attempt to access a value through that value itself.
+In contrast, in this case ...
+
+p = array + 6 // points to an invalid location
+
+
+... p does not point to anything, at least inasmuch as can be determined by analysis of the code.  Attempting to evaluate the expression array + 6 produces undefined behavior, and in particular, the result is not well defined.Inheriting from libuv handlesThe libuv handles have a void* data field to carry around any context information (pretty standard pattern for callbacks in C-land). However, since I'm working in C++-land, I would like to use inheritance to directly store context in the handle. The main advantage is in storing multiple context items which IIUC requires heap allocations to "combine" them into a single pointer, say, std::tuple<...>* or some temporary struct (correct me if I'm wrong here and I can avoid heap allocations even in C-land).
+My main apprehensions are:
+
+Pointers to the handles are eventually used in C-land (the libuv library). Not sure about any interop related corner cases here.
+libuv has its own pseudo-inheritance system by repeating fields from parents in children. This seems akin to how a compiler might lay out fields from base classes in derived classes. Not sure how this would interact with C++ inheritance.
+From what I've researched, the standard doesn't really define any memory layout for inheritance, its up to the compiler. Not sure if that affects things.
+
+So, can I inherit from libuv handles safely in C++? Bonus points if you can clarify the above points as well.If you are the one allocating the handles yourself and then passing them to libuv, there is nothing stopping you from inheriting them. You are allowed to allocate them however you want. You could make them a member of your class, but you could also make them a base of your class.
+The compiler isn't allowed to change the libuv handle's memory layout just because it's a base class. It's allowed to decide where the base goes in the overall class structure, but it's not allowed to change the base itself. (Otherwise, pointers to the base class would have to work differently, depending on whether you allocated the an instance of the base class or the derived class!)
+Since the compiler can't change the memory layout, whatever libuv does is irrelevant. If it works with normal libuv handle objects, it'll still work when they're used as a base class.
+Note: If inheriting from a libuv handle still makes you uncomfortable, you could allocate the handle as a member of your class, and store a pointer to the whole class in libuv's "context" field.What are the next step after compiling PYBIND11_MODULE in C++ fileI was trying to use PYbind 11 to wrap the following small C++ test programme into a Python module, so I can call the test C++ function from python files.
+My problem is : while the C++ file compiled successfully, I have no clue as to what steps to take next to import the newly created module file in python.
+I tried to run "from example import add" in a test Python file in Spyder but received error message saying there is no module named example.
+I'm using Windows10 (x64bit), Python3.7 and Visual studio 2017 community.
+Can some one please help? Thank you very  much!
+#include
+//#include <Aspose.Cells.h>
+#include <pybind11/pybind11.h>
+
+void print(const char*);
+
+int add(int i, int j) {
+return i + j;
+}
+
+PYBIND11_MODULE(example, m) {
+m.doc() = "pybind11 example plugin"; // optional module docstring
+
+m.def("add", &add, "A function which adds two numbers");
+}
+
+int main()
+{
+const char *x = "C Plus plus is wonderful.";
+
+char *z;
+char b = 'z';
+z = &b;
+
+int num = 10;
+int* a = 0;
+
+print(x);
+}
+
+void print(const char* z)
+{
+
+std::cout << "pointer z is" << z << "\n";
+
+std::cin.get();
+}
+
+UPDATE: I followed Stuart's suggestion below when building my test c++ programme. I made two attempts: at the first attempt, I changed Target Extension to ".pyd"; whereas at the second attempt, I kept Target Extension as "dll".
+In both attempts, I received the same error message from Visual Studio, which seem to suggest that the DLL file being built can not be started (as shown in the screenshot that immediately follows)
+Error Messages for Starting DLL Programme
+However, the actual building of dll file seemed successful, as I can see one dll file and one Python Extension Module file, with filenames and path listed as follows:
+C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\ConsoleApplication5.dll
+and
+C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\ConsoleApplication5
+The Visual Studio output message upon building is pasted at the end.
+My problem is: I created a Test.py file in the same directory (C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug)
+and tried to run it in Spyder after including just one line command "import example ". Sypder returned a error message saying " No MODULE Named Example".
+Can anyone please help? Thanks a lot!
+1>------ Build started: Project: ConsoleApplication5, Configuration: Debug x64 ------
+1>LINK : C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\ConsoleApplication5.dll not found or not built by the last incremental link; performing full link
+1>   Creating library C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\ConsoleApplication5.lib and object C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\ConsoleApplication5.exp
+1>ConsoleApplication5.vcxproj -> C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\ConsoleApplication5.dll
+========== Build: 1 succeeded, 0 failed, 0 up-to-date, 0 skipped ==========
+
+UPDATE2: I followed every details of Stuart's instructions in his Update2.
+I got example.pyd (as shown in the following screenshot)
+
+However, I got error message when running in Spyder, as follows:
+(Sorry I only managed to copy the second half of Spyder output message as its very hard to do text selection in Spyder console)
+File "C:\Users\rmili\Anaconda3\lib\site-packages\spyder_kernels\customize\spydercustomize.py", line 110, in execfile
+    exec(compile(f.read(), filename, 'exec'), namespace)
+
+  File "C:/Users/rmili/source/repos/ConsoleApplication5/x64/Debug/Test.py", line 9
+    d = "C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug"
+       ^
+SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in position 2-3: truncated \UXXXXXXXX escape
+
+I changed backward slash "" to  forward slash"/" in the value that's being assigned to "d", and got the following error again:
+File "C:\Users\rmili\Anaconda3\lib\site-packages\spyder_kernels\customize\spydercustomize.py", line 110, in execfile
+    exec(compile(f.read(), filename, 'exec'), namespace)
+
+  File "C:/Users/rmili/source/repos/ConsoleApplication5/x64/Debug/Test.py", line 12, in <module>
+    import example
+
+ModuleNotFoundError: No module named 'example'
+
+UPDATE3:
+As shown in the following screenshot, example module can not be found in Windows command line prompt.
+[Unable to find example module in Windowscommand line prompt]3Make sure the compiled output file is named example.pyd (or has a symlink of that name pointing to it), and try running python from the same directory.
+
+Update: How to build a .pyd in Visual Studio
+On Windows, compiled Python modules are simply DLL files, but they have a .pyd file extension.  You mentioned that your C++ file compiles successfully.  Did you compile it as an executable (.exe), or as a .dll? You should compile it as a DLL, but change the file extension to .pyd.
+The Visual Studio documentation explains how to change your project to create a DLL.  Here's what it says:
+
+
+Open the project's Property Pages dialog box. For details, see Set C++ compiler and build properties in Visual Studio.
+
+Click the Configuration Properties folder.
+
+Click the General property page.
+
+Modify the Configuration Type property.
+
+
+
+Also, on that same settings page, you can find an option to change the Target Extension property.  Change it to .pyd.  (Or simply rename the file yourself after it is built.)
+
+Update 2
+I think you need to change three settings:
+
+Target Name
+
+Change to example
+
+
+Target Extension
+
+Change to .pyd
+
+
+Configuration Type
+
+Change to Dynamic Library (.dll)
+
+
+
+Also, I recommend deleting (or commenting out) everything from example.cpp except for the code shown below.  (I don't know if the presence of a main() function may cause problems, so just remove it.)
+After that, building your project should produce the following file:
+C:\Users\rmili\source\repos\ConsoleApplication5\x64\Debug\example.pyd
+Than, from the Spyder console, try this:
+import os
+
+d = "C:\\Users\\rmili\\source\\repos\\ConsoleApplication5\\x64\\Debug"
+os.chdir(d)
+
+import example
+example.add(1,2)
+
+
+I don't have a Windows machine to test with.  But in case it's useful, here's how I compiled your example on my Mac.  (On Mac and Linux, they use the extension .so instead of .pyd.)
+// example.cpp
+#include <pybind11/pybind11.h>
+
+int add(int i, int j) {
+    return i + j;
+}
+
+PYBIND11_MODULE(example, m) {
+    m.doc() = "pybind11 example plugin";
+
+    m.def("add", &add, "A function which adds two numbers");
+}
+
+$ # Compile
+$ clang++ -I${CONDA_PREFIX}/include -I${CONDA_PREFIX}/include/python3.7m -undefined dynamic_lookup -shared -o example.so example.cpp
+
+$ # Test
+$ python -c "import example; print(example.add(10,20))"
+30I have found answer to my problem:
+
+Make sure all steps I described previously in my post are done
+this is what I missed -` It is important to make sure the file type of "example" is Python Extension Module, as shown in the following screenshot .
+As shown in screenshots of my Updates, initially the Type of my "example.pyd" file was just "File". I managed to convert it to Python Extension Module by adding "cp35-win_amd64." in the file extension, resulting in file name "examplelib.cp35-win_amd64.pyd", and then remove the same texts that were added.fread(): Reading from a file (without alignment) results in skipping of bytesI have a file and using C I want to read the contents of it using fread() (from stdio.h) and write it into the members of a struct. (In my case there is a 2 byte int at the start followed by a 4 byte int.)
+But after writing the contents of the file correctly into the first two byte variable of the struct, it skips two bytes before continuing with the second four byte variable.
+To demonstrate, I have created a 16 byte file to read from. In Hex it looks like this (Little-endian):
+22 11 66 55 44 33 11 11  00 00 00 00 00 00 00 00
+With the following code I expect the first variable, twobytes, to be 0x1122 and the second, fourbytes, to be 0x33445566. But instead it prints:
+twobytes: 0x1122 
+fourbytes: 0x11113344
+
+sizeof(FOO) = 8
+&foo     : 0061FF14
+&foo.two : 0061FF14
+&foo.four: 0061FF18
+
+Skipping bytes 3 and 4 (0x66 & 0x55). Code:
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+
+    FILE* file = fopen("216543110.txt", "r");
+    if (file==NULL) { return 1; }
+
+    typedef struct
+    {
+        uint16_t twobytes;
+        uint32_t fourbytes;
+    }__attribute__((__packed__)) // removing this attribute or just the underscores around packed does not change the outcome
+    FOO;
+    
+    FOO foo;
+    
+    fread(&foo, sizeof(FOO), 1, file);
+    
+    printf("twobytes: 0x%x \n", foo.twobytes);
+    printf("fourbytes: 0x%x \n\n", foo.fourbytes);
+
+    printf("sizeof(FOO) = %d\n", sizeof(FOO));
+    printf("&foo     : %p\n", &foo);
+    printf("&foo.two : %p\n", &foo.twobytes);
+    printf("&foo.four: %p\n", &foo.fourbytes);
+    
+    fclose(file);
+    return 0;
+}
+
+Using a struct with two same size integers works as expected.
+
+So: Using fread() to write into different size variables causes skipping bytes:
+22 11 .. .. 44 33 11 11 ...
+instead of
+22 11 66 55 44 33 ...
+
+I am aware that something about byte alignment is playing a role here, but how does that affect the reading of bytes? If C wants to add padding to the structs, how does that affect the reading from a file?
+I don't care if C is storing the struct members as
+22 11 .. .. 66 55 44 33 ...
+or
+22 11 66 55 44 33 ...,
+I'm confused about why it fails to read my file correctly.
+Also, I am using gcc version 6.3.0 (MinGW.org GCC-6.3.0-1)From the output your program produces, it seems the compiler ignores the __attribute__(__packed__) specification.
+The gcc online user's guide documents the __attribute__ ((__packed__)) type attribute with an example where this attribute is placed before the { of the definition.
+This extension is non standard so it is possible that different compilers or different versions of any given compiler handle it differently depending on the placement choice. If you use gcc, moving the attribute should fix the problem. If you use a different compiler, look at the documentation to figure what it does differently.
+Also note these remarks:
+
+the file should be opened in binary mode, with "rb",
+the sizeof(FOO) argument should be cast as (int) for the %d conversion specifier.
+pointer arguments for %p should be cast as (void *).
+foo.twobytes has the same address as foo, which is mandated by the C Standard and &foo.fourbytes is located 4 bytes away, which means foo.fourbytes is aligned and there are 2 padding bytes between the 2 members.
+
+Try modifying your code this way:
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    FILE *file = fopen("216543110.txt", "rb");
+    if (file == NULL) {
+        return 1;
+    }
+
+    typedef struct __attribute__((__packed__)) {
+        uint16_t twobytes;
+        uint32_t fourbytes;
+    } FOO;
+    
+    FOO foo;
+    
+    if (fread(&foo, sizeof(FOO), 1, file) == 1) {
+        printf("twobytes : 0x%x\n", foo.twobytes);
+        printf("fourbytes: 0x%x\n\n", foo.fourbytes);
+
+        printf("sizeof(FOO) = %d\n", (int)sizeof(FOO));
+        printf("&foo     : %p\n", (void *)&foo);
+        printf("&foo.two : %p\n", (void *)&foo.twobytes);
+        printf("&foo.four: %p\n", (void *)&foo.fourbytes);
+    }
+    fclose(file);
+    return 0;
+}On GCC, when targetting x86 platforms, the
+__attribute__((__packed__))
+only works on structs with
+__attribute__((gcc_struct)).
+However, when targetting Microsoft Windows platforms, the default attribute for structs is
+__attribute__((ms_struct)).
+Therefore, I see three ways to accomplish what you want:
+
+Use the compiler command-line option -mno-ms-bitfields to make all structs default to __attribute__((gcc_struct)).
+Explicitly use __attribute__((gcc_struct)) on your struct.
+Use #pragma pack instead of __attribute__((__packed__)).
+
+Also, as pointed out in the answer by @chqrlie, there are some other things not ideal in your code. Especially when reading binary data, you should normally open the file in binary mode and not text mode, unless you know what you are doing (which you possibly are, since the file has a .txt extension).Since the data structure in memory is different from one in file, It may be better to read the members of struct one by one.
+For example, there are a way to specify position to read  the members of struct with "offsetof".
+The following reads the members of struct with the fread_members function.
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h> /* offsetof */
+
+/* offset and size of each member */
+typedef struct {
+    size_t offset;
+    size_t size;
+} MEMBER;
+
+#define MEMBER_ELM(type, member) {offsetof(type, member), sizeof(((type*)NULL)->member)}
+
+size_t fread_members(void *ptr, MEMBER *members, FILE *stream) {
+    char *top = (char *)ptr;
+    size_t rs = 0;
+    int i;
+    for(i = 0; members[i].size > 0; i++){
+        rs += fread(top + members[i].offset, 1, members[i].size, stream);
+    }
+    return rs;
+}
+
+int main(void) {
+
+    FILE* file = fopen("216543110.txt", "r");
+    if (file==NULL) { return 1; }
+
+    typedef struct
+    {
+        uint16_t twobytes;
+        uint32_t fourbytes;
+    } FOO;
+
+    MEMBER members[] = {
+        MEMBER_ELM(FOO, twobytes),
+        MEMBER_ELM(FOO, fourbytes),
+        {0, 0} /* terminated */
+    };
+
+    FOO foo;
+
+    fread_members(&foo, members, file);
+
+    :How to make a pointer to an array of string in c?I want to make a pointer to an array of string(matrix[10][10]), but I get "initialization from incompatible pointer type" problem so how to fix it?
+And what is the problem?
+void rotate(char matrix[10][10]){
+  
+  char * pMatrix = matrix;
+  for(int j = 0; j < 10; j ++){
+    for(int i = 9; i >= 0; i --){
+      *pMatrix = matrix[i][j];
+      pMatrix ++;
+    }
+  }
+
+}
+
+btw, my task is to perform 90 degree clockwise rotation of matrix, but my algorithm is terrible I knowmatrix is of type char (*)[10] (pointer to array of 10 char).
+pMatrix is of type char * (pointer to char).
+There is a type mismatch when you use:
+char *pMatrix = matrix;
+
+You try to assign a pointer to an array of 10 char to a pointer to char.
+This is why you get the warning:
+
+warning: initialization of 'char *' from incompatible pointer type 'char (*)[10]'
+
+
+You need to dereference matrix
+char *pMatrix = *matrix;
+
+to get a pointer to char.
+
+Could you say why my version (char * pMatrix = matrix;) works for 1D array, but stops working for 2d array?
+
+matrix' type is different when declared as char matrix[10] and parameter of a function. Then matrix is actual equivalent to char *. The assignment from char * to char * is correct.
+Take a look at:
+
+Difference between passing array and array pointer into function in C
+
+Passing an array as an argument to a function in C
+
+C pointer notation compared to array notation: When passing to function
+
+
+Note that if you provide an amount of elements like in your case doesn't matter. char matrix[10] is equal to char matrix[] which is furthermore equal to char *matrix.
+
+ No guarantee if your algorithm works beside that. If you got problems with that, please ask a different question.There are so many ways but I prefer this one:
+void rotate(char matrix[10][10]){
+  
+  char *pMatrix = matrix[0];
+  for(int j = 0; j < 10; j ++){
+    for(int i = 9; i >= 0; i --){
+      *pMatrix = matrix[i][j];
+      pMatrix ++;
+    }
+  }
+}
+
+Or you could use this for better understanding
+void rotate(char matrix[10][10]){
+  
+  char * pMatrix = &matrix[0][0];
+  for(int j = 0; j < 10; j ++){
+    for(int i = 9; i >= 0; i --){
+      *pMatrix = matrix[i][j];
+      pMatrix ++;
+    }
+  }
+}Check this,
+void rotate(char matrix[][10]){
+  char * pMatrix = &matrix[0][0];
+  for(int j = 0; j < 10; j ++){
+  for(int i = 9; i >= 0; i --){
+      *pMatrix++ = matrix[i][j];
+         }
+      }
+   }
+
+
+One dimensional array:
+Consider an array a of 4 integers as a[4].
+Basic rule is both a and &a will point to same location.But they aren't pointing to the same type.
+(1) &a will point to the entire array which is an int[]. The pointer type is int(*)[]
+(2) a, when it decays to a pointer, will point to the first element of the array which is an int. The pointer type is int * Now consider two-dimensional array.
+Two dimensional array
+Consider an array containing two 1D arrays, with each of them having two elements; a[2][2].
+Since the number of dimensions increases, we have one more level of hierarchy i.e. &a, a and *a will point to the same location, but they aren't pointing to the same type.
+(1) &a will point to the entire array which is int[][]. The pointer type is int(*)[][].
+(2) a, when it decays to a pointer, will point to the first element of the 2D array which is an int[]. The pointer type is int(*)[]
+(3) By using *a, we are de-referencing the pointer to a 1D array. Hence we will have a int * pointing to the first integer value of the 2D array.
+Now considering your case,
+(1) In your case is like the first case where you are just using 1 D array, and the one which I suggested as  &matrix[0][0], the pointer points to the entire array. Hope this is clear now.
+(2) Also, you need not pass the first dimension in the function.How to find the whole path to a library using the C preprocessor?I'm looking for a simple bash script which, when given the name of a system header, will return its full path from which it would be read in a #include <header> statement. I already have an analogous thing for looking up the library archive used by linker.
+ld -verbose -lz -L/some/other/dir | grep succeeded | sed -e 's/^\s*attempt to open //' -e 's/ succeeded\s*$//'
+
+For example, this will return the path of libz archive (/lib/x86_64-linux-gnu/libz.so on my system).
+For the requested script I know that I could take a list of include directories used by gcc and search them for the file myself, but I'm looking for a more accurate simulation of what's happening inside the preprocessor (unless it's that simple).You can use the preprocessor to do the work:
+user@host:~$ echo "#include <stdio.h>" > testx.c && gcc -M testx.c | grep 'stdio.h'
+testx.o: testx.c /usr/include/stdc-predef.h /usr/include/stdio.h \
+
+You can add a bit bash-fu to cut the part you are interested inPipe the input to preprocessor and then process the output. Gcc preprocessor output inserts # lines with information and flags that you can parse.
+$ f=stdlib.h
+$ echo "#include <$f>" | gcc -xc -E - | sed '\~# [0-9]* "\([^"]*/'"$f"'\)" 1 .*~!d; s//\1/'
+/usr/include/stdlib.h
+
+It can output multiple files, because gcc has #include_next and can improperly detect in some complicated cases where multiple filenames are included with the same name, like in f=limits.h. So you could also filter exactly second line, knowing that the first line is always going to be stdc-predef.h:
+$ f=limits.h; echo "#include <$f>" | gcc -xc -E - | sed '/# [0-9]* "\([^"]*\)" 1 .*/!d;s//\1/' | sed '2!d'
+/usr/lib/gcc/x86_64-pc-linux-gnu/10.1.0/include-fixed/limits.h
+
+But really search the include paths yourself, it's not that hard:
+$ f=limits.h; echo | gcc -E -Wp,-v - 2>&1 | sed '\~^ /~!d; s/ //' | while IFS= read -r path; do if [[ -e "$path/$f" ]]; then echo "$path/$f"; break; fi; done
+/usr/lib/gcc/x86_64-pc-linux-gnu/10.1.0/include-fixed/limits.hC lang strlen function returns wrong value [closed]Closed. This question is not reproducible or was caused by typos. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed last year.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+#include<stdio.h>
+#include<string.h>
+#include<stdlib.h>
+void func(char* str) {
+    int i = 0;
+    for (i = 0; i < 8191; i += 1) {
+        str[i] = ('a');
+    }
+}
+int main(void) {
+    char buff[8192] = { 0, };
+    int len = 0;
+    
+    func(buff);// printf("%s\n", buff);
+    len = strlen(buff);
+    printf("len:%d\n");
+    //printf("%s\n",buff);
+    return 0;
+}
+
+I try to expect the len : 8191 ,
+but returns wrong number..
+why is this happen??
+could you explain why this happens??printf("len:%d\n"); is incorrect. For each conversion specification such as %d, there must be an argument in the function call that gives the value to be printed. It should be printf("len:%d\n", len);.
+Your compiler likely warned you of this. If it did not, enable warnings in your compiler and pay attention to them.Linux Kernel List, Freeing memoryI am currently learning some Linux Driver writing, and i try to implement list with the Linux Kernel list API.
+My code just allocate a list and add 2 elements to it.
+All go Ok until i try to free the memory i allocate, here i got a segmentation fault, and from what i test, it come from list_del call.
+But i cannot see where i did wrong.
+Here is my code :
+struct drv_cdev{
+    int devno;
+};
+
+struct drv_dev_itf {
+    struct drv_cdev cdev; //DATA
+    struct list_head cdev_list;
+};
+
+struct drv_dev {
+    int number;
+    struct list_head list_master;
+    struct drv_dev_itf drv_dev_itf;
+};
+
+void add_node(struct drv_dev *dev, int num)
+{
+    struct drv_dev_itf *new_cdev;
+
+    new_cdev = kmalloc(sizeof(struct drv_dev_itf*), GFP_KERNEL);
+
+    new_cdev->cdev.devno = num;
+
+    INIT_LIST_HEAD(&new_cdev->cdev_list);
+    list_add(&new_cdev->cdev_list, &dev->list_master);
+}
+
+void destroy_list(struct drv_dev *dev)
+{
+    struct list_head *position;
+    struct drv_dev_itf *data_structure;
+
+    list_for_each (position, &dev->list_master) {
+    data_structure = list_entry(position, struct drv_dev_itf, cdev_list);
+    printk("Devno testing : %d\n", data_structure->cdev.devno);
+    //dev_node_release(driver_class, &data_structure->cdev);
+
+    list_del(position);
+    printk("List head deleted\n");
+    /*kfree(data_structure);
+    printk("List data_structure deleted\n");*/
+    }
+ }
+
+static int __init test_init(void)
+{
+    struct drv_dev *dev;
+
+    dev = kmalloc(sizeof(*dev), GFP_KERNEL);
+
+    INIT_LIST_HEAD(&dev->list_master);
+    add_node(dev, 1);
+    add_node(dev, 2);
+    destroy_list(dev);
+
+    kfree(dev);
+    return 0;
+
+}
+
+Thanks in advance for your answers, have a nice day.Hash a file with SHA on a memory-constrained system using mbedltsI want to calculate the SHA256 value of a file, which has a size of more than 1M. In order to get this hash value with the mbedtls library, I need to copy the whole file to the memory. But my memory size is only 100K. So I want to know if there is some method that calculates the file hash value in sections.In order to get this hash value with mbedtls library, I need to copy the whole file to the memory.
+
+This is not accurate. The mbedtls library supports incremental calculation of hash values.
+To calculate a SHA-256 hash with mbedtls, you would have to take the following steps (reference):
+
+Create an instance of the  mbedtls_sha256_context struct.
+Initialize the context with mbedtls_sha256_init and then mbedtls_sha256_starts_ret.
+Feed data into the hash function with mbedtls_sha256_update_ret.
+Calculcate the final hash sum with mbedtls_sha256_finish_ret.
+Free the context with mbedtls_sha256_free
+
+Note that this does not mean that the mbedtls_sha256_context struct holds the entire data until mbedtls_sha256_finish_ret is called. Instead, mbedtls_sha256_context only holds the intermediate result of the hash calculation. When feeding additional data into the hash function with mbedtls_sha256_update_ret, the state of the calculation is updated and the new intermediate result is stored in the  mbedtls_sha256_context.
+The total size of a mbedtls_sha256_context, as determined by sizeof( mbedtls_sha256_context), is 108 bytes on my system. We can also see this from the mbedtls source code (reference):
+typedef struct mbedtls_sha256_context
+{
+    uint32_t total[2];          /*!< The number of Bytes processed.  */
+    uint32_t state[8];          /*!< The intermediate digest state.  */
+    unsigned char buffer[64];   /*!< The data block being processed. */
+    int is224;                  /*!< Determines which function to use:
+                                     0: Use SHA-256, or 1: Use SHA-224. */
+}
+mbedtls_sha256_context;
+
+We can see that the struct holds a counter of size 2*32 bit = 8 byte that keeps track of the total number of bytes processed so far. 8*32 bit = 32 byte are used to track the intermediate result of the hash calculation. 64 byte are used to track the current data block being processed. As you can see, this is a fixed size buffer that does not grow with the amount of data that is being hashed. Finally an int is used to distinguish between SHA-224 and SHA-256. On my system sizeof(int) == 4. So in total, we get the 8+32+64+4 = 108 byte.
+Consider the following example program, which reads a file step by step into a buffer of size 4096 and feeds the buffer into the hash function in each step:
+#include <mbedtls/sha256.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#define BUFFER_SIZE 4096
+#define HASH_SIZE 32
+
+int main(void) {
+  int ret;
+
+  // Initialize hash
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts_ret(&ctx, /*is224=*/0);
+
+  // Open file
+  FILE *fp = fopen("large_file", "r");
+  if (fp == NULL) {
+    ret = EXIT_FAILURE;
+    goto exit;
+  }
+
+  // Read file in chunks of size BUFFER_SIZE
+  uint8_t buffer[BUFFER_SIZE];
+  size_t read;
+  while ((read = fread(buffer, 1, BUFFER_SIZE, fp)) > 0) {
+    mbedtls_sha256_update_ret(&ctx, buffer, read);
+  }
+
+  // Calculate final hash sum
+  uint8_t hash[HASH_SIZE];
+  mbedtls_sha256_finish_ret(&ctx, hash);
+
+  // Simple debug printing. Use MBEDTLS_SSL_DEBUG_BUF in a real program.
+  for (size_t i = 0; i < HASH_SIZE; i++) {
+    printf("%02x", hash[i]);
+  }
+  printf("\n");
+
+  // Cleanup
+  fclose(fp);
+  ret = EXIT_SUCCESS;
+
+exit:
+  mbedtls_sha256_free(&ctx);
+  return ret;
+}
+
+When running a program on a large sample file, the following behavior can be observed:
+$ dd if=/dev/random of=large_file bs=1024 count=1000000
+1000000+0 records in
+1000000+0 records out
+1024000000 bytes (1.0 GB, 977 MiB) copied, 5.78353 s, 177 MB/s
+$ sha256sum large_file 
+ae2d3b46eec018e006533da47a80e933a741a8b1320cfce7392a5472faae0216  large_file
+$ gcc -O3 -static test.c /usr/lib/libmbedcrypto.a
+$ ./a.out 
+ae2d3b46eec018e006533da47a80e933a741a8b1320cfce7392a5472faae0216
+
+We can see that the program calculates the correct SHA-256 hash. We can also inspect the memory used by the program:
+$ command time -v ./a.out
+...
+Maximum resident set size (kbytes): 824
+...
+
+We can see that the program consumed at most 824 KB of memory. Thus, we have calculated the hash of a 1 GB file with < 1MB of memory. This shows that we do not have to load the entire file into memory at once to calculate its hash with mbedtls.
+Keep in mind this measurement was done on a 64 bit desktop computer, not an embedded platform. Also, no further optimizations were performed besides -O3 and static linking (the latter approximately halved the memory usage of the program). I would expect the memory footprint to be even smaller on an embedded device with a smaller address size and a tool chain performing further optimizations.What will this recursive function yield?I have a recursive function g3, which I cannot understand what is the logic behind it, and what it actually does in general case.
+double g3(double n) {
+    if (n <= 1)
+    {
+        return 2;
+    }
+    double temp = g3(n / 2);
+    return temp * temp;
+}
+
+
+For 1 I got 2
+For 2 I got 4
+For 3 I got 16
+For 4 I got 16
+
+Can you help me understand what it does?You could start by analyzing the cases, going from stop clause up, and looking not only on the "number" but what it represents:
+g3(1) = 2 = 2^1
+g3(2) = g3(1)^2 = 2^2
+g3(4) = g3(2)^2 = (2^2)^2 = 2^4
+g3(8) = g3(4)^2 = (2^4)^2 = 2^8
+g3(16) = g3(8)^2 = (2^8)^2 = 2^16
+
+So, this is pretty clear (I hope) what happens when n = 2^k for some integer k.
+
+Can you prove it?
+Can you repeat the process to answer what happens when n != 2^k for some integer k ?CMake: What do CMake build types (DCMAKE_BUILD_TYPE) do?I am using CMake (within CLion IDE but that should not matter for this discussion). Up until now I have been using things like set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2") or set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2") to set compiler options for GCC. I assume CMake passes these on directly to the compiler. However, CMake is supposed to be platform independent and (at least in principle) able to build the same code using different compilers. Does this mean one should do it differently?
+I have been thinking about using build configurations. For example, I assume calling CMake with a build type flag:
+cmake .. -DCMAKE_BUILD_TYPE="Release"
+enables some optimization. I was unable, however, to find any documentation on what exactly this flag does (maybe because it depends on things like the compiler being used). I have two questions:
+
+What does -DCMAKE_BUILD_TYPE="Release" (and other release types) do (as exactly as one can tell not knowing the system where the build happens)?
+What is the best way to view the compiler and all options actually being used at build time (both using CMake in command line and within an IDE like CLion) ?
+
+Reading the makefile generated by CMake to find the flags does not seem like an option to me. I tried setting VERBOSE=yes for Make but somehow it didn't give me compiler flags, just some "entering end exiting directories".What does -DCMAKE_BUILD_TYPE="Release" (and other release types) do (as exactly as one can tell not knowing the system where the build happens)?
+
+
+It enables certain compiler options defined in the core CMake modules, which are specific to the target system. The documentation doesn't exactly explain what each of the build types mean, but the names are fairly commonly used. I understand Release to mean "disable debugging, enable highest optimisation".
+For example, the module Modules/Compiler/GNU.cmake contains following:
+
+string(APPEND CMAKE_${lang}_FLAGS_RELEASE_INIT " -O3 -DNDEBUG")
+
+
+
+
+
+What is the best way to view the compiler and all options actually being used at build time (both using CMake in command line and within an IDE like CLion) ?
+
+
+One convenient way is the compilation database. The format is specified here and it is enabled with the option CMAKE_EXPORT_COMPILE_COMMANDS. The file  compile_commands.json will then contain the exact commands used to compile each file.
+Figuring out the compiler may need additional steps if the alias /usr/bin/c++ is used, as is common.
+
+P.S. In many cases, it may be useful to enable debugging in release mode. While RELWITHDEBINFO does that, it doesn't enable highest optimisation (-O2 with GCC). As such, I personally find the default choices lacking.It makes you switch between "Debug" and "Release" configuration. What does it mean? There are default compile flags for each language and configuration
+CMAKE_<LANG>_FLAGS_<CONFIG>
+
+Changing from Debug to Release you are changing flags that CMake will use to set CMAKE_CXX_FLAGS.
+Setting directly cmake flags "set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")" is not a best practice in modern cmake (version >= 3).
+Why?
+The modern CMake is about targets and properties. If you set flags in your project, that flags can affect other projects. (And in a huge code base it happens) So it's very important to take care of the visibility of variables and flags. Consider using target_compile_features, target_compile_options and target_compile_definitions. It makes your code more readable and less error-proneRudimentary C Benchmark calculating Primes throws up crazy results and then craps out on Windows?I wrote a rudimentary C program (PCB for Prime C Benchmark) that benchmarks system speed by timing the process of finding prime numbers for all natural numbers between 0 and a user-entered number [User Enters a 'Load Value', which is multiplied to 10^5]
+On my Intel i5 5350U & LPDDR3 (MacBook Air 2017, Using Apple Clang 11) A workload of 1 (i.e primes upto 100,000) run 5 times, takes avg 25 seconds (plugged in, charging but goes to 50 seconds when @ 5% battery).
+On my Exynos 9611 & LPDDR4x (Samsung M21, using the 'Coding C' App/Compiler ) The same exact workload and run 5 times, takes an avg 8 seconds !!
+On Windows ( i5 3340M, Win7_SP2, VS2019 latest, Release version, x86), the program craps out absolutely ! When run 5 times for any 'Load Value', I get a time taken of 0.0000 !! What ?! There's absolutely something amiss here XD ....\
+Linux (Ubuntu 20.04, GCC, same hardware as Win, i3) takes 21.5 seconds. It appears to me that Linux and MacOS (so Apple Clang & GCC) are probably doing it right...
+The code:
+#include <stdio.h>
+#include <time.h>
+
+long count = 0;
+
+void bench(double x) {
+    register unsigned long n, i, q;
+    for (q = 0; q <= x; q++) {
+        for (i = 2; i <= q / 2; ++i) {
+            if (q % i == 0)
+                count++;
+        }
+    }  
+}
+
+int main() {
+    double x;
+    int y;
+    printf( "\nPCB v0.1\nOpen-source Tool for Benchmarking System Speed.\n\nRecommended Load Value 1 - 3\n");
+    printf("\nEnter Load Value : ");
+    scanf("%lf", &x);
+    printf("\nEnter Frequency for Repetition : ");
+    scanf("%d", &y);
+    x = x * 100000;
+    printf("\nPress Enter to Run ");
+    getchar();
+    getchar();
+    printf("\n(...Running...)\n");
+    int z;
+    for (z = 1; z <= y; z++) {
+        clock_t t; 
+        t = clock(); 
+        bench(x); 
+        t = clock() - t; 
+        double time_taken = ((double)t)/CLOCKS_PER_SEC; // in seconds 
+        printf("\nTime Taken #%d = %.4f seconds\n", z, time_taken);
+    }
+    printf("\nPress Enter to Exit ");
+    getchar();
+    return count;
+}Your prime number enumeration code is flawed:
+
+in the code initially posted, the for loop in the benchmark function had no side effect, so efficient compilers were able to optimise it and generate essentially no code. This explains the great disparity from one system to another.
+
+in the last update, your algorithm does not compute the count of prime numbers, it merely performs a huge number of divisions and counts the number of times you get a zero remainder. This is much more costly than an actual prime number test which is itself much less efficient than performing a Sieve of Eratostenes.
+
+
+For the purpose of measuring and comparing system performance, this method focuses exaggeratedly on the speed of the division opcode, and it shows a great variation between Linux, OS/X and Windows probably because of the size of type unsigned long which is 64-bit on Linux and OS/X vs 32-bit on Windows, making the modulo operation faster on Windows, even for the same set of numbers. Furthermore this type of benchmark uses a single core, so it does not measure total system performance by a long shot.
+Relative performance of the different systems should be measured using a more diversified set of operations, stressing the CPU, memory, storage and communications systems.
+Regarding the prime number enumeration, here is a modified version with a prime test:
+#include <limits.h>
+#include <stdio.h>
+#include <time.h>
+
+unsigned long long bench(double x) {
+    if (x < 0 || x >= ULLONG_MAX) {
+        printf("invalid benchmark range\n");
+        return 0;
+    }
+    unsigned long long n = (unsigned long long)x;
+    unsigned long long count = 0;
+    if (n >= 2)
+        count++;
+    for (unsigned long long p = 3; p <= n; p += 2) {
+        count++;
+        for (unsigned long long i = 3; i * i <= p; i += 2) {
+            if (p % i == 0) {
+                count--;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+int main() {
+    double x;
+    int y;
+    clock_t total = 0;
+    unsigned long long count;
+    double time_taken;
+
+    printf("\nPCB v0.1\nOpen-source Tool for Benchmarking System Speed.\n\nRecommended Load Value 1 - 3\n");
+    printf("\nEnter load value: ");
+    if (scanf("%lf", &x) != 1)
+        return 1;
+    printf("\nEnter repeat count: ");
+    if (scanf("%d", &y) != 1)
+        return 1;
+    x = x * 100000;
+    printf("\nPress Enter to Run ");
+    getchar();
+    getchar();
+    printf("\n(...Running...)\n");
+    for (int z = 0; z < y; z++) {
+        clock_t t;
+        t = clock();
+        count = bench(x);
+        t = clock() - t;
+        total += t;
+        time_taken = ((double)t) / CLOCKS_PER_SEC; // in seconds
+        printf("\n%llu primes, time taken #%d = %.4f seconds\n", count, z, time_taken);
+    }
+    time_taken = ((double)total) / CLOCKS_PER_SEC; // in seconds
+    printf("\nAverage time taken = %.4f seconds\n", time_taken / y);
+    printf("\nPress Enter to Exit ");
+    getchar();
+    return 0;
+}
+
+Output:
+
+PCB v0.1
+Open-source Tool for Benchmarking System Speed.
+Recommended Load Value 1 - 3
+
+Enter load value: 1
+Enter repeat count: 5
+Press Enter to Run
+(...Running...)
+
+9592 primes, time taken #0 = 0.0126 seconds
+9592 primes, time taken #1 = 0.0117 seconds
+9592 primes, time taken #2 = 0.0133 seconds
+9592 primes, time taken #3 = 0.0136 seconds
+9592 primes, time taken #4 = 0.0137 seconds
+
+Average time taken = 0.0130 seconds
+Press Enter to Exit
+
+This is almost 2000x faster than the initial code on my laptop.
+Running a load of 100 gives this output:
+
+PCB v0.1
+Open-source Tool for Benchmarking System Speed.
+Recommended Load Value 1 - 3
+
+Enter load value: 100
+Enter repeat count: 5
+Press Enter to Run
+(...Running...)
+
+664579 primes, time taken #0 = 7.4249 seconds
+664579 primes, time taken #1 = 7.3742 seconds
+664579 primes, time taken #2 = 7.4119 seconds
+664579 primes, time taken #3 = 7.3887 seconds
+664579 primes, time taken #4 = 7.6725 seconds
+
+Average time taken = 7.4544 seconds
+Press Enter to Exit
+
+Which is still much slower than a sieve:
+
+$ chqrlie > time prime -c 1..10000000
+664579
+
+real    0m0.009s
+user    0m0.006s
+sys     0m0.001s
+
+Here is a simplistic implementation using the Sieve approach that is not quite as fast as the optimised one used in my primes utility, but still achieves an average time of 0,0773 seconds for a load of 100, a 100x improvement over the prime test loop:
+unsigned long long bench(double x) {
+    /* simplistic Sieve of Eratostenes version */
+    if (x < 0 || x >= SIZE_MAX) {
+        printf("invalid benchmark range\n");
+        return 0;
+    }
+    size_t count = 0;
+    size_t n = (size_t)x + 1;   // array size
+    if (n > 1) {
+        unsigned char *a = calloc(n, 1);
+        if (a == NULL) {
+            printf("cannot allocate memory\n");
+            return 0;
+        }
+        // 0 and 1 are considered composite
+        a[0] = a[1] = 1;
+        // flag all multiples of 2 as composite
+        for (size_t i = 4; i < n; i += 2) {
+            a[i] = 1;
+        }
+        for (size_t p = 3; p * p < n; p += 2) {
+            // for all potential prime numbers
+            if (a[p] == 0) {
+                // if p is prime, flag all odd multiples of p as composite
+                for (size_t i = p * p; i < n; i += 2 * p) {
+                    a[i] = 1;
+                }
+            }
+        }
+        count = n;
+        // count the number of composite numbers
+        for (size_t i = 0; i < n; i++) {
+            count -= a[i];
+        }
+        free(a);
+    }
+    return count;
+}I would suggest changing the bench function to
+unsigned  long bench (double x) {
+    register unsigned long n;
+    register unsigned long i, q;
+    unsigned long count = 0;
+    for(q = 0;q <= x; q++){
+        int prime = 0;
+        for (i = 2; i <= q/2 ; ++i) {
+            if (q % i == 0) {
+                prime = 1;
+        break;
+            }
+        }
+        if (prime)
+            count++;
+    }
+    return count;
+}
+
+and the main function to:
+int main() {
+    ...
+    unsigned  long count = 0;
+    for(z=1;z <=y; z++)
+    {
+        clock_t t; 
+        t = clock(); 
+        unsigned  long c = bench(x); 
+        t = clock() - t; 
+        count += c;
+        double time_taken = ((double)t)/CLOCKS_PER_SEC; // in seconds 
+        printf("\nTime Taken #%d = %.4f seconds\n", z, time_taken);
+    }
+    printf("\nPress Enter to Exit ");
+    getchar();
+    return count > 0 ? 0 : 1; // ensures the use of the return values of bench
+}
+
+Also for accurate measurements you should make sure that all compilers compile with the maximum optimization. This is important because this might give the compilers the opportunity of using SIMD instructions to speed-up the bench operation.
+But be also aware that banchmarking a system/CPU by only one operation is not a good basis for a general comparisons between systems/CPUs. Your bench function for example only benchmarks how fast a CPU can divide large numbers of consecutive numbers.@chqrlie Was on the right trail...
+He was right about :
+
+The for loop in bench() being rendered useless by any compiler doing good optimisations (So basically 'Coding C' App, VS2019 but not Apple Clang & GCC)
+This tests only integers calculations, so perhaps not very accurate in all cases (which is an acceptable limitation but more on that later)
+The unsigned long was becoming 32-bit in VS and maybe in 'Coding C' as well, making them exponentially faster than in VS and 'Coding C'.
+His code has the right bench() function, I have used this, as well as his smart addition of an average time output.
+
+Further, what I might add :
+Apart from UI improvements like doing away with outputs for every loop, and just sticking to an average as well as some capitalisation here and there, I have :
+
+Made x=x10^5 into x=x10^7 to make Load Value less inflated (it takes avg 8 sec on my devices for Load Value 1 and you could still run decimal values).
+There might be other small changes, idk, the code is posted below.
+
+For anyone interested more , I'll be building PCB for some time with the source in this file, feel free to check it out or suggest changes/ critique code to apjo@tuta.iomulti thread receiver in single socketWith TCP, I'm designing some programs like next.
+clients' recv in many threads are waiting for one server's send message. However, there is a condition. recv is waiting for a specific send message.
+For example
+client
+thread 1: recv (key = 4)
+thread 2: recv (key = 6)
+thread 3: recv (key = 9)
+
+server
+send(value = A) for key 4 - send(value = B) for key 9 - send(value = C) for key 6
+
+then, thread 1 should get value A, thread 3 should get value B, thread 2 should get value C
+how can recv function distinguish server send messages? Is there any good idea or solution?
+Thanks.recv doesn't support content-filtered data receiving.
+You should distinguish those kind of messages on your own.How to get flags of opened fd in C?I want to get flags of fd was opened before in C.
+But I use fcntl(fd,F_GETFD,0) reference by fcntl man page, it always return 1 to me.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define XSZ(x) (int)(sizeof(x)*2)
+
+int main()
+{
+    int ret;
+    static const char str [] = "hello c program!\n";
+    int fd = open("test.txt", O_RDWR | O_APPEND | O_CREAT, 0777);
+    if(fd < 0)
+    {
+        perror("open");
+        return -1;
+    }
+    printf("fd = %d\n", fd);
+
+    ret = fcntl(fd, F_GETFD, 0);
+    printf("flag:%d\n",ret);
+    write(fd, str, strlen(str)-1);
+
+    return 0;
+}
+
+It always print:
+fd = 3
+flag:1
+
+What I thought the ret is the sum of O_RDWR | O_APPEND | O_CREATF_GETFD does not query the open flags, but just FD_CLOEXEC (see here).
+The line
+write(fd, "hello c program\n", strlen("hello c program!\n"));
+
+is wrong, as you query the length of a longer string than what you write, possibly causing a buffer overflow. A safer and more efficient way to do this would be:
+static const char str [] = "hello c program!\n";
+write(fd, str, sizeof(str)-1);
+
+The -1 is needed to avoid writing the terminating 0 byte.
+I don't know the purpose of
+#define XSZ(x) (int)(sizeof(x)*2)
+
+but casting size_t (the result type of sizeof()) to int is probably not a good idea.You should use F_GETFL instead of F_GETFD. Also remember to print in octal to compare.
+One important thing is not all flags are returned by fcntl. Only the access mode flags are remembered, like O_RDWR. However O_CREATE/O_TRUNC etc. are operating mode or open-time flags which are not remembered by the system and hence not returned.
+Here is your modified code
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define XSZ(x) (int)(sizeof(x)*2)
+
+int main()
+{
+    int ret;
+    int fd = open("test.txt", O_RDWR | O_APPEND | O_CREAT, 0777);
+    if(fd < 0)
+    {
+        perror("open");
+        return -1;
+    }
+    printf("fd = %d\n", fd);
+    ret = fcntl(fd, F_GETFL);
+    perror("fcntl");
+    printf("flag:%o\n",ret);
+    printf("flag:%o\n",O_RDWR|O_APPEND);
+    write(fd, "hello c program\n", strlen("hello c program!\n"));
+
+    return 0;
+}
+
+here is the output of the above code
+fd = 3
+fcntl: Success
+flag:102002
+flag:2002Can't use _m_prefetchw intrinsic with gcc/clang -march=native on older Intel CPU?I ran into this problem while compiling my project with Clang. I want to use the intrinsic function _m_prefetchw for that I included x86intrin.h, but for some reason my flow is not reaching the _m_prefetchw  definition.
+I checked the x86intrin.h header file of Clang and I dont have the __PRFCHW__ defined in order to include prfchwintrin.h although I do have PREFETCHW supported by my PC (I ran coreinfo to know this).
+does anyone know why __PRFCHW__  isn't defined although I have PREFETCHW supported?
+code example:
+#include <x86intrin.h>
+
+int main(){
+    int i = 10;
+    _m_prefetchw(&i);
+    return 0;
+}
+
+After running I get the error error LNK2019: unresolved external symbol _m_prefetchw referenced in function main
+I dug into my clang include header files and found this in x86intrin.h:
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__PRFCHW__)
+#include <prfchwintrin.h>
+#endif
+
+And _m_prefetchw is defined in the prfchwintrin.h file.
+My processor is Intel Xeon E5-2690, Clang version is 9.0.1.Manually use -mprfchw to tell the compiler to let you use _m_prefetchw even when compiling for a -march= where prefetchw is only a NOP.
+-march=native only includes -mprfchw if it will actually have an effect.  See What is the effect of second argument in _builtin_prefetch()? for more details on how compilers "think about" availability of prefetch instructions and CPUID.
+
+Your E5-2690 is a Sandybridge, older than Broadwell which introduced (on the Intel side) real support for PREFETCHW.
+Any non-ancient Intel CPUs can run prefetchw as a NOP (http://ref.x86asm.net/coder64.html#gen_note_NOP_0F0D), but only Broadwell and later actually advertizes the CPU feature in its CPUID, and only Broadwell and later actually do anything different from a NOP.  (AMD CPUs support it as an actual prefetch into Exclusive state ever since 3DNow! introduced it.)
+Running as a NOP instead of faulting is apparently necessary for installing 64-bit Windows, so a lot of discussion about "supporting" PREFETCHW revolves around not faulting, rather than its CPUID bit and actually doing anything.  For example, comments on Windows 10 64-bit requirements: Does my CPU support PrefetchW? discuss this difference in "support" (as in won't fault) vs. "support" as in actually does something.
+This forum thread mentions that P4 Nocona faults on prefetchw, and thus can't install Windows 8.1.  But Core2 and later do have "won't fault" support.How to store the current date in a struct?struct date{
+  int date;
+  int month;
+  int year
+};
+
+struct date current_date;
+
+I have this struct. Then I wanna store the current date in current_date. How can I do this using C language?
+Thank You so much!struct tm is a very standard structure for representing a broken down time representation with second resolution.
+You would:
+// get current time
+time_t t = time(NULL);
+struct tm *tm = localtime(&t);
+// assign to your structure
+current_date.date = tm->tm_mday;
+current_date.month = tm->tm_mon + 1;
+current_date.year = tm->tm_mon + 1900;Hello in this source: https://www.geeksforgeeks.org/getdate-and-setdate-function-in-c-with-examples/
+It says that getdate() function might be useful to you. It works like this:
+ struct date yourdate; 
+ getdate(&yourdate);  
+ current_date.day = yourdate.da_day
+
+And you should import   #include <dos.h>Function delete all nodes of a given value in a linked listFunktion (deleteall) takes a linked list and a value and delete all the nodes that hold that value, and then return the list after changing.
+ Pointer deleteall(Pointer l, int v)
+{
+  
+  Pointer temp;
+
+  while(l != NULL)
+  {
+    if(l->val == v) {
+      temp = l;
+      l = temp ->next;
+      free(temp);
+      
+    }
+    if(l == NULL) return l;
+    else l = l->next;
+  }
+  return l;
+}
+
+There is no error showing, the compiler finish and nothing is showing, I think the program goes in an endless loop.You do not need to return a pointer. You just to need to pass the head of the list as argument. Then create a temporary pointer which is initialized to where the head points to, and from that point you can work on
+When you find a node with the val that needs to be removed, MAKE SURE you connect the node previous and next of the node-to-be-free. Thus, the linked list, remains linked
+
+Hereby I put a sample solution, assuming that the list a) The head is not the same val as the one which needs to released and b) The last node points-to-NULL. We keep 2 temporary pointers, pointing to a)Node and b)Node->next. We always check the Node->next, and if it is one-to-be-released, we connect the list without it, and then we release it.
+void deleteall(Pointer l, int v)
+{
+  
+  Pointer temp, temp2;
+  temp2 = l;
+  temp = temp2->next;
+
+  while(temp != NULL)
+  {
+    if(temp->val == v) {
+      temp2->next = temp->next;
+      free(temp);
+      temp = temp2->next
+
+    } else
+    {
+      temp2 = temp;
+      temp = temp->next;
+    if(temp == NULL)
+      break;
+
+  return;} 
+
+This solution can be optimized, but it helps me personally, especially if I draw a diagram with pointers and nodes.Your function always returns a null-pointer.
+When the pointer to the head node is not passed by reference to the function as in your function definition then the function must return the pointer to the head node.
+It can look the following way
+Pointer deleteall(Pointer l, int v)
+{
+    while ( l && l->val == v )
+    {
+        Pointer temp = l;
+        l = l->next;
+        free( temp );
+    }
+
+    if ( l )
+    {
+        for ( Pointer current = l; current->next != NULL; )
+        {
+            if ( current->next->val == v )
+            {
+                Pointer temp = current->next;
+                current->next = current->next->next;
+                free( temp );
+            }
+            else
+            {
+                current = current->next;
+            }
+        }
+    }
+
+    return l;
+}
+
+If in main the pointer to the head node is also named like l then the function shall be called like
+l = deleteall( l, v );
+
+A more simple function definition can look when the pointer to the head node is passed by reference. For example
+void deleteall(Pointer *l, int v)
+{
+    while ( *l != NULL )
+    {
+        if ( ( *l )->val == v )
+        {
+            Pointer temp = *l;
+            *l = ( *l )->next;
+            free( temp );
+        }
+        else
+        {
+            l = &( *l )->next;
+        }
+    }
+}
+
+And in main the function can be called like
+deleteall( &l, v );This is quite a short implementation. It utilizes a prev pointer which points to previous pointer, pointing to a current element. This way we can easily check whether the current element exists (the list isn't exhausted) and advance the pointer along the list or hold on the current position if the current elements gets deleted an the next one replaces it.
+Pointer deleteall(Pointer l, int v)
+{
+    Pointer* prev = &l;
+
+    while (*prev != NULL)        // any items after the previous one?
+    {
+        Pointer curr = *prev;    // yes - so this is our current item
+        if (curr->val == v)
+        {
+            *prev = curr->next;  // link next item to prev
+            free(curr);
+        }
+        else
+            prev = & curr->next; // step forward on the list
+    }
+    return l;                    // a new head of the list
+}Print element from array if its not zero [closed]Closed. This question is not reproducible or was caused by typos. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed last year.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I want to print an array in c, but only if the specific element of this array is not zero.
+Lets assume, foo looks like this 12345678900000000000123 i want only print 123456789123.
+int foo[512];
+for (i= 0; i < 512; i++) {
+    if (foo[i] != '0') {  // This is not working
+        printf("%d ", foo[i]);
+    }
+}This is because your condition is bad.
+if (foo[i] != '0')
+
+whit this, you test whether the foo[i] is equal to a character 0 and not a number 0
+for fix this use this condition
+if (foo[i] != 0)Your code has two problems.
+
+You didn't initialized the array foo and foo has storage-class auto. The elements contain arbitrary garbage values. Using them in the loop invokes undefined behavior.
+
+'0' is not equal to 0. '\0' is equal to 0. But better use 0 as you only want 0 in its integer nature.
+
+
+Surrounding integers in apostrophes make them character constants which have specific value. Most likely these values belong to the ASCII character set. '0' for example has the ASCII value 48.
+So
+if (foo[i] != '0')
+
+is high-probably equivalent to
+if (foo[i] != 48)
+
+on your system.
+
+Side Note:
+int foo[512];
+for (i= 0; i < 512; i++)
+
+You use two times the hardcoded value 512. This technique is susceptible for failures. Better use f.e. a macro constant instead, which ensures that the values are equal:
+#define SIZE_ARR 512
+...
+
+int foo[SIZE_ARR];
+for (i= 0; i < SIZE_ARR; i++)Getting unexpected results in CS50 readability problemIn solving this readability problem, I have been getting some weird unexpected results(expected Grade 16+, getting Grade 10 etc etc), I am not being able to figure out where the bug is or how can I solve it, please help me figure out the bug. The codes are as follows:
+//includes
+#include <stdio.h>
+#include <cs50.h>
+#include <string.h>
+#include <math.h>
+
+//global variables
+int lc; //letter count
+int wc; //word count
+int sc; //sentence count
+bool awc; //already word counted
+double L; //average number of letters per 100 words
+double S; //average number of sentences per 100 words
+float index;
+
+//function declaration
+int count_letters(string x);
+int count_words(string x);
+int count_sentences(string x);
+
+//main
+int main(void)
+{
+    string text = get_string("text : ");
+    count_letters(text);
+    printf("%i letters\n", lc);
+    count_words(text);
+    printf("%i words\n", wc);
+    count_sentences(text);
+    printf("%i sentences\n", sc);
+
+    L = lc / wc * 100.0f;
+    S = sc / wc * 100.0f;
+
+    index = (0.0588 * L) - (0.296 * S) - 15.8;
+
+    if(index < 1)
+    {
+        printf("Before Grade 1\n");
+    }
+    else if(index >= 16)
+    {
+        printf("Grade 16+\n");
+    }
+    else
+    {
+        printf("Grade %i\n", (int) round(index));
+    }
+}
+
+
+//functions
+int count_letters(string x)
+{
+   lc = 0;
+   for(int i = 0, n = strlen(x); i < n; i++)
+   {
+      if((x[i] >= 'a' && x[i] <= 'z') || (x[i] >= 'A' && x[i] <= 'Z'))
+      {
+          lc += 1;
+      }
+   }
+   return lc;
+}
+
+int count_words(string x)
+{
+    wc = 0;
+    awc = false;
+    for(int i = 0, n = strlen(x); i < n; i++)
+    {
+        if((x[i] >= 'a' && x[i] <= 'z') || (x[i] >= 'A' && x[i] <= 'Z'))
+        {
+           if(awc == false)
+           {
+                wc += 1;
+                awc = true;
+           }
+        }
+        if(x[i] == ' ')
+        {
+            awc = false;
+        }
+    }
+    return wc;
+}
+
+int count_sentences(string x)
+{
+    sc = 0;
+    for(int i = 0, n = strlen(x); i < n; i++)
+    {
+        if(x[i] == '.' || x[i] == '!' || x[i] == '?')
+        {
+            sc += 1;
+        }
+    }
+    return sc;
+}
+
+The number of letters, words and sentences from these functions are correct so far so I think the problem lies in the main section, probably something to do with the variable type of "L" and "S" or the index formulae, please help me figure out where the problem is. Thank you
+here are some of the tests: sentences(expected results)
+1.One fish. Two fish. Red fish. Blue fish. (Before Grade 1)
+2.Harry Potter was a highly unusual boy in many ways. For one thing, he hated the summer holidays more than any other time of year. For another, he really wanted to do his homework, but was forced to do it in secret, in the dead of the night. And he also happened to be a wizard. (Grade 5)
+3.A large class of computational problems involve the determination of properties of graphs, digraphs, integers, arrays of integers, finite families of finite sets, boolean formulas and elements of other countable domains. (Grade 16+)L = lc / wc * 100.0f;
+
+wrong
+L = 100.0f * lc / wc;
+
+right.
+When both operands of / are integers, the result is integer as well, so 5/3 == 1.the OPs code contains several problems, as discussed in the comments to the question.
+The following proposed code:
+
+corrects those problems exposed in the comments
+cleanly compiles
+strongly suggest all those 'global' variables be moved to inside the appropriate functions and when needed else where be passed as parameters.
+
+and now, the proposed code:
+//includes
+#include <stdio.h>
+#include <cs50.h>
+#include <string.h>
+#include <math.h>
+
+//global variables
+int lc; //letter count
+int wc; //word count
+int sc; //sentence count
+bool awc; //already word counted
+double L; //average number of letters per 100 words
+double S; //average number of sentences per 100 words
+double i;
+
+//function declaration
+int count_letters(string x);
+int count_words(string x);
+int count_sentences(string x);
+
+//main
+int main(void)
+{
+    string text = get_string("text : ");
+    
+    count_letters(text);
+    printf("%i letters\n", lc);
+    
+    count_words(text);
+    printf("%i words\n", wc);
+    
+    count_sentences(text);
+    printf("%i sentences\n", sc);
+
+    L = lc / wc * 100.0;
+    S = sc / wc * 100.0;
+
+    i = (0.0588 * L) - (0.296 * S) - 15.8;
+
+    if(i < 1.0)
+    {
+        printf("Before Grade 1\n");
+    }
+    
+    else if(i >= 16.0)
+    {
+        printf("Grade 16+\n");
+    }
+    
+    else
+    {
+        printf("Grade %i\n", (int) round(i));
+    }
+}
+
+
+//functions
+int count_letters(string x)
+{
+   lc = 0;
+   for( size_t i = 0, n = strlen(x); i < n; i++)
+   {
+      if((x[i] >= 'a' && x[i] <= 'z') || (x[i] >= 'A' && x[i] <= 'Z'))
+      {
+          lc += 1;
+      }
+   }
+   return lc;
+}
+
+int count_words(string x)
+{
+    wc = 0;
+    awc = false;
+    for( size_t i = 0, n = strlen(x); i < n; i++)
+    {
+        if((x[i] >= 'a' && x[i] <= 'z') || (x[i] >= 'A' && x[i] <= 'Z'))
+        {
+           if(awc == false)
+           {
+                wc += 1;
+                awc = true;
+           }
+        }
+        if(x[i] == ' ')
+        {
+            awc = false;
+        }
+    }
+    return wc;
+}
+
+int count_sentences(string x)
+{
+    sc = 0;
+    for( size_t i = 0, n = strlen(x); i < n; i++ )
+    {
+        if(x[i] == '.' || x[i] == '!' || x[i] == '?')
+        {
+            sc += 1;
+        }
+    }
+    return sc;
+}Order of operations for bitwise operators (a & (a=1) strange behavior)?I was messing around with some c++ code after learning that you cannot increment booleans in the standard. I thought incrementing booleans would be useful because I like compacting functions if I can and
+unsigned char b = 0; //type doesn't really matter assuming no overflow
+while (...) {   
+    if (b++) //do something
+...}
+
+is sometimes useful to have, but it would be nice to not have to worry about integer overflow. Since booleans cannot take on any value besides 0 or 1, I thought that perhaps this would work. Of course, you could just have a boolean assigned to 1 after you do your operation but that takes an extra line of code.
+Anyway, I thought about how I might achieve this a different way and I came up with this.
+bool b = 0;
+while (...)
+if (b & (b=1)) ...
+
+This turned out to always evaluate to true, even on the first pass through. I thought - sure, its just doing the bitwise operator from right to left, except that when I swapped the order, it did the same thing.
+So my question is, how is this expression being evaluated so that it simplifies to always being true?
+As an aside, the way to do what I wanted is like this I guess:
+bool b = 0;
+while (...) if (!b && !(b=1)) //code executes every time except the first iteration
+
+There's a way to get it to only execute once, also.
+Or just do the actually readable and obvious solution.
+bool b = 0;
+while (...) {
+  if (b) {} else {b=1;}
+}This is what std::exchange is for:
+if (std::exchange(b, true)) {
+    // b was already true
+}
+
+As mentioned, sequencing rules mean that b & (b=1) is undefined behaviour in both C and C++. You can't modify a variable and read from it "without proper separation" (e.g., as separate statements).I don't see what meaning you can assign to a "bitwise increment" operator. If I am right, what you achieve is just setting the low-order bit, which is done by b|= 1 (following the C conventions, this could have been defined as a unary b||, but the || was assigned another purpose). But I don't feel that this is a useful bitwise operation, and it can increment only once. IMO the standard increment operator is more bitwise.
+If your goal was in fact to "increment" a boolean variable, i.e. set it to true (prefix or postfix), b= b || true is a way. (There is no "logical OR assignement" b||= true, and even less a "logical increment" b||||.)There is no "strange behavior" here. The & operator, in your case is a bitwise arithmetic operator. These operator are commutative, so both operand must be evaluated before computing the resulting value.
+As mentioned earlier, this is considered as undefined behavior, as the standard does not prevent computing + loading into a register the left operand, before doing the same to the second, or doing so in reverse order.
+If you are using C++14 or above, you could use std::exchange do achieve this, or re-implement it quite easily using the following :
+bool exchange_bool(bool &var, bool &&val) {
+    bool ret = var;
+    var = val;
+    return ret;
+}
+
+If you end up re-implementing it, consider using template instead of hard-coded types.
+As a proper answer to your question :
+
+So my question is, how is this expression being evaluated so that it simplifies to always being true?
+
+It does not simplify, if we strictly follow the standard, but I'd guess you are always using the same compiler, which end up producing the same output.
+Side point: You should not "compact" functions. Most of the time the price of this is less readability. This might be fine if you're the only dev working on a project, but on bigger project, or if you come back to your code later, that could be an issue. Last but not least, "compact" function are more error prone, because of their lack of readability.
+If you really want shorter function, you should consider using sub-function that will handle part of the function computation. This would enable you to write short function, to quickly fix or update behavior, without impacting clarity.C/++/ASM - Is it possible to read stack/heap size, and virtual memory address space from 0x0? [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed last year.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+As far as I know, a memory address like 0x0 of a program is the beginning of its code segment in its virtual address space. Is it possible to simply read what's in there from within a program? What about checking things like the size of the stack/heap? If not possible in C/++ programs, is it possible in assembly?
+Edit: I find memory allocation and management interesting. I'm asking out of curiosity. I like the idea of being able to see what's in every address of my program's virtual address space. When I mentioned stack/heap size, I meant those of the program, too.First, check /proc/<pid>/maps, assuming that you are running Linux. This will show you a list of allocated regions, and the permissions for each region (or VMA, technically). Check out this answer. The permissions are 'rwx' or a subset of these, representing readable, writable and executable. For regions which are readable, you can craft a pointer in C/C++ using a uintptr_t. Thereafter, you can read it.
+Basically, you can dump all of your readable regions using simple pointers.
+Btw, in virtually all C binaries, the region starting at address 0x0 will be unmapped, so that using a NULL pointer leads to a SEGFAULT.Multi threading using p thread Linux problemI have two functions, producer and consumer called by two p threads, but the while loop in the function is not running. Its a linux RT system. this is my code. im coding in eclipse.
+#include <stdio.h>
+#include"NIDAQmx.h"
+#include <pthread.h>
+#include "sts_queue/s_q.c"
+#include <stdlib.h>
+
+void *producer(void *ptr);// first function
+void *consumer(void *ptr);// second function
+
+TaskHandle taskHandle = 0;
+int ret = 0;
+int numChannels = 0;
+int numRead;
+float64 data[100];
+int iret1, iret2;
+pthread_t thread1, thread2;
+
+int main(void) {
+char *message1 = "Producer ended";
+char *message2 = "consumer ended";
+    init();
+ret = DAQmxCreateTask("task", &taskHandle);
+
+ret=DAQmxCreateAIVoltageChan(taskHandle, "PXI1Slot2/ai0", "",
+        DAQmx_Val_Cfg_Default, -5, 5, DAQmx_Val_Volts, NULL);
+
+ret=DAQmxCfgSampClkTiming(taskHandle, "", 1000, DAQmx_Val_Rising,DAQmx_Val_ContSamps, 100);
+
+ret=DAQmxGetTaskAttribute(taskHandle, DAQmx_Task_NumChans, &numChannels);
+
+
+ret=DAQmxStartTask(taskHandle);
+
+iret1 = pthread_create(&thread1, NULL, producer,(void*) message1);// calling two threads
+iret2 = pthread_create(&thread2, NULL, consumer,(void*) message2);// calling thread
+
+
+
+}
+
+void *producer(void *ptr) // enque function
+{
+char *message;
+int i = 0;
+int ret;
+message = (char *) ptr;
+while(i<1000)
+{
+//ret=DAQmxReadAnalogF64(taskHandle, 100, 10.0, DAQmx_Val_GroupByChannel, data,100 * numChannels, &numRead, NULL);
+printf("task handle=%d\n",taskHandle);
+printf("value of i=%d\n",i);
+printf("Number of sample read%d\n",numRead);
+printf("ret%d\n",ret);
+sleep(.1);
+i++;
+}
+ret=DAQmxStopTask(taskHandle);
+
+ret=DAQmxClearTask(taskHandle);
+
+printf("%s \n", message);
+pthread_join(thread1, NULL);
+return 0;
+}
+
+void *consumer(void *ptr) // deque function
+{
+char *message;
+int k = 0;
+int elements=0;
+message = (char *) ptr;
+while(k<1000)
+{
+
+    printf("value ofk=%d\n",k);
+    sleep(.1);
+    k++;
+}
+printf("%s \n", message);
+pthread_join(thread2, NULL);
+
+ }
+
+Should i use pthread_exit or pthread-join?
+how to use pthead_exit to exit first thread when while loop has exited?
+now my console prints just this
+task handle=-163491360
+start0
+value ofk=0
+task handle=-163491360
+value of i=0
+Number of sample read0
+ret0
+logout
+
+but actually value of i and k should go to 1000 and when it reaches 1000, while loop will stop and exit
+Sometimes im getting this error too
+pure virtual method called
+terminate called without an active exception
+Aborted
+logoutYou need to call pthread_join in the main function after creating thread1 and thread2. Otherwise, the main thread will terminate before thread1 and thread2 are completed.Syntax error while running the c program despite having no problem during compilingI am trying to run a basic program 'hello world'using this code
+#include<stdio.h>
+
+int main()
+{ 
+ printf("hello world\n");
+ return 0;
+}
+
+
+There is no error while compiling but when i try to run the code the error is:
+
+./hello.c: line 2: syntax error near unexpected token'('
+./hello.c: line 2: 'int main()'
+
+
+How can i solve this because ive tried everything and i dont think there is a syntax error.You don't run the .c file from the shell. After you compile the program, you run the executable that was created.
+So if you compiled it like:
+gcc -o hello hello.c
+
+Then you run it with
+./hello
+
+When you use ./hello.c, the shell tries to run your C source code as a shell script. That won't work because they're completely different languages.The program doesn't stop on scanf("%c", &ch) line, why? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+scanf() leaves the new line char in the buffer
+
+                                (5 answers)
+                            
+
+Closed last year.
+
+
+
+the program doesnt stop on scanf("%c", &ch) line. why does it happens sombody can please explain this to me
+#include<stdlib.h>
+#include<stdio.h>
+
+struct list {
+   char val;
+   struct list * next;
+};
+
+typedef struct list item;
+
+void main()
+{
+    char ch;
+    int num;
+
+    printf("Enter [1] if you want to use linked list or [2] for realloc\n");  
+    scanf("%d", &num);
+    if(num == 2)
+    {
+        scanf("%c", &ch); 
+        printf("%c", ch);
+    }
+}Let's say you input 2 when you're reading for num. The actual input stream will be 2\n (\n is the newline character). 2 goes into the num, and there remains \n, which goes into ch. To avoid this, add a whitespace in format specifier. 
+scanf(" %c", &ch); 
+
+This will ignore any whitespaces, newlines or tabs.The reason behind this is the newline \n character left behind by previous scanf, when pressing Enter key, for the next read of scanf. When the statement  
+scanf("%c", &ch);   
+
+executed then it reads that \n left behind by the previous scanf.
+To eat up this \n you can use a space before %c specifier. A space before the %c specifier is able to eat up any number of white-space characters.  
+scanf(" %c", &ch);   
+       ^ a spaceHow to send Sysrq programmatically over serial and is CONFIG_MAGIC_SYSRQ_SERIAL requiredI keep getting the SysRq HELP printout, basically seems i can send over serial the sysrq but it won't accept the next key within 5 seconds ie the command key (b) to reboot.
+I need to send the command programmatically over serial console connection to reboot system.
+I can reboot the system via echo b > /proc/sysrq-trigger and cat /proc/sys/kernel/sysrq is 1 (ie full sysrq is enabled)
+But I notice that kernel (2.6.32) image I'm booting with only has CONFIG_MAGIC_SYSRQ=y and there's no mention of CONFIG_MAGIC_SYSRQ_SERIAL. I'd like to know if that setting is required for 2.6.32 or if it was "assumed enabled" and its only required in new kernels.
+According to this, I don't need that in my kernel since it was only added to apparently optionally disable sysrq over serial to prevent unwanted triggers.
+Anyway I don't really care if PERL is used or PYTHON or C code with tcsendbreak or any programmatic method to send alt-sysrq-b over /dev/ttyUSB0 to reboot linux over serial. So far all i can do is send break sequence and see output of:
+SysRq : HELP : loglevel(0-9) reBoot Crash terminate-all-tasks(E) memory-full-oom
+l-active-cpus(L) show-memory-usage(M) nice-all-RT-tasks(N) powerOff show-registe
+-blocked-tasks(W)
+
+But the command key sent afterward never does anything. So I'm not sure what's wrong. FYI, the system I'm trying to send sysrq over serial to is an embedded linux system that boots via uboot with uimage and dtb file.
+Instead of using a break signal I would prefer a technique where the code actually sends the Alt-SysRq-b keyboard keys over the serial console connection.c programming..difference between counter controlled loop and logic controlled loopI was reading the control flow in C programming it said better to use "while loop" for logic controlled loops and "for loop" for counter controlled loop.
+My confusion is that I could not understand the difference between the counter controlled and the logic controlled loops?Write them down:
+logic controlled loop:
+while(condition == true) {
+    // do stuff
+}
+
+counter controlled loop:
+for(int counter=0; counter<10; counter++) {
+    // do stuff
+}
+
+Don't overthink this: for loop if you have something that has to be done for a exact number of times, while loop if you want something done while a condition is true."Counter controlled" means that you know exactly the number of times the loop has to be executed. The "exactly" is usually given by a variable in the code, or any other expression which evaluates to a number.
+Example: if you have the data for 10 people, you need to run the loop 10 times in order to make some processing for all people.
+
+"Logic controlled" means that you do not know for how many times you need to run the loop, but you know the condition when it must stop executing.
+Example: you want to make sure that the user provides a valid number for his age, instead of his name. So you will loop reading the age, until the user enters a number, instead of his name. It can be 1 execution (if the user is smart), or it can be many times, if the user is less than smart.A counter-controlled loop is when you're processing sequential numbers until a known limit. A common example is when you're stepping through all the elements of an array.
+for (int i = 0; i < array_length; i++) {
+    // do something with array[i]
+}
+
+A logic-controlled loop is when you're repeating until some more general condition changes. For instance, if you're reading a file, you want to read until you reach the end.
+while (fgets(buffer, sizeof buffer, file)) {
+    // do something with buffer
+}Logic control loop will be until the logic evaluates to be true. Like the while loop. Before we execute we don't know how many times the loop will execute.
+But coming counter control loops we are making the loop to execute fixed number of times. Like the for loop contains initiation testing and increment/decrement. Before we execute we know how many times the loop will execute.Preprocessor macro using caret ^ symbol at the start of an expressionLooking at this page: http://www.mikeash.com/pyblog/friday-qa-2010-12-31-c-macro-tips-and-tricks.html
+I found this snippet of code with ^{ ... }() syntax, what are the caret/brackets doing?
+#define MAX(x, y) (^{ \
+    int my_localx = (x); \
+    int my_localy = (y); \
+    return my_localx > my_localy ? (my_localx) : (my_localy); \
+}())
+
+It looks like its creating an anonymous function or something. What is this concept called? Where can I read about it?It's a C block. It's quite like an anonymous function (in use, not in structure). You can read more about them on Mike Ash's site and in Apple's documentation.It's a block. It's not standard C, but it is supported by Apple's LLVM compiler (around about Xcode 3.2 IIRC and later).  See here and here for more details.
+It's not just for Objective-C, but is part of the C and C++ compilers also.Official Apple Documentation on C BlocksIt is a C block, which will create an anonimous function.
+Note that it will create calls to the system API to handle those calls, don't know about mac, but for iOS, the runtime system must be 3.2 or later to support those calls.How to convert array of char into array of int?#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "stats.h"
+
+/* Size of the Data Set */
+#define SIZE (40)
+
+void print_array (unsigned char *p, int l) {
+    int i;  
+    for (i=0;i<l;i++) {
+        printf("%d\t",*p);
+        p++;    
+    }
+    
+}
+void print_array_int (int *p, int l) {
+    int i;  
+    for (i=0;i<l;i++) {
+        printf("%d\t",*p);
+        p++;    
+    }
+    
+}
+void typecasting(unsigned char test[SIZE], int array[SIZE]) {
+    int i=0;
+    unsigned char *token = strtok(test,",");
+    while (token) {
+        if(i<SIZE) {
+        array[i++] = atoi(token);
+        }
+    token = strtok(NULL,",");
+    }
+}
+void main() {
+  int array[SIZE] = {};
+  unsigned char test[SIZE] = {34,201,190,154,8,194,2,6,114,88,45,76,123,87,25,23,200,122,150,90,92,87,177,244,201,6,12,60,8,2,5,67,7,87,250,230,99,3,100,90};
+
+
+
+  /* Other Variable Declarations Go Here */
+  /* Statistics and Printing Functions Go Here */
+print_array(test, SIZE);
+typecasting(test,array);
+print_array_int(array,SIZE);
+}
+
+What I want in this code is to convert the array of char into an array of int.
+Previously I tried doing this by using pointers but didn't work and it showed stack smashing error. I want to convert this array of char into array of int to perform some mathematical operations.You are trying too hard. Here's how typecasting should look
+void typecasting(unsigned char test[SIZE], int array[SIZE]) {
+    for (int i = 0; i < SIZE; ++i)
+        array[i] = test[i];
+}
+
+Your code might be suitable if you were converting from a C string, i.e. if your original test array was
+char test[] = "34,201,190,154,8,194,2,6,114,88,45,76,123,87,25,23,...";
+
+So I guess you could say you're misunderstanding the nature of char (and unsigned char) in C++. They can represent character data as in char greeting[] = "hello"; or they can represent small integers as in char test[] = {1,2,3};.How to require argv[1] to be an int?I have to check that argv[1] is an int, otherwise, print "error".
+Any tips? What I have so far clearly is not correct.
+int main(int argc, char *argv[])
+{  
+    if (argc == 2 && (int) argv[1] > 0)
+    {
+        printf("Hello, %s\n", argv[1]);
+    }
+    else
+    {
+        printf("ERROR\n");
+        return 1;
+    }
+}The argv array is an array of strings, you cannot usefully cast that to an integer since it will give you the integer variant of the pointer.
+What you need to do is use a function like strtol to convert the string to a number. The following complete program contains a function that will do that for you:
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+int checkStrLong(char *num, long *pValue) {
+    // Attempt conversion, base ten, get address of first invalid character.
+
+    char *nextCh;
+    long val = strtol (num, &nextCh, 10);
+
+    // Reject empty string, ensure whole string was used.
+
+    if ((nextCh == num) || (*nextCh != '\0'))
+        return 0;
+
+    // Pass back value.
+
+    *pValue = val;
+    return 1;
+}
+
+int main(int argc, char *argv[]) {
+    int i;
+    long val;
+
+    int len, maxLen = 0;
+    for (i = 1; i < argc; i++) {
+        if ((len = strlen(argv[i])) > maxLen) {
+            maxLen = len;
+        }
+    }
+
+    for (i = 1; i < argc; i++) {
+        if (checkStrLong(argv[i], &val)) {
+            printf ("%-*s: %ld\n", maxLen, argv[i], val);
+        } else {
+            printf ("%-*s: <INVALID>\n", maxLen, argv[i]);
+        }
+    }
+    return 0;
+}
+
+The following transcript shows it in action for a few test values:
+pax> ./testprog 1 -7 42 314159 44.2 21guns hello one23 ""
+1     : 1
+-7    : -7
+42    : 42
+314159: 314159
+44.2  : <INVALID>
+21guns: <INVALID>
+hello : <INVALID>
+one23 : <INVALID>
+      : <INVALID>You should somehow convert string to int.
+You could check this answer where they recommed using strtol(), which supports error checking.
+From the man page:
+
+The implementation may also set errno to EINVAL in case no conversion was performed (no digits seen, and 0 returned).
+
+So basically you should check errno. If it equals to EINVAL, it means there were no numbers to convert.
+Additionally, if you want to print the error set at errno, you could use perror().
+
+It's a good practice to check the return value, know what each case may mean, and to print the error msg with perror() in case some error occurred. It's good for you, so you familiarize with the tools you're using, it makes the software more robust, and in case the user makes a mistake somewhere (or anything bad happens), the user will receive some feedback on it. Basically, it's a win-win-win situation ;)I like using sscanf for scenarios such as this...
+int main(int argc, char** argv)
+{
+    int num;
+
+    if ((argc != 2) || (sscanf(argv[1], "%d", &num) != 1)) {
+        printf("ERROR\n");
+        exit(1);
+    }
+    printf("%d\n", num);
+    return 0;
+}
+
+We check if there are 2 args then we use sscanf to convert argv at 1 to an int and check if it is a number.gcc throwing -Wint-to-pointer-cast despite the variable types are the same(from multiboot_uint64_t to multiboot_uint64_t*)Here's the code that triggers the warning(public_mbd is a struct multiboot_info):
+multiboot_uint64_t* fadr;
+fadr=(multiboot_uint64_t*)public_mbd->framebuffer_addr;
+
+the definition of framebuffer_addr and the struct is as follow:
+struct multiboot_info{
+...
+multiboot_uint64_t framebuffer_addr;
+...
+} 
+
+gcc said:
+warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+
+I'm getting really confused by that. Isn't fadr a multiboot_uint64_t*? They are the same size!It's not faddr that is the problem. It is the cast that is the problem.
+From the type it is clear that multiboot_uint64_t framebuffer_addr is 64 bit. And from the warning we can guess that pointers are 32 bit for your build. So the warning is telling you that you are casting a 64 bit int to a 32 bit pointer.This expression
+public_mbd->framebuffer_addr
+
+is of type
+multiboot_uint64_t
+
+You attempt to cast it to type (multiboot_uint64_t*), i.e. a pointer to a multiboot_uint64_t. It appears that on your architecture the types multiboot_uint64_t and pointers have different sizes, but that is not really important; direct casting from a type to a pointer to that type is almost never the right thing to do.
+Perhaps you wanted the variable fadr to point to public_mbd->framebuffer_addr. This you can achieve by
+fadr = &(public_mbd->framebuffer_addr);
+
+Alternatively, of course, you may avoid pointers altogether and write
+multiboot_uint64_t fadr;
+fadr = public_mbd->framebuffer_addr;
+
+Another possibility is that the structure is incorrectly specified. If you want the framebuffer_addr field itself to be a pointer, you would write
+struct multiboot_info{
+  ...
+  multiboot_uint64_t* framebuffer_addr;
+  ...
+}
