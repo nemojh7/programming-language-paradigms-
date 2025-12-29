@@ -1,0 +1,4289 @@
+Writing an LLVM pass to detect malloc function calls, number of bytes assigned and the variable name pointing to that memoryI have recently begun working with LLVM. I am trying to write a pass in LLVM that given the following code
+string = (char *)malloc(100);
+string = NULL;
+
+and the corresponding LLVM IR
+%call = call noalias i8* @malloc(i64 100) #3
+store i8* %call, i8** %string, align 8
+store i8* null, i8** %string, align 8
+
+detects instructions calling malloc, extracts number of bytes assigned (in this case 100), the address returned and the variable name that the address is assigned to. 
+std::map<std::string, std::tuple<size_t, int> > mem_addrs;  // stores pointer name, address and no. of bytes allocated
+Count() : ModulePass(ID) {}
+
+virtual bool runOnModule(Module &M) {
+  for (Function &F: M) { 
+    for (BasicBlock &B: F) {
+        for (Instruction &I: B) {
+            if(CallInst* call_inst = dyn_cast<CallInst>(&I)) {
+                Function* fn = call_inst->getCalledFunction();
+                StringRef fn_name = fn->getName();
+                errs() << fn_name << " : " << "\n";
+                for(auto args = fn->arg_begin(); args != fn->arg_end(); ++args) {
+                    ConstantInt* arg = dyn_cast<ConstantInt>(&(*args));
+                    if (arg != NULL)
+                            errs() << arg->getValue() << "\n";
+                }    
+            }
+        }
+     }  
+  }
+
+The output is 
+-VirtualBox:~/program_analysis$ opt -load $LLVMLIB/CSE231.so -analyze -count < $BENCHMARKS/leaktest/leaktest.bc > $OUTPUTLOGS/welcome.static.log
+ok
+allocaimw
+allocaleak
+allocamalloc : 0x2f5d9e0
+0  opt             0x0000000001315cf2 llvm::sys::PrintStackTrace(_IO_FILE*) + 34
+1  opt             0x0000000001315914
+2  libpthread.so.0 0x00007f0b53f12330
+3  opt             0x00000000012ec78f llvm::APInt::toString(llvm::SmallVectorImpl<char>&, unsigned int, bool, bool) const + 79
+4  opt             0x00000000012ed309 llvm::APInt::print(llvm::raw_ostream&, bool) const + 57
+5  CSE231.so       0x00007f0b52f16661
+6  opt             0x00000000012ad6cd llvm::legacy::PassManagerImpl::run(llvm::Module&) + 797
+7  opt             0x000000000058e190 main + 2752
+8  libc.so.6       0x00007f0b5313af45 __libc_start_main + 245
+9  opt             0x00000000005ab2ca
+Stack dump:
+0.  Program arguments: opt -load /home/hifza/program_analysis/llvm/build/Release+Asserts/lib/CSE231.so -analyze -count 
+1.  Running pass 'Instruction Counts Pass' on module '<stdin>'.
+Segmentation fault (core dumped)
+
+I am able to detect malloc instructions, but I am not able to find out the corresponding memory address and the number of bytes assigned. Can anyone guide me on how can I go about doing this? Thanks.You don't check the result of dyn_cast<ConstantInt>(&(*args)). If casted type is not a ConstantInt, it returns nullptr. And in the next line (arg->getValue()) you dereference it.I prefer detecting malloc calls,
+
+by first detecting store insts
+then checking whether LHS is a pointer
+then find out what is RHS (by using a stack approach to find actual value, since LLVM IR is a load-store architecture and hence we don't find the actual value in RHS, always)
+if I end up getting a call inst then
+check whether its malloc or not
+
+Once you have detected the malloc, you can simply fetch the bytes accessed by ip->getOperand(0)
+And the variable name pointing to the memory is nothing but the value returned by Store inst that you just started with - lhs in the code
+Am sharing the code snippet,which will also work for inter-procedural cases as well and also supports new operator .
+void findOperand(Value *itVal) {
+            std::stack<Value *> st;
+            st.push(itVal);
+            while(!st.empty()) {
+
+                auto ele = st.top();
+                st.pop();
+
+                if(isa<Instruction>(ele)) {
+                    Instruction *tip = (Instruction *)ele;
+                    if(isa<AllocaInst>(tip)) {
+                        errs()<<"others\n";
+                        //opdSet.insert(ele);
+                    }else if(isa<LoadInst>(tip)) {
+                        Value *ti = tip->getOperand(0);
+                        if(!isa<ConstantData>(ti))
+                            st.push(ti);
+                    } else if(isa<CallInst>(tip)) {
+                        Function *calledFp = cast<CallInst>(tip)->getCalledFunction();
+                        
+                        errs()<<calledFp->getName()<<"\n";
+                        if(calledFp->getName() == "malloc" || calledFp->getName() == "_Znwm") {
+                            errs()<<"Dynamic memory allocation!\n";
+                            errs()<<tip->getNumOperands()<<"\n";
+                            errs()<<tip->getOperand(0)<<"\n";
+                        } else {
+                            //fetch the last bb of the function
+                            auto bb = calledFp->end();
+                            if(bb != calledFp->begin()) {
+                                bb --;
+                                BasicBlock *bp = &(*bb);
+                                //fetch the terminator
+                                Instruction *term = bp->getTerminator();
+                                if(isa<ReturnInst>(term)) {
+                                    //find Operand
+                                    findOperand(term->getOperand(0));
+                                    errs()<<"done\n";
+                                }
+                                
+                            }
+                        }
+                    } else {
+                        for(int i=0, numOp = tip->getNumOperands(); i < numOp; i++) {
+                            Value *ti = tip->getOperand(i);                     
+                            if(!isa<ConstantData>(ti)) {
+                                st.push(ti);
+                            }
+                        }
+                    }
+                } else if (isa<GlobalVariable>(ele)) {
+                    errs()<<"others\n";
+                }
+            }
+            
+        }//findOperand
+
+        void visitStoreInst(StoreInst &ip) {
+            
+            Value *lhs = ip.getOperand(1);
+            Value *rhs = ip.getOperand(0);
+            if(lhs->getType()->getContainedType(0)->isPointerTy()) {
+                //figure out rhs
+                errs()<<"pointer assignment!"<<lhs->getName()<<"\n";
+                findOperand(rhs);
+            }
+        }Pass RR in BLE Protocol [Heart Rate] for Arduinocode:
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+
+
+byte flags = 0b00011110;
+byte bpm;
+byte rr;
+byte heart[8] = { 0b00011110, 60, 60, 60, 60 , 60, 60, 60};
+byte hrmPos[1] = {2};
+
+bool _BLEClientConnected = false;
+
+#define heartRateService BLEUUID((uint16_t)0x180D)
+BLECharacteristic heartRateMeasurementCharacteristics(BLEUUID((uint16_t)0x2A37), BLECharacteristic::PROPERTY_NOTIFY);
+BLECharacteristic sensorPositionCharacteristic(BLEUUID((uint16_t)0x2A38), BLECharacteristic::PROPERTY_READ);
+BLEDescriptor heartRateDescriptor(BLEUUID((uint16_t)0x2901));
+BLEDescriptor sensorPositionDescriptor(BLEUUID((uint16_t)0x2901));
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      _BLEClientConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      _BLEClientConnected = false;
+    }
+};
+
+void InitBLE() {
+  BLEDevice::init("Sensor X");
+  // Create the BLE Server
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create the BLE Service
+  BLEService *pHeart = pServer->createService(heartRateService);
+
+  pHeart->addCharacteristic(&heartRateMeasurementCharacteristics);
+  heartRateMeasurementCharacteristics.addDescriptor(&heartRateDescriptor);
+  heartRateMeasurementCharacteristics.addDescriptor(new BLE2902());
+
+  pHeart->addCharacteristic(&sensorPositionCharacteristic);
+  sensorPositionCharacteristic.addDescriptor(&sensorPositionDescriptor);
+
+  pServer->getAdvertising()->addServiceUUID(heartRateService);
+
+  pHeart->start();
+  // Start advertising
+  pServer->getAdvertising()->start();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Start");
+  InitBLE();
+  bpm = 1;
+  rr = 800;
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+
+  heart[1] = (byte)bpm;
+  int energyUsed = 3000;
+  heart[3] = energyUsed / 256;
+  heart[6] = (byte)bpm;
+  heart[2] = energyUsed - (heart[2] * 256);
+  Serial.println(bpm);
+  Serial.println(rr);
+
+  heartRateMeasurementCharacteristics.setValue(heart, 8);
+  heartRateMeasurementCharacteristics.notify();
+
+  sensorPositionCharacteristic.setValue(hrmPos, 1);
+  rr++;
+  bpm++;
+  delay(2000);
+}
+
+I have the above code - and I have been looking at this here but I can't figure out how do I pass the RR data over BLE. I set the flags according to the BLE spec shown here. But whenever I use an app to see the data "HRV Logger", it says that I am not transmitted RR data. I thought all I had to do was pass heart[6] data and that would show up as RR. I have dummy information being passed since I'm not connected to any sensors. Help would be helpful, determining how to pass the RR data across, thanks! (for future reference I am using the Sparkfun ESP32, but this shouldn't affect solving the issue since it has to do with protocols)Input Array in C and check for same valueshow I can input an array of integers and check if 2 pairs of values are equal and I also want to remove the duplicated to have only 1 same value in array?
+I want to print the final result of the array without the duplicated values in it.
+I have something like this in mind: 
+int a[SIZE], i;
+ printf("Enter %d numbers:\n", SIZE);
+ for (i = 0; i < SIZE; i++) {
+  scanf_s("%d", a[i]);
+ if(i>=1){
+  if(a[i-1]==a[i]){
+  a[i-1]==a[i];
+  printf("%d", a[i-1]);
+ }
+}
+
+this result gives me what I need but not completely. 
+can you assist with this?Code
+#include<stdio.h>
+int main() {
+   int arr[20], i, j, k, size;
+   printf("\nEnter array size:");
+   scanf("%d", &size);
+   printf("\nEnter Numbers:");
+   for (i = 0; i < size; i++)
+      scanf("%d", &arr[i]);
+   printf("\nList of Unique Numbers:");
+   for (i = 0; i < size; i++) {
+      for (j = i + 1; j < size;) {
+         if (arr[j] == arr[i]) {
+            for (k = j; k < size; k++) {
+               arr[k] = arr[k + 1];
+            }
+            size--;
+         } else
+            j++;
+      }
+   }
+   for (i = 0; i < size; i++) {
+      printf("%d ", arr[i]);
+   }
+}
+
+Explanation
+After inputting, we start from the first element.  Then within that for loop, we have another for loop to check elements after that element.  If there is a duplicate, I remove it.  Hope this helps!ipsec encryption support in linux: SADB_EALG_NONE vs SADB_EALG_NULLIn linux/pfkeyv2.h I can see following values:
+#define SADB_EALG_NONE          0
+...
+#define SADB_EALG_NULL          11
+
+Anyone can explain what is the difference between those values and how specifying those values in sadb_sa.sadb_sa_encrypt would affect ipsec encryption?SADB_EALG_NONE is used to indicate that no encryption applies for an SA, while SADB_EALG_NULL signifies the NULL encryption algorithm as specified in RFC 2410. As stated in RFC 2367, section 3.5 the former must only be used if no encryption can apply for an SA (e.g. for AH), the latter may be used for ESP SAs and can be negotiated via IKE.Can we safely say that the result of realloc does not alias with the original pointer?Say we have:
+char *a = malloc(sizeof(char*));    
+char *b = realloc(a,sizeof(char*));
+
+Can we safely say that b does not alias with a? The realloc reference page says that
+
+The original pointer ptr is invalidated and any access to it is
+  undefined behavior (even if reallocation was in-place).
+
+So can I mark b as not aliasing a as we cannot legally access a anymore? However this could result in a questionable optimization where the below branch would be eliminated:
+if (a == b)
+  something..
+
+Based on my understanding, the comparison of a == b itself would be UB so is this a technically correct optimization?After freeing, the value of a is indeterminate.  
+n1570-§6.2.3 (p2):
+
+[...] If an object is referred to outside of its lifetime, the behavior is undefined. The value of a pointer becomes indeterminate when the object it points to (or just past) reaches the end of its lifetime.
+
+If this indeterminate value becomes trap representation the comparison a == b will cause an undefined behavior. 
+Note that the lifetime of the object pointed to by pointer reaches its end when the pointer is passed to free. 
+Further readings:
+1. Why isn't a pointer null after calling free? 
+2. A dangling pointer is indeterminate.Based on my understanding, the comparison of a == b itself would be UB..
+
+Well, yes.
+Regarding the "why" part, as mentioned in haccks's answer, after a pointer has been free()d, the object it points to reaches the end of it's lifetime, thus making the pointer value indeterminate. So, any further use (read) of the pointer itself would be unspecified behavior at best and any attempted usage of the address pointed to by it, would invoke undefined behavior.
+So, technically, the optimization you expect, would be correct and would be a must to make the code exhibit a defined behavior, as the code is incorrect to start with. Do not expect the compiler to correct your code, it may not.
+That said, regarding
+
+Can we safely say that "b" does not alias with "a"?
+
+I'm not very clear on what ground you used the alias here, but just to be sure, the official wording, from C11, chapter §7.22.3.5,
+P2:
+
+The realloc function deallocates the old object pointed to by ptr and returns a
+  pointer to a new object that has the size specified by size. The contents of the new
+  object shall be the same as that of the old object prior to deallocation, up to the lesser of
+  the new and old sizes. [...]
+
+P3:
+
+[...]  If ptr is a null pointer, the realloc function behaves like the malloc function for the
+  specified size. Otherwise, if ptr does not match a pointer earlier returned by a memory
+  management function, or if the space has been deallocated by a call to the free or
+  realloc function, the behavior is undefined. If memory for the new object cannot be
+  allocated, the old object is not deallocated and its value is unchanged.
+
+and, P4:
+
+The realloc function returns a pointer to the new object (which may have the same
+  value as a pointer to the old object), or a null pointer if the new object could not be
+  allocated.I don't know what's going wrong with this code?I am writing a simple code which accepts a string from the user of any length and just displays it. But my code is not doing it correctly as it accepts the string but not prints it correctly.
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+main()
+{
+    int i,len;
+    static int n=5;
+    char a[20];
+    char **s;
+    s=malloc(5*sizeof(char));
+    char *p;
+    for(i=0;i<n;i++)
+    {
+        scanf("%s",a);
+        if(*a=='1')                   /*to exit from loop*/
+        {
+            break;
+        }
+        len=strlen(a);
+        p=malloc((len+1)*sizeof(char));
+        strcpy(p,a);
+        s[i]=p;
+        if(i==n-1)
+        {
+            s=realloc(s,(5+i*5)*sizeof(char));
+            n=5+i;
+        }
+    }
+    for(i=0;i<n-1;i++)
+    {
+        printf("%s ",s[i]);
+    }
+    free(p);
+    p=NULL;
+    return 0;
+}There are multiple issues, but at first look, the most prominent one is,
+  s=malloc(5*sizeof(char));
+
+is wrong. s is of type char **, so you'd need to allocate memory worth of char * there. In other words, you expect s to point to a char * element, so, you need to allocate memory accordingly.
+To avoid these sort of mistakes, never rely on hardcoded data types, rather, use the form
+ s = malloc( 5 * sizeof *s);  // same as s=malloc( 5 * sizeof (*s))
+
+where, the size oid essentially determined from the type of the variable. Two advantages
+
+You avoid mistakes like above.
+The code becomes more resilient, you don;t need to change the malloc() statement in case you choose to change the data type 
+
+That said, scanf("%s",a); is also potentially dangerous and cause buffer overflow by longer-than-expected-input. You should always limit the input scanning length, using the maximum field width, like
+scanf("%19s",a);  // a is array of dimension 20, one for terminating null
+
+
+That said, to advice about the logic, when you don't know or don't dictate the length of the input string beforehand, you cannot use a string type to scan the input. The basic way of getting this done would be
+
+Allocate a moderate length buffer, dynamically, using allocator functions like malloc().
+Keep reading the input stream one by one, fgetc() or alike.
+If the read is complete (for example, return of EOF), you've read the complete input.
+If the allocated memory has run out, re-allocate the original buffer and continue to step 3.
+
+and, don't forget to free() the memory.
+Otherwise, you may use fgets() to read chunks of memory and keep realloacting as mentioned above.WDK: "named mounts" instead of drive letters - WinIFSFile-systems on Windows. 
+So, I have written my own FSD, and it gets assigned a drive letter, and if I reply appropriately to IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME I can even change/set which drive letter to assign, for example by returning a string like "\DosDevices\G:".
+But I would also be able to use "named mounts", like that of "C:\directory". I can not return that above (return buffer size is only enough to hold drive letter name). 
+So I have been trying for a while to get named mounts to work, but there seems to be many parts to it.  For example, using IOCTL_MOUNTMGR_CREATE_POINT from kernel, IoCreateSymbolicLink() which some examples seem to use. Or is it better to use FSCTL_SET_REPARSE_POINT from userland with SetVolumeMountPoint() ?
+
+So, I think I should be able to managed to get a "drive" mounted as "C:\Some\Directory" without having a drive letter.
+Should I seek a kernel-space, or userland, approach to setting a "named mount" (or does it require both?)
+If my FSD is done right, should it show in "Disk Manager" or will only real physical disks show there. Is that desirable?
+Is a reparse-point connected to mounts at all?
+
+I do not think the MS Samples "fastfat" allows for named mounts, or I would follow its example.Optimize convolution operation for ARM using NEONCan someone guide me to optimize the Convolution of a filter on an image using the benefits of ARM Neon intrinsics in C? I have already implemented this in traditional C, however, I need to time-optimize the code for faster image processing on ARM with NEON support. The resources available on the internet are very limited for the algorithm implementation on ARM using NEON using C. 
+I need to convolve a 3x3 filter with the image. The main problem I guess is the loop constraints to access the 3x3 matrix of the image. NEON intrinsics help us to load 8 bytes of data at a go, but how to take benefit of this, in order to access the 3x3 matrix?
+
+For now, I'm accessing the 3x3 image matrix like this,
+for(i=1;i<width;i++) // i = rows                                                                                                       
+        {                                                                                                             
+                if(i!=1)                                                                                                                       
+                        fseek(fp, 1078+(width*(i-1)), SEEK_SET);                                                                               
+                for(j=1;j<height-1;j++) // j = columns                                                                                         
+                {                                                                                                                              
+                        if(j!=1)                                                                                                               
+                                fseek(fp, 1077 + (i*width) + j , SEEK_SET);                                                                    
+                        for(k=0;k<9;k+=3)                                                                                                      
+                        {                                                                                                                      
+                                data[k] = getc(fp);                                                                                            
+                                data[k+1] = getc(fp);                                                                                          
+                                data[k+2] = getc(fp);                                                                                          
+                                //fread(buf, sizeof(char), width - 3, fp);                                                                     
+                                fseek(fp, width - 3, SEEK_CUR);                                                                                
+                        }                                                                                                                      
+                        pixel = vld1_u8(&data);                                                                                                
+                        pixel_last = data[8];                                                                                     
+                        result = vmul_u8(kernel,pixel);                                                                                        
+
+                        for(k=0;k<8;k++)                                                                                                       
+                                sum += result[k];                                                                                              
+
+                        sum += pixel_last * kernel_last;                                                                                       
+                        sum = sum/9;                                                                                                           
+                        sum = sum > 255 ? 255 : sum;                                                                                           
+                        imageData[i*width + j]= sum;                                                                                           
+
+                }                                                                                                                              
+
+        }The answer from @PaulR in the comments above did the trick. Reading the image data at once, in a buffer, and then applying the filter algorithm reduced the timings to nearly 10 times. 
+Here is what I did,
+fread(imageData, sizeof(unsigned char), imgDataSize, fp);                                    
+
+for(i=0;i<width;i++) // i = rows                                                                       
+        {                                                                           
+                start_1= clock();                                      
+                for(j=0;j<height;j++) // j = columns                                    
+                {                                                                                    
+                        for(k=0;k<9;k+=3)                                                                      
+                        {                                                           
+                                data[k] = imageData[i*width + j];
+                                data[k+1] = imageData[(i+1)*width + (j+1)];             
+                                data[k+2] = imageData[(i+2)*width + (j+2)];                          
+                        }                                                                                      
+                        pixel = vld1_u8(&data);                                     
+                        pixel_last = data[8];                                       
+                        result = vmul_u8(kernel,pixel);                                                        
+
+                        for(k=0;k<8;k++)                         
+                                sum += result[k];                                       
+
+                        sum += pixel_last * kernel_last;                                                       
+                        sum = sum/9;                                                
+                        sum = sum > 255 ? 255 : sum;             
+                        newimageData[i*width + j]= sum;                                 
+
+                }                                                                                              
+        }breaking float value in char and transmit it on tcp and read using java program [closed]Closed. This question does not meet Stack Overflow guidelines. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I using this c code to convert and transmit float data form micro controller using TCP/IP. Here I break float in to four char value and this work well. But I need its equivalent java code to again get float value on server end. 
+I am new for java. so please help.  
+/********************************************************************************/
+unsigned char outbox[5];
+
+void breakDown(void)
+{
+  int index=0;
+  float member=-600.231;    
+
+  unsigned long d = *(unsigned long *)&member;
+  outbox[0] = d & 0x00FF;
+  outbox[1] = (d & 0xFF00) >> 8;
+  outbox[2] = (d & 0xFF0000) >> 16;
+  outbox[3] = (d & 0xFF000000) >> 24;
+
+  }
+
+
+  void buildUp(void) 
+  {
+   unsigned long d;
+   unsigned index;
+
+   d =  ((long)outbox[3] << 24);
+   d|=  ((long)outbox[2] << 16);
+   d|=  ((long)outbox[1] << 8);
+   d|=  ((long)outbox[0]);
+
+   float member = *(float *)&d;
+   printf("Float output=%f\n\n",member);
+
+   }java.io.DataInputStream.readFloat() which invokes java.lang.Float.intBitsToFloat(int bits), you may try it. (read the api doc first)Why are you trying to split the variable into different segments? Just send it as a string, then use JAVA function to convert it to the float variable.
+String numberAsString = "153.25";
+float number = Float.parseFloat(numberAsString);GHashTable is not defined when attempting to retrieve it from GArrayThe compiler is saying that GHashTable is not defined but clearly it is defined if i am using it above the code that retrieves the GHashTables from the array. What is going on? I am confused.
+gcc -Wall -o tht `pkg-config --cflags glib-2.0` TestGLib.c `pkg-config --libs glib-2.0`
+In file included from /usr/include/glib-2.0/glib.h:31:0,
+                 from TestGLib.c:5:
+TestGLib.c: In function ‘main’:
+/usr/include/glib-2.0/glib/garray.h:67:62: error: invalid use of undefined type ‘struct _GHashTable’
+ #define g_array_index(a,t,i)      (((t*) (void *) (a)->data) [(i)])
+                                                              ^
+TestGLib.c:24:34: note: in expansion of macro ‘g_array_index’
+         GHashTable *current_ht = g_array_index(g_arr_hts, GHashTable, i);
+                                  ^~~~~~~~~~~~~
+/usr/include/glib-2.0/glib/garray.h:67:62: error: dereferencing pointer to incomplete type ‘GHashTable {aka struct _GHashTable}’
+ #define g_array_index(a,t,i)      (((t*) (void *) (a)->data) [(i)])
+                                                              ^
+TestGLib.c:24:34: note: in expansion of macro ‘g_array_index’
+         GHashTable *current_ht = g_array_index(g_arr_hts, GHashTable, i);
+                                  ^~~~~~~~~~~~~
+TestGLib.c:26:22: warning: cast from pointer to integer of different size [-Wpointer-to-int-cast]
+         printf("%s", (gchar) g_hash_table_lookup(current_ht, "key"));
+                      ^
+TestGLib.c:26:18: warning: format ‘%s’ expects argument of type ‘char *’, but argument 2 has type ‘int’ [-Wformat=]
+         printf("%s", (gchar) g_hash_table_lookup(current_ht, "key"));
+                 ~^   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                 %d
+
+The code i am attempting to compile is very simple.
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <glib.h>
+
+int main() {
+
+    GHashTable *g_ht_first = g_hash_table_new_full(g_str_hash, g_str_equal, free, free);
+    g_hash_table_insert(g_ht_first, g_strdup("key"), g_strdup("val"));
+
+    GHashTable *g_ht_second = g_hash_table_new_full(g_str_hash, g_str_equal, free, free);
+    g_hash_table_insert(g_ht_second, g_strdup("key"), g_strdup("val"));
+
+    GArray *g_arr_hts = g_array_new(FALSE, FALSE, 2);
+
+    g_array_append_val(g_arr_hts, g_ht_first);
+    g_array_append_val(g_arr_hts, g_ht_second);
+
+    int i;
+
+    for (i = 0; i < g_arr_hts->len; i++) {
+
+        GHashTable *current_ht = g_array_index(g_arr_hts, GHashTable, i);
+
+        printf("%s", (gchar) g_hash_table_lookup(current_ht, "key"));
+
+    }
+
+    return 0;
+}
+
+ThanksOk, after going back to the docs, i noticed that Glib also has Pointer Array GPtrArray so i updated my code to that and it worked. Didn't know that the regular GArray does not support pointers. :)
+https://developer.gnome.org/glib/stable/glib-Pointer-Arrays.htmlHow to run external programs in C and make it invisible by ps command?I create a C program to run an external command on a CentOS system. I use system(cmd); to run the external command but this command can be seen by ps command. 
+Below is an example of my program runit:
+./runit "mongo mongodb://username:password@localhost:27017/admin"
+
+it takes a string as command line argument which is used to launch a mongo shell process. In the source code of runit, it runs the mongo shell as below:
+int main(int argc, char **argv){
+    char *cmd = argv[1];
+    printf("%s\n", cmd);
+    if (argc > 1) {
+        char *arg_end;    
+        arg_end = argv[argc-1] + strlen (argv[argc-1]);
+        *arg_end = ' ';
+        }
+    system(cmd);
+    exit(100);
+}
+
+when I use ps -ef | grep runit command, it doesn't show the command line parameters. But it does show when I run ps -ef |grep mongo. Is there a way for me to hide the command line parameter inside system() method?invalid conversion from 'const char*' to 'char' [-fpermissive]In my code below, this line:
+b[6] = Hello
+
+Is throwing this error:
+invalid conversion from 'const char*' to 'char' [-fpermissive]
+
+Question
+Why am I receiving this error? Actually, all I want is to declare "b[6]" separately. Not like char b[6] = "Hello" like If I take a int variable say "int x" then i can easily declare it's value separately say "x = 2" but here, for string variable why I am unable to do that.
+int a;
+char b[6];
+
+scanf("%d", &a);
+if( a == 1)
+    b[6] = "Hello";
+else
+    printf("Wrong");In C, Strings are treated as char arrays, and the name of an array is treated as a pointer to the beginning of the array.
+char b[6];
+
+Based on this declaration, b is a pointer to the beginning of an array of 6 chars.
+b[6] = "Hello";
+
+This line attempts to set the 6th element of b to "Hello", but there's two problems with doing that:
+
+b[6] does not actually exist. b is 6 elements long, beginning with index 0, so the highest index you can use is 5.
+b is an array, so b[6] refers to a specific char whereas you attempt to set it to a String, i.e. a pointer to char, hence your error message.
+
+If you're trying to make b hold the value of "Hello", there are a number of ways to do that. Theoretically, your method of b = "Hello"; would work, but would probably be considered bad practice by most. The most basic is to set the values of the chars in the array to the letters in "Hello" one-by-one, followed by a NULL byte. Using the <string.h> standard library, you could (and probably should) do it using strcpy.
+strcpy(b, "Hello");benter code here[6] = "Hello";
+Here you are assigning a char const * to a single char (and in addition that char is out of range).
+If you want be to hold "H" do:
+strcpy(b, "H");regarding: `
+b[6] = "Hello";`  
+
+when an array is referenced; the result is the address of the first byte of the array.  
+So the statement is trying to assign the address of "Hello" to the char b[].   
+Are you trying to fill the array b[]?  if so, then the proper method is: 
+strcpy( b, "Hello" );8 Queens diagonal checkingAt the moment I am creating a program where the user is asked to place the queens for the 8 Queens Problem. Right now I have nearly created the program, but I'm stuck on how to make the program check diagonally.
+This is the (unfinished)code:
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+int check_r_c(int**chess,int*p,int N,int M)
+{
+    int times=0;
+    for(int i=0; i<N; i++)
+    {
+        times=0;
+        for(int j=0; j<M; j++)
+        {
+            if(chess[i][j] == 1)
+                times++;
+
+        }
+        if( times != 1)
+        {
+            *p=1;
+            return 1;
+        }
+    }
+    for(int j=0; j<M; j++)
+    {
+        times=0;
+        for(int i=0; i<N; i++)
+        {
+            if(chess[i][j] == 1)
+                times++;
+        }
+        if( times != 1)
+        {
+            *p=1;
+            return 1;
+        }
+    }
+    *p=0;
+    return 0;
+}
+int main()
+{
+    int N,M;
+    printf("Give the number of rows: \n");
+    scanf("%d",&N);
+    printf("Give the number of columns: \n");
+    scanf("%d",&M);
+    int**chess = malloc(N*sizeof(int));
+    int i,j,ch;
+    int*ptr;
+    ptr=&ch;
+    if(chess==NULL)
+    {
+        printf("\nMemory cannot be allocated\n");
+        return 1;
+    }
+    for(i=0; i<N; i++)
+    {
+        if((chess[i] = malloc(M*sizeof(int)))==NULL)
+        {
+            printf("\nMemory cannot be allocated\n");
+            return 1;
+        }
+    }
+    for(int i=0; i<N; i++)
+        for(int j=0; j<M; j++)
+            chess[i][j]= 0;
+    for(int k=0; k<N; k++)
+    {
+        printf("Give the position of the %d queen\n",k+1);
+        scanf("%d",&i);
+        scanf("%d",&j);
+        if(chess[i][j] == 1)
+        {
+            printf("You cant put 2 queens in the same place!!!\n" );
+            return 0;
+        }
+        chess[i][j] = 1;
+    }
+    check_r_c(chess,ptr,N,M);
+    if(ch == 0)
+        printf("Solution is correct!");
+    else
+        printf("Solution is incorrect!");
+    for(int i=0; i<N; i++)
+        free(chess[i]);
+    free(chess);
+}The logic for checking diagonal for a queen placed is (p,q) is to check for all the places located at (p+i,q+i) for all i, where both p+i and q+i are within the board. For negative side, use (p-i,q-i).hashedmap and pointer to structs: CXX0030: Error: expression cannot be evaluatedIm trying to create a simple hashmap in C. The vs doesnt know any errors at compilation time. But during execution, the pointer to the structure is becoming a bad pointer. 
+hashedKey CXX0030: Error: expression cannot be evaluated    
+
+Here is the code for that, can anyone tell me why the code is crashing.
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<iostream>
+using namespace std;
+
+
+//#include"Header.h"
+struct hashItem{
+char* hashedKey;
+char* hashedValue;
+hashItem* next;
+};
+#define SIZE 20
+
+unsigned long hashf(char *str)
+{
+    unsigned long hash = 5381;
+    int c;
+
+    while (c = *str++)
+    hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+
+    return hash%SIZE;
+}
+
+struct hashItem * createNewItem(char *key, char *value){
+struct hashItem *newKeyValue = (struct hashItem *)calloc(1, sizeof(struct 
+hashItem));
+newKeyValue->hashedKey = (char*)malloc(sizeof(char) * 100);
+newKeyValue->hashedValue = (char*)malloc(sizeof(char) * 100);
+strcpy(newKeyValue->hashedKey, key);
+
+newKeyValue->hashedValue = value;
+newKeyValue->next = NULL;
+return newKeyValue;
+}
+
+void put(struct hashItem** hashTable, char *key, char *value)
+{
+    if (value == NULL)
+    return;
+
+struct  hashItem *newKeyValue = createNewItem(key, value);
+
+int index = hashf(key);
+
+if (hashTable[index] == NULL){
+    hashTable[index] = newKeyValue;
+}
+else
+{
+    int inserted = 0;
+    struct hashItem *p = hashTable[index];
+    struct hashItem *q = NULL;
+    while (p != NULL){
+        int e = strcmp(p->hashedKey, newKeyValue->hashedKey);
+        if (e == 0){
+            if (q != NULL)
+                q->next = newKeyValue;
+            p->hashedValue = newKeyValue->hashedValue;
+            inserted = 1;
+            break;
+        }
+        q = p;
+        p = p->next;
+    }
+    if (!inserted)
+        q->next = newKeyValue;
+    }
+}
+
+struct hashItem * get(struct hashItem** hashTable, char *key){
+    if (hashTable == NULL)
+        return NULL;
+    int index = hashf(key);
+    if (hashTable[index] != NULL)
+    {
+    if (!strcmp(hashTable[index]->hashedKey, key)){
+        return hashTable[index];
+    }
+    else{
+        struct hashItem *p = hashTable[index];
+        while (p != NULL){
+            if (p->hashedKey == key)
+                return p;
+            p = p->next;
+        }
+        return NULL;
+    }
+    }
+     else{
+    return NULL;
+}
+}
+
+
+int main(){
+
+
+    hashItem** hashtable = (hashItem**)malloc(sizeof(hashItem*)*20);
+    for (int i = 0; i < 20; i++){
+        hashtable[i] = (hashItem*)malloc(sizeof(hashItem));
+        hashtable[i]->hashedKey = NULL;
+        hashtable[i]->hashedValue = NULL;
+        hashtable[i]->next = NULL;
+    }
+
+    put(hashtable, "select", "marks");
+
+    hashItem* temp = (hashItem*)get(hashtable,"select");
+    printf("%s", temp->hashedKey);
+    int k;
+    scanf("%d", &k);
+    return 0;
+} 
+
+During the debugging it seems the code is crashing at the exact line of:
+struct hashItem *p = hashTable[index];
+
+Please tell me why the code is crashing.Basically you are thinking wrong about initializing the hash buckets.
+In the main() function basically you only need to allocate memory for the buckets of the hash table, so you only need this:
+ hashItem** hashtable = (hashItem**)calloc(20, sizeof(hashItem**));
+
+Pay attention that I am using calloc instead of malloc to make sure that it is going to initialize to NULL these memory region. So, basically here we created 20 buckets to be managed by the hash table.
+Again, you should not do that for (int i = 0; i < 20; i++), that is wrong. You will manage the buckets at insertion time, so, when you are inserting something that is not in the hash table, then you allocate memory to that entry.
+You are using a mixture of C and C++ here, please make sure to state that when you submit your question.
+I will paste here the changes I made, because you were using a lot of casting to get the right pointer type, but it is not necessary if you usce the right structure types.
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+
+typedef struct _hashItem{
+    char* hashedKey;
+    char* hashedValue;
+    struct _hashItem* next;
+} hashItem;
+#define SIZE 20
+
+unsigned long hashf(char *str)
+{
+    unsigned long hash = 5381;
+    int c;
+
+    while (c = *str++)
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+
+    return (hash % SIZE);
+}
+
+hashItem * createNewItem(char *key, char *value){
+    hashItem *newKeyValue = (hashItem *)calloc(1, sizeof(
+                hashItem));
+    newKeyValue->hashedKey = (char*)malloc(sizeof(char) * 100);
+    newKeyValue->hashedValue = (char*)malloc(sizeof(char) * 100);
+    strcpy(newKeyValue->hashedKey, key);
+
+    newKeyValue->hashedValue = value;
+    newKeyValue->next = NULL;
+    return newKeyValue;
+}
+
+void put(hashItem** hashTable, char *key, char *value)
+{
+    if (value == NULL)
+        return;
+
+    hashItem *newKeyValue = createNewItem(key, value);
+
+    int index = hashf(key);
+
+    if (hashTable[index] == NULL){
+        hashTable[index] = newKeyValue;
+    }
+    else
+    {
+        int inserted = 0;
+        hashItem *p = hashTable[index];
+        hashItem *q = NULL;
+        while (p != NULL){
+            int e = strcmp(p->hashedKey, newKeyValue->hashedKey);
+            if (e == 0){
+                if (q != NULL)
+                    q->next = newKeyValue;
+                p->hashedValue = newKeyValue->hashedValue;
+                inserted = 1;
+                break;
+            }
+            q = p;
+            p = p->next;
+        }
+        if (!inserted)
+            q->next = newKeyValue;
+    }
+}
+
+hashItem * get(hashItem** hashTable, char *kAey){
+    if (hashTable == NULL)
+        return NULL;
+    int index = hashf(key);
+    if (hashTable[index] != NULL)
+    {
+        if (!strcmp(hashTable[index]->hashedKey, key)){
+            return hashTable[index];
+        }
+        else{
+            hashItem *p = hashTable[index];
+            while (p != NULL){
+                if (p->hashedKey == key)
+                    return p;
+                p = p->next;
+            }
+            return NULL;
+        }
+    }
+    else{
+        return NULL;
+    }
+}
+
+
+int main(){
+    hashItem** hashtable = (hashItem**)calloc(20, sizeof(hashItem**));
+
+    put(hashtable, "select", "marks");
+
+    hashItem* temp = get(hashtable,"select");
+    printf("%s", temp->hashedKey);
+    int k;
+    scanf("%d", &k);
+    return 0;
+}Sorting Subarrays in C Sorts Entire Array Instead?So in this little game I wrote I have a deck of n_C cards, each with a unique integer value. 
+There are n_P players each holding n_H cards in their hand.
+The deck and the hands share an array, like so:
+Player i_P's hand contains all cards from from deck[i_P * n_H to deck[i_P * (n_H + 1) - 1]. All players combined always hold less than n_C cards.
+Now I want to sort each player's hand, but not the entire deck (obviously, as this would move some cards between players' hands). I've gone about this like so:
+void sort_hands(char * deck, size_t n_P) {
+    for (size_t i_P = 0; i_P < n_P; i_P++)
+        sort_cards(deck + i_P * n_H, n_H);
+}
+
+And then, using insertion sort (this function will sort an entire array just fine):
+void sort_cards(char * cards, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = i - 1; j >= 0; j--) {
+            if (cards[j] > cards[j + 1])
+                card_swap(cards, j, j + 1);
+            else
+                break;
+    }
+}
+
+*Note: card_swapdoes  exactly what you would expect it to, it's only 3 statements.
+Both n_Cand n_H are #define'd constants, n_P is a local variable.
+When I run the above code with a shuffled deck, and params n_C = 104, n_H = 10, n_P = 3, I get:
+0: 74 31 53 46 42 75 72 77 70 49
+1: 76 86 99 78 11 94 61 14 41 87
+2: 40 26 92 5 9 3 66 63 101 98
+before subarray sorting and something like:
+0: 3 5 9 11 31 42 46 49 53 74
+1: 61 70 75 72 76 77 78 86 94 99
+2: 14 26 40 41 63 66 87 92 98 101
+afterwards. As we can see, some cards have moved hands when they shouldn't have. But the deck has not been sorted across all hands (see e.g. 14 in player 2's hand. How can this be? The way I see it, my coding skills are not at fault, but the compiler seems to be messing with me.
+I have observed this behaviour both with the VS15 C++ compiler as well as GCC.I compiled your sort_cards() function (after providing the missing }),  with GCC 7.2.0 on a Mac and the command line:
+gcc -O3 -g -std=c11 -Wall -Wextra -Werror -Wmissing-prototypes \
+    -Wstrict-prototypes -c cards53.c
+
+With these options (the critical one is -Wextra), it warns immediately:
+cards53.c:31:34: error: comparison of unsigned expression >= 0 is always true [-Werror=type-limits]
+         for (size_t j = i - 1; j >= 0; j--)
+
+That indicates a serious problem.  Especially as on the first iteration of the outer loop, i is 0, so i - 1 is a very big number.  Frankly, your claim that the function will sort an entire array successfully is bogus.  It won't.  And I don't run code that won't compile with the command line shown.
+If you fix that function, your code is then OK.  I used:
+#include <stdio.h>
+
+#define n_H 10
+#define n_C 104
+
+static inline void card_swap(char *deck, int i1, int i2)
+{
+    char t = deck[i1];
+    deck[i1] = deck[i2];
+    deck[i2] = t;
+}
+
+static void sort_cards(char *cards, size_t n)
+{
+    for (size_t i = 1; i < n; i++)
+    {
+        for (size_t j = i; j-- > 0; )
+        {
+            if (cards[j] > cards[j + 1])
+                card_swap(cards, j, j + 1);
+            else
+                break;
+        }
+    }
+}
+
+static void sort_hands(char *deck, size_t n_P)
+{
+    for (size_t i_P = 0; i_P < n_P; i_P++)
+        sort_cards(deck + i_P * n_H, n_H);
+}
+
+static void dump_hands(const char *tag, const char *deck, size_t n_P)
+{
+    printf("%s:\n", tag);
+    for (size_t p = 0; p < n_P; p++)
+    {
+        printf("Player %zu:", p + 1);
+        const char *hand = deck + p * n_H;
+        for (int i = 0; i < n_H; i++)
+            printf(" %3d", hand[i]);
+        putchar('\n');
+    }
+}
+
+int main(void)
+{
+    char deck[n_C] =
+    {
+        74,  31,  53,  46,  42,  75,  72,  77,  70,  49,
+        76,  86,  99,  78,  11,  94,  61,  14,  41,  87,
+        40,  26,  92,   5,   9,   3,  66,  63, 101,  98,
+    };
+    int n_P = 3;
+    dump_hands("Before", deck, n_P);
+    sort_hands(deck, n_P);
+    dump_hands("After", deck, n_P);
+    return 0;
+}
+
+The array is initialized with the sample data you gave; the residue is all zeros, but that doesn't matter for this exercise.
+Sample output:
+Before:
+Player 1:  74  31  53  46  42  75  72  77  70  49
+Player 2:  76  86  99  78  11  94  61  14  41  87
+Player 3:  40  26  92   5   9   3  66  63 101  98
+After:
+Player 1:  31  42  46  49  53  70  72  74  75  77
+Player 2:  11  14  41  61  76  78  86  87  94  99
+Player 3:   3   5   9  26  40  63  66  92  98 101
+
+Inspection shows that the each sub-array is correctly sorted.how to move an imported .db file within xcode directly to an iphoneI want to replace an existing sms.db file in my iphone with a modified sms.db file that has been imported into the xcode project. 
+I have a function below, cp() that takes "from" and "to" params.  I want to execute it like this:
+cp('/path/within/xcode/project/sms-modified.db', '/var/mobile/Library/SMS/sms.db');
+
+how can i modify the below function to take the sms.db imported in xcode and replace the sms.db within my phone?
+int cp(const char *from, const char *to) {
+    int fd_to, fd_from;
+    char buf[4096];
+    ssize_t nread;
+    int saved_errno;
+
+    fd_from = open(from, O_RDONLY);
+    if (fd_from < 0)
+        return -1;
+
+    fd_to = open(to, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd_to < 0)
+        goto out_error;
+
+    while (nread = read(fd_from, buf, sizeof buf), nread > 0)
+    {
+        char *out_ptr = buf;
+        ssize_t nwritten;
+
+        do {
+            nwritten = write(fd_to, out_ptr, nread);
+
+            if (nwritten >= 0)
+            {
+                nread -= nwritten;
+                out_ptr += nwritten;
+            }
+            else if (errno != EINTR)
+            {
+                goto out_error;
+            }
+        } while (nread > 0);
+    }
+
+    if (nread == 0)
+    {
+        if (close(fd_to) < 0)
+        {
+            fd_to = -1;
+            goto out_error;
+        }
+        close(fd_from);
+
+        /* Success! */
+        return 0;
+    }
+
+    out_error:
+    saved_errno = errno;
+
+    close(fd_from);
+    if (fd_to >= 0)
+        close(fd_to);
+
+    errno = saved_errno;
+    return -1;
+}how can i modify the below function to take the sms.db imported in xcode and replace the sms.db within my phone?
+
+You can't. Your iPhone is "sandboxed". It cannot "see" your computer.C arrays on stackIn c (and c++), one can create an  integer array in the following ways:
+int a[const];
+
+Where const is a compile-time constant, or
+int *a = (int *) malloc(...);
+
+According to my understanding, the first allocates the memory on stack, and the second on the heap. Now, as far as i know, memory on the stack is ordered such that the program can pop it off the top as needed. This would imply that the elements in the array are not necessarily stored sequentially, which sound odd. 
+What, precisely, is happening here? 
+Edit:
+Thanks for the replies guys. With your answers and some follow up Googling i found the source of my confusion. I was assuming that the program would only really use the top variable of the stack, and pop them on/off one by one.While abstract C language does not say how local objects are allocated (i.e. there's no explicit references to "stack" language specification), the storage duration of local objects is well aligned with LIFO properties of stacks: local objects are destroyed in the reverse order of their creation. Object that are created last are destroyed first and vice versa.
+This principle applies uniformly to all local objects. Arrays are no exception. Every array is just an appropriately sized block of contiguous memory bytes (which, BTW, is true for objects of any type). There's nothing special about arrays. There's no reason to store array elements non-sequentially.
+Every array object is created in its entirety on top of the stack. And when array object reaches the end of its storage duration, it is simply "popped off the top", just like you said. Anything that could have possibly resided above it in the stack should have already been popped off by that moment.You may be misunderstanding something.
+In fact, the stack will always be sequential storage.  The stack, however, will be far more limited in size than the heap.  While it is true that things are "popped" off of the stack, this will effectively not apply within the function where the local array is declared.
+The heap, on the other hand, can grow.  When running out of memory, malloc implementations will call sbrk() to request additional memory.  This means that, overall, the heap need not be contiguous, though when you call malloc or realloc, you can be confident that the memory will be at least as large as what you have requested and that the addresses will be sequential (at least, from your point of view).There are 3 main memory types in programming: static memory, heap and stack.
+Static memory is used to allocate all 'static' variables, i.e. variables declared in global scope or declared as static in functions. This means that the number of static variables and their size is known at compilation time and compiler just reserves memory for them.
+Heap is a dynamic memory pool where you can borrow memory when you need it and return the memory to it. So, when you borrow memory, i.e. 'malloc' it, you can use it as you wish till you return (free) it so that it could be reused by a different piece of the program.
+The stack is a special memory region, used to allocate local variables for functions. When you call a function which has non-static local variables, it will allocate enough space for those variables in the memory (plus additional space needed for the function's needs). When you return from the function, the memory gets automatically return to the system for reuse in another function call.
+In your case, the first declaration could either be a static variable or could be a local function variable. Depending on this it could be allocated in one of those pools. The second case borrows memory from heap.
+Usually every single variable occupies contiguous space in memory. It does not matter which type of the memory it is. Array is such a variable which occupies a memory region. The order in which data is put in memory itself depends on architecture. The task of the compiler is to give you a standard view of the variables, i.e. array[0] should contain data for array[0] and pointer arithmetic should work in the standard way. 
+So, in practice all elements of an array are stored sequentially. If not, it will not alter anything in the programming. Though I have not seen a case where they would not be as such.Why scanf("%d", &number) results 'a' as 29 in C programming?I have a following code in C
+#include <stdio.h>
+int main()
+{
+    int number;
+
+    // printf() displays the formatted output
+    printf("Enter an integer: ");
+
+    // scanf() reads the formatted input and stores them
+    scanf("%d", &number);
+
+    // printf() displays the formatted output
+    printf("You entered: %d", number);
+    return 0;
+}
+
+Here I am expected to enter a number but I have entered a character 'a' and it results 29. I expected that it will throw an exception but I was surprised by an output.For starters the function main without parameters shall be declared like
+int main( void )
+
+Just change your program the following way
+#include <stdio.h>
+
+int main( void )
+{
+    int number;
+
+    // printf() displays the formatted output
+    printf("Enter an integer: ");
+
+    // scanf() reads the formatted input and stores them
+    if (scanf("%d", &number) == 1)
+    {
+        // printf() displays the formatted output
+        printf("You entered: %d\n", number);
+    }
+    else
+    {
+        puts("Invalid input");
+    }
+
+    return 0;
+}
+
+and see what will happen if you try to enter the character 'a' instead of a number.
+According to the description of the function in the C Standard (7.21.6.2 The fscanf function)
+
+d    Matches an optionally signed decimal integer, whose format is the
+       same as expected for the subject sequence of the strtol function with
+       the value 10 for the base argument. The corresponding argument shall be 
+       a pointer to signed integer.
+
+And (7.22.1.4 The strtol, strtoll, strtoul, and strtoull functions)
+
+7 If the subject sequence is empty or does not have the expected
+  form, no conversion is performed; the value of nptr is stored in the
+  object pointed to by endptr, provided that endptr is not a null
+  pointer.
+
+Thus in the demonstrative program the else statement will be executed because (The C Standard, 7.21.6.2 The fscanf function)
+
+16 The fscanf function returns the value of the macro EOF if an input
+  failure occurs before the first conversion (if any) has completed.
+  Otherwise, the function returns the number of input items assigned,
+  which can be fewer than provided for, or even zero, in the event of
+  an early matching failureYou have fallen into the same trap that snares virtually all new C programmers that do not take the time to fully understand the scanf family of function before attempting to take user input with it.
+Before getting to the specifics, any time you take user input, you must validate the input. That means checking the return for whatever function you used to validate input was in fact received, and if necessary, validate that the input received was within the expected/acceptable range of values for your code. Using scanf is no different.
+The preferred method for user input is fgets because it avoids the pitfalls inherent in scanf and completely consumes each line of input (provided the buffer is large enough, or if it is called repeatedly until you validate the last character read was a '\n') 
+With scanf, it is up to you to account for, and remove, any characters that remain in stdin in the event of (1) successful input or (2) an input or matching failure where additional attempts at input will follow.
+To safely use scanf for user input, you have three conditions to test for, (1) did the return indicate all conversions specified in the format string took place? If so, empty stdin and check the range of values received as required. (2) did the user cancel input by pressing Ctrl+d (or Ctrl+z on windoze). If so, gracefully exit insuring a final '\n' is provided in your output -- (OS & compiler dependent); and finally (3) did a matching or input failure occur? If so, handle the error and empty any invalid characters from stdin.
+When you are taking user input, an invalid input does you no good. So you generally want to loop until you receive valid input or the user cancels, that can be done relatively easily with a simple infinite loop, e.g.
+/** empty all characters reamining in stdin */
+void empty_stdin()
+{
+    int c = getchar();
+
+    while (c != '\n' && c != EOF)
+        c = getchar();
+}
+...
+
+    for (;;) {          /* loop until valid input or user cancels */
+        int rtn = 0;    /* variable to capture scanf return */
+
+        /* printf() displays the formatted output */
+        printf ("Enter an integer: ");
+
+        /* scanf() reads the formatted input and stores them */
+        rtn = scanf ("%d", &number);
+
+        if (rtn == 1) {         /* we got an integer value */
+            empty_stdin();      /* empty any remaining characters */
+            break;              /* continue with program */
+        }
+        else if (rtn == EOF) {  /* user canceled with ctrl+d (ctrl+z on win) */
+            fprintf (stderr, "user canceled input.\n");
+            return 1;
+        }
+        /* handle input or matching failure */
+        fprintf (stderr, "error: matching or input failure occurred.\n");
+        empty_stdin();          /* empty any remaining characters */
+    }
+
+Stepping though the input loop, you will notice each of the three conditions you must check for are handled, and any characters that remain in stdin are emptied in preparation for the next input. Your complete code simply outputs the result of the successful input (and if on windows, adds a final getchar(); to prevent the terminal window from closing if you are running withing an IDE, e.g.
+#include <stdio.h>
+
+/** empty all characters reamining in stdin */
+void empty_stdin()
+{
+    int c = getchar();
+
+    while (c != '\n' && c != EOF)
+        c = getchar();
+}
+
+int main (void) {
+
+    int number = 0;
+
+    for (;;) {          /* loop until valid input or user cancels */
+        int rtn = 0;    /* variable to capture scanf return */
+
+        /* printf() displays the formatted output */
+        printf ("Enter an integer: ");
+
+        /* scanf() reads the formatted input and stores them */
+        rtn = scanf ("%d", &number);
+
+        if (rtn == 1) {         /* we got an integer value */
+            empty_stdin();      /* empty any remaining characters */
+            break;              /* continue with program */
+        }
+        else if (rtn == EOF) {  /* user canceled with ctrl+d (ctrl+z on win) */
+            fprintf (stderr, "user canceled input.\n");
+            return 1;
+        }
+        /* handle input or matching failure */
+        fprintf (stderr, "error: matching or input failure occurred.\n");
+        empty_stdin();          /* empty any remaining characters */
+    }
+
+    /* printf() displays the formatted output */
+    printf ("You entered: %d\n", number);
+
+#if defined (_WIN32) || defined (_WIN64)
+    getchar ();     /* to hold terminal open -- don't use getch() */
+#endif
+
+    return 0;
+}
+
+Example Use/Output
+$ ./bin/scanf_int
+Enter an integer: apples
+error: matching or input failure occurred.
+Enter an integer: a 10 b 50 c 90
+error: matching or input failure occurred.
+Enter an integer: 12345aaa
+You entered: 12345
+
+Example where input canceled. (note: on Win10, ctrl+z does not generate EOF by default, See CTRL+Z does not generate EOF in Windows 10 | PROC-X.com)
+$ ./bin/scanf_int
+Enter an integer: NO!
+error: matching or input failure occurred.
+Enter an integer: user canceled input.
+
+Look things over and let me know if you have further questions.I think "scanf()" doesn't read "a" as as number and simply skips to put any number in "number" and 29 is the initial value of the number which is found in stack!
+try to initialize "number" with something like 123 and you will get 123 in output.%d expects to see one or more decimal digits in the input stream; ’a’ is not a decimal digit, so you get a matching failure - number is not updated, a is left in the input stream, and scanf returns 0 to indicate that no conversion and assignment occurred.
+Since you don’t initialize number when you declare it, it contains an indeterminate value, which in this case was 29.
+C doesn’t use exceptions for unexpected input - you have to check the return value of scanf.  
+int result = scanf( “%d”, &number );
+if ( result == 1 )
+{
+  // user entered one or more decimal digits for number
+}
+else if ( result == 0 )
+{
+  // user entered something that isn’t a decimal digit
+}
+else // result == EOF
+{
+  // EOF or error detected on input
+}GTK Glade C - Treeview selection weird segfaultI'm currently learning GTK and Glade. I'm trying little by little to make a small accounting programm. Now, i have a weird segfault happening and i can't understand why. I just want to unselect all the GtkTreeSelection using gtk_tree_selection_unselect_all. Note that it also crashes if try to select all.
+What is weird is that the segfault doesn't occur if i comment out my on_treeview_selection1_changed function. So it seems this function somehow messes with the other one.. Is it possible ?
+main.c :
+#include <gtk/gtk.h>
+
+typedef struct {
+    GtkTreeView *treeview;
+    GtkWidget *ent_date;
+    GtkWidget *ent_lib;
+    GtkWidget *ent_mont;
+    GtkWidget *but_unset;
+} app_widgets;
+
+enum
+{
+    DATE_COLUMN,
+    LIBELLE_COLUMN,
+    MONTANT_COLUMN,
+    N_COLUMN
+};
+
+void on_window_main_destroy() {
+    gtk_main_quit();
+}
+
+void on_button_unset_clicked (GtkButton *button, app_widgets *app_wid) {
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(app_wid->treeview));
+
+    gtk_tree_selection_unselect_all(selection);
+    //gtk_tree_selection_set_mode(selection, GTK_SELECTION_MULTIPLE);
+    //gtk_tree_selection_select_all(selection);
+
+}
+
+void on_treeview_selection1_changed (GtkTreeSelection *treeselection, app_widgets *app_wid) {
+
+    gchar *a,*b,*c;
+    GtkTreeIter iter;
+    GtkTreeModel *model;
+
+    if (gtk_tree_selection_get_selected(treeselection, &model, &iter))
+    {
+        gtk_tree_model_get(model, &iter, DATE_COLUMN, &a, LIBELLE_COLUMN, &b,MONTANT_COLUMN, &c, -1);
+
+    }
+
+    gtk_entry_set_text(GTK_ENTRY(app_wid->ent_date), a);
+    gtk_entry_set_text(GTK_ENTRY(app_wid->ent_lib), b);
+    gtk_entry_set_text(GTK_ENTRY(app_wid->ent_mont), c);
+
+    g_free(a);
+    g_free(b);
+    g_free(c);
+
+}
+
+int main(int argc, char *argv[])
+{
+    GtkBuilder *builder;
+
+    app_widgets *widgets = g_slice_new(app_widgets);
+
+    gtk_init(&argc, &argv);
+
+    builder = gtk_builder_new();
+    gtk_builder_add_from_file (builder, "test.glade", NULL);
+
+    widgets->treeview = GTK_TREE_VIEW(gtk_builder_get_object(builder, "treeview1"));
+    widgets->ent_date  = GTK_WIDGET(gtk_builder_get_object(builder, "entry_date"));
+    widgets->ent_lib = GTK_WIDGET(gtk_builder_get_object(builder, "entry_lib"));
+    widgets->ent_mont = GTK_WIDGET(gtk_builder_get_object(builder, "entry_mont"));
+    widgets->but_unset = GTK_WIDGET(gtk_builder_get_object(builder, "button_unset"));
+
+    gtk_builder_connect_signals(builder, widgets);
+
+    gtk_widget_show(GTK_WIDGET(gtk_builder_get_object(builder, "window1")));
+
+    g_object_unref(builder);
+
+    gtk_main();
+
+    g_slice_free(app_widgets, widgets);
+    return 0;
+}
+
+and the test.glade file :
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Generated with glade 3.18.3 -->
+<interface>
+  <requires lib="gtk+" version="3.12"/>
+  <object class="GtkListStore" id="liststore1">
+    <columns>
+      <!-- column-name Date -->
+      <column type="gchararray"/>
+      <!-- column-name Libellé -->
+      <column type="gchararray"/>
+      <!-- column-name Montant -->
+      <column type="gchararray"/>
+    </columns>
+    <data>
+      <row>
+        <col id="0" translatable="yes">20.05.2017</col>
+        <col id="1" translatable="yes">Something - here</col>
+        <col id="2" translatable="yes">30.20</col>
+      </row>
+      <row>
+        <col id="0" translatable="yes">25.06.2017</col>
+        <col id="1" translatable="yes">Something else - overthere</col>
+        <col id="2" translatable="yes">24.90</col>
+      </row>
+      <row>
+        <col id="0" translatable="yes">11.08.2017</col>
+        <col id="1" translatable="yes">Third thing - lala</col>
+        <col id="2" translatable="yes">5.15</col>
+      </row>
+    </data>
+  </object>
+  <object class="GtkWindow" id="window1">
+    <property name="can_focus">False</property>
+    <property name="margin_left">5</property>
+    <property name="margin_right">5</property>
+    <property name="margin_top">5</property>
+    <property name="margin_bottom">5</property>
+    <property name="window_position">center</property>
+    <child>
+      <object class="GtkBox" id="box1">
+        <property name="visible">True</property>
+        <property name="can_focus">False</property> 
+        <property name="orientation">vertical</property>
+        <child>
+          <object class="GtkScrolledWindow" id="scrolledwindow1">
+            <property name="visible">True</property>
+            <property name="can_focus">True</property>
+            <property name="shadow_type">in</property>
+            <child>
+              <object class="GtkTreeView" id="treeview1">
+                <property name="visible">True</property>
+                <property name="can_focus">True</property>
+                <property name="model">liststore1</property>
+                <child internal-child="selection">
+                  <object class="GtkTreeSelection" id="treeview-selection1">
+                    <signal name="changed" handler="on_treeview_selection1_changed" swapped="no"/>
+                 </object>
+                </child>
+                <child>
+                  <object class="GtkTreeViewColumn" id="treeviewcolumn1">
+                    <property name="resizable">True</property>
+                    <property name="fixed_width">70</property>
+                    <property name="title" translatable="yes">Date</property>
+                    <child>
+                      <object class="GtkCellRendererText" id="cellrenderertext1"/>
+                      <attributes>
+                        <attribute name="text">0</attribute>
+                      </attributes>
+                    </child>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkTreeViewColumn" id="treeviewcolumn2">
+                    <property name="resizable">True</property>
+                    <property name="title" translatable="yes">What</property>
+                    <child>
+                      <object class="GtkCellRendererText" id="cellrenderertext2"/>
+                      <attributes>
+                        <attribute name="text">1</attribute>
+                      </attributes>
+                    </child>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkTreeViewColumn" id="treeviewcolumn3">
+                    <property name="resizable">True</property>
+                    <property name="title" translatable="yes">Amount</property>
+                    <child>
+                      <object class="GtkCellRendererText" id="cellrenderertext3"/>
+                      <attributes>
+                        <attribute name="text">2</attribute>
+                      </attributes>
+                    </child>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="position">0</property>
+          </packing>
+        </child>
+        <child>
+          <object class="GtkBox" id="box2">
+            <property name="visible">True</property>
+            <property name="can_focus">False</property>
+            <child>
+              <object class="GtkBox" id="box_date">
+                <property name="visible">True</property>
+                <property name="can_focus">False</property>
+                <property name="orientation">vertical</property>
+                <child>
+                  <object class="GtkLabel" id="label1">
+                    <property name="visible">True</property>
+                    <property name="can_focus">False</property>
+                    <property name="label" translatable="yes">Date</property>
+                  </object>
+                 <packing>
+                    <property name="expand">False</property>
+                    <property name="fill">True</property>
+                    <property name="position">0</property>
+                  </packing>
+                </child>
+                <child>
+                  <object class="GtkEntry" id="entry_date">
+                    <property name="visible">True</property>
+                    <property name="can_focus">True</property>
+                  </object>
+                  <packing>
+                    <property name="expand">False</property>
+                    <property name="fill">True</property>
+                    <property name="position">1</property>
+                  </packing>
+                </child>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="position">0</property>
+          </packing>
+        </child>
+        <child>
+          <object class="GtkBox" id="box_lib">
+            <property name="visible">True</property>
+            <property name="can_focus">False</property>
+            <property name="orientation">vertical</property>
+            <child>
+              <object class="GtkLabel" id="label2">
+                <property name="visible">True</property>
+                <property name="can_focus">False</property>
+                <property name="label" translatable="yes">What</property>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="position">0</property>
+              </packing>
+            </child>
+            <child>
+              <object class="GtkEntry" id="entry_lib">
+                <property name="visible">True</property>
+                <property name="can_focus">True</property>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="position">1</property>
+              </packing>
+            </child>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="position">1</property>
+          </packing>
+        </child>
+        <child>
+          <object class="GtkBox" id="box_mont">
+            <property name="visible">True</property>
+            <property name="can_focus">False</property>
+            <property name="orientation">vertical</property>
+            <child>
+              <object class="GtkLabel" id="label3">
+                <property name="visible">True</property>
+                <property name="can_focus">False</property>
+                <property name="label" translatable="yes">Amount</property>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="position">0</property>
+              </packing>
+            </child>
+            <child>
+              <object class="GtkEntry" id="entry_mont">
+                <property name="visible">True</property>
+                <property name="can_focus">True</property>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="position">1</property>
+              </packing>
+            </child>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="position">2</property>
+          </packing>
+        </child>
+      </object>
+      <packing>
+        <property name="expand">False</property>
+        <property name="fill">True</property>
+        <property name="position">1</property>
+      </packing>
+    </child>
+    <child>
+      <object class="GtkFixed" id="fixed1">
+        <property name="visible">True</property>
+        <property name="can_focus">False</property>
+        <child>
+          <object class="GtkButton" id="button_unset">
+            <property name="label" translatable="yes">Unselect</property>
+            <property name="width_request">100</property>
+            <property name="height_request">23</property>
+            <property name="visible">True</property>
+            <property name="can_focus">True</property>
+            <property name="receives_default">True</property>
+            <property name="xalign">0.47999998927116394</property>
+            <property name="yalign">0.44999998807907104</property>
+            <signal name="clicked" handler="on_button_unset_clicked" swapped="no"/>
+          </object>
+          <packing>
+            <property name="x">370</property>
+            <property name="y">68</property>
+          </packing>
+        </child>
+      </object>
+      <packing>
+        <property name="expand">False</property>
+        <property name="fill">True</property>
+        <property name="position">2</property>
+      </packing>
+      </child>
+      </object>
+    </child>
+  </object>
+</interface>In on_treeview_selection1_changed() you are trying to set the entry fields even if gtk_tree_selection_get_selected(treeselection, &model, &iter) returned FALSE because there is currently no selection. In this case this means that the variables a, b and c have not been set by gtk_tree_model_get(model, &iter, DATE_COLUMN, &a, LIBELLE_COLUMN, &b,MONTANT_COLUMN, &c, -1), and calling the three gtk_entry_set_text instructions will thus result in a segfault (for the same reason, the g_free instructions wouldn't work either). A, b and c have to point to strings and not to some random values.
+You might want to simply use gtk_entry_set_text(GTK_ENTRY(app_wid->ent_date), ""); etc. if you want to delete the content of the entry fields in case there is no selection.Testing a Linked ListI am reading Skiena's "The Algorithm Design Manual" for personal learning, and I am trying to implement the linked list in C.
+How do I use the insert_list() function and then print out my list to verify the values?
+/* definition of linked list */
+typedef struct list {
+    int item;
+    struct list *next;
+} list;
+/* insert item into list */
+void insert_list(list **l, int x) {
+    list *p;
+    p = malloc(sizeof(list));
+    p->item = x;
+    p->next = *l;
+    *l = p;
+}
+
+I wrote a main function to try and figure out how to use insert_list():
+int main(void) {
+    struct list *root;
+struct list *traverse;
+    root = (struct list *)malloc(sizeof(struct list));
+    root->next = 0;
+    root->item = 5;
+    traverse = root;
+    insert_list(traverse, 1);    /* this is the problem */
+    printf("%d\n", root->item);
+}
+
+I receive an error at compilation with gcc:
+expected 'struct list **' but argument is of type 'struct list *
+How do I properly use this function to insert items into and then print my list? Without the insert_list() call, it prints root->item as 5, as expected.You have a nice function. Now: use it.
+
+int main(void) {
+    // You have a typedef, so you should omit the struct keyword
+    /*struct */ list *root= NULL, *p;
+
+    insert_list(&root, 5);    
+    insert_list(&root, 1);
+
+    for (p=root; p; p=p->next){
+      printf("%d\n", p->item);
+      }
+
+ return 0;
+}As mentioned in the comments, the way to get it to compile is to change the call to insert_list() to this:
+insert_list(&traverse, 1);
+
+The insert_list() function takes a pointer to a pointer to a struct list, not just a pointer to a struct list.
+You've written the code in an odd way. You're first assigning traverse to be equal to root and then calling the insert_list() function, which will overwrite traverse with the pointer to the new node it creates. At that point, the new node will be the "root" of your tree, not the root node you originally created. This will likely cause confusion when you attempt to traverse the list later.C - converting hex to stringFollowing on an old question Converting hex to string in C?
+The approved answer suggests to use sprintf to convert each hex to string.
+I have two question on this - 
+1) When i have a hex like 0a i want my string to have 0a too, but following the above solution the result will have a.
+2) What am i doing wrong here?
+#include <stdio.h>
+
+int main(void)
+{
+    unsigned char readingreg[10];
+    readingreg[0] = 0x4a;
+    readingreg[1] = 0xab;
+    readingreg[2] = 0xab;
+    readingreg[3] = 0x0a;
+    readingreg[4] = 0x40;
+    unsigned char temp[10];
+    int i = 0;
+
+    while (i < 5)
+    {
+        sprintf(temp + i, "%x", readingreg[i]);
+        i++;
+    }
+    printf("String: %s\n", temp);
+    return 0;
+}
+
+The o/p seems to - String: 4aaa40
+3) Combining both the both questions, i want my result string to be 4aabab0a40
+TIAYour code has several problems.
+First unsigned char temp[10]; should be unsigned char temp[11]; to contain a string terminator.
+Next is the format spec "%x" should be "%02x" so each value is 2 digits.
+Then temp + i should be temp + i*2 so each pair of digits is written in the right place.
+Correcting those mistakes:
+#include <stdio.h>
+
+int main(void)
+{
+    unsigned char readingreg[10];
+    readingreg[0] = 0x4a;
+    readingreg[1] = 0xab;
+    readingreg[2] = 0xab;
+    readingreg[3] = 0x0a;
+    readingreg[4] = 0x40;
+    unsigned char temp[11];
+    int i = 0;
+
+    while (i < 5)
+    {
+        sprintf(temp + i*2, "%02x", readingreg[i]);
+        i++;
+    }
+    printf("String: %s\n", temp);
+    return 0;
+}
+
+Program output is now the required
+
+String: 4aabab0a40c - struct unsafe warningi am trying to use struct to make some kind of list that takes the student's name, number etc. My problem when i try to build solution and see if there is an error, compiler(Visual Studio 2013) tells me to use "strcpy_s" intead of "strcpy". And when i fix it this time i get errors related to string string sizes. What exactly am i doing wrong?
+#include <stdio.h>
+#include<string.h>
+
+struct student
+{
+char name[20];
+char surname[20];
+char dep[50];
+int Class;
+int num;
+}stud;
+
+main(void){
+strcpy(stud.name, "goktug");
+strcpy(stud.surname, "saray");
+strcpy(stud.dep, "elektrik");
+
+}Well safe unsafe question is coming because of the buffer over run issue. strcpy is not aware of destinations characeter holding capability. That's why its unsafe.
+Safer would be strcpy_s( stud.name, 20, "goktug" );. Here we are specifying that no matter what we should be in limit of 20 as destnation is capable of holding 20 characters including the NUL terminating character.
+One can argue that here data is being truncated which is not better than a clear message that destination is too small to hold the copied thing, but surely better than a buffer overrun exploits. If we think along that line then well, we can reach the conclusion that we shouldn't call them unless we become sure that destination can hold the copied string.FreeRTOS, Atmel Studio - Task not being blocked before it receives a binary semaphoreI'm trying to switch to a blocked task after a button press. Basically I want task_player1 to do nothing until it receives a semaphore from task_ctrl. The way I'm giving the semaphore is on a button press. The code is bellow:
+#define B1 PIO_PB26_IDX
+
+#define TASK_STACK_SIZE (2048/ sizeof(portSTACK_TYPE))
+
+xTaskCreate(task_ctrl, (const signed char * const) "Control", TASK_STACK_SIZE, NULL, 1, NULL);
+
+xTaskCreate(task_player1, (const signed char * const) "Player1", TASK_STACK_SIZE, NULL, 1, NULL);
+
+void task_player1(void *pvParameters)
+{
+    vSemaphoreCreateBinary(player1_signal);
+
+    while (1)
+    {
+        if( xSemaphoreTake( player1_signal, portMAX_DELAY ) == pdTRUE )
+        {
+            printf("Semaphore taken\n");
+            ioport_set_pin_level(L1, HIGH);
+        }
+    }
+}
+
+    void task_ctrl(void *pvParameters)
+{
+    static signed portBASE_TYPE xHigherPriorityTaskWoken;
+
+    bool button1;
+    while (1)
+    {
+        xHigherPriorityTaskWoken = pdFALSE;
+        button1 = ioport_get_pin_level(B1);
+        printf("TASK_CTRL RUNNING...\n");
+        ioport_set_pin_level(L1, LOW);
+
+        if (button1)
+        {
+            xSemaphoreGiveFromISR(player1_signal, &xHigherPriorityTaskWoken);
+            printf("Semaphore given\n");
+
+            vTaskDelay(1);
+        }
+    }
+}
+
+The problem is task_player1 is never blocked as it should be by portMAX_DELAY. As soon as I upload the code to the microchip the LED lights up while I only want it to light up once I press the button and the semaphore is given. What am I doing wrong here?
+Due to Atmel Studio restrictions I'm using FreeRTOS v7.3.
+Edit: Updated codeBinary semaphores in FreeRTOS are created in a "given" state, ie. with a count of 1. Therefore when task_player1() enters the while loop it will set the pin to high without blocking at the semaphore. You could call xSemaphoreTake() just after the semaphore is created to decrement the semaphore count to 0.
+task_ctrl() should not be using xSemaphoreGiveFromIsr(), because it is a task and not an ISR.Pointer to string changes its value unexpectedlyI have noted that, when writing a string in an array allocated with malloc(), its value changes. To be clear, here is the code that replicates this "error": 
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <stdlib.h>
+
+#define N (20)
+
+int main()
+{
+   char * a_p;
+   a_p = malloc( N * sizeof(char));
+   printf(" * 01 pointer -> %p\n", a_p);
+   a_p = "something";
+   printf(" * 02 pointer -> %p\n", a_p);
+   printf("-- TEST --\n");
+   return 0;
+
+}
+
+When executing, the output is:
+ * 01 pointer -> 0x1332010
+ * 02 pointer -> 0x4006b9
+-- TEST --
+
+While I was expecting the same value because I am not changing where the pointer points (at least not directly). This causes problem when using free(). What is happening under the wood? What am I missing? How to do these things the right way?Your problem
+You are allocating memory for your pointer with malloc() but then you assign your pointer variable to something else ("something", which has its own address), instead of filling the newly-allocated pointer.
+Solution
+You should use the strdup() function that allocates memory and copies a string at the allocated memory:
+a_p = strdup("something");
+
+Or the strcpy() function, that takes a malloc()'d pointer and a string to copy in the pointed memory:
+a_p = malloc(N * sizeof(char));
+strcpy(a_p, "something");You are changing the pointer directly. This statement
+a_p = "something";
+
+is equivalent to
+a_p = &"something"[0];
+
+String literals have types of character arrays. For example the string literal "something" has type char[10]. 
+From the C Standard (6.4.5 String literals)
+
+6 In translation phase 7, a byte or code of value zero is appended to
+  each multibyte character sequence that results from a string literal
+  or literals.78) The multibyte character sequence is then used to
+  initialize an array of static storage duration and length just
+  sufficient to contain the sequence. For character string literals,
+  the array elements have type char, and are initialized with the
+  individual bytes of the multibyte character sequence...
+
+Used in expressions arrays with rare exceptions are converted to pointers to their first elements.
+From the C Standard (6.3.2.1 Lvalues, arrays, and function designators)
+
+3 Except when it is the operand of the sizeof operator or the unary &
+  operator, or is a string literal used to initialize an array, an
+  expression that has type ‘‘array of type’’ is converted to an
+  expression with type ‘‘pointer to type’’ that points to the initial
+  element of the array object and is not an lvalue. If the array object
+  has register storage class, the behavior is undefined.
+
+So after this statement
+a_p = "something";
+
+the pointer points to the first character of the string literal with the static storage duration.
+I think you mean
+strcpy( a_p, "something" );
+
+That is you wanted to copy the string literal in the dynamically allocated memory.
+Take into account that if even you'll write the following code
+char *p1 = "string";
+char *p2 = "string";
+
+then it is not necessary that p1 is equal to p2 because depending on compiler options the compiler can place these two identical string literals in different memory extents.
+So the if statement
+if ( p1 == p2 )
+
+can yield either true or false.Well the literal string are basically arrays and it decayed into pointer to the first element when you assigned it to a_p. That address is being printed. 
+And as you dont keep the address of the allocated memory you are having memory leak.
+Also you cant use it in free and that gives enough hint that it is not allocated dynamically . From standard
+
+The free function causes the space pointed to by ptr to be
+  deallocated, that is, made available for further allocation. If ptr is
+  a null pointer, no action occurs. Otherwise, if the argument does not
+  match a pointer earlier returned by a memory management function, or
+  if the space has been deallocated by a call to free or realloc, the
+  behavior is undefined.
+
+Well this explains why you faced problem when trying to free memory you haven't allocated. 
+Again to have something like copying you need to use strcpy or strncpy or strdup(POSIX compliant).
+For more information check this link. Standard says it explicitly how it is considered as array in translation steps.
+Especially this part - ( Decayed pointer is of type char* that's why)
+
+ For character string literals, the array elements have type
+  char, and are initialized with the individual bytes of the multibyte
+  character sequence.The string literal "something" represents a null-terminated series of characters that live in some read-only region (most likely .text if you build/link/run on a GNU/Linux system). 
+Initially, a_p points to somewhere in the memory region within which malloc is allocating buffers. You can freely write to the location to which a_p points, free() it, etc. When you perform the assignment a_p = "something";, you are not writing characters to the location to which a_p points, but rather changing that pointer to point to the beginning of that string. Now, you're pointing into (read-only) memory that wasn't allocated by malloc so its corresponding free function isn't able to do anything meaningful.
+Use strcpy (or better yet for safety, strncpy) instead to copy characters to the destination, a_p.what does dereference operator return? l-value or r-valuewhat does dereference operator return? l-value or r-value
+based on below example as the increment opearator is working properly. Need an explanation for the same
+// venukant
+#include<stdio.h>
+int main()
+{
+  char arr[] = "gendafool";
+  char *p = arr;
+  ++*p; // evaluated as ++(*p) but ++ requires a l-value 
+  printf(" %c", *p); // prints h
+
+  return 0;
+}The  unary * produces an lvalue as its result. A non-null pointer p always points to an object, so *p is an lvalue. For example:
+int a[N];
+int *p = a;
+...
+*p = 3;     // ok
+
+Although the result is an lvalue, the operand can be an rvalue, as in:
+*(p + 1) = 4;    // ok
+
+Hope this answers your query.From the 1999 C standard, Section 6.3.2.1, para 1 starts with .....
+
+An lvalue is an expression with an object type or an incomplete type other than void;
+
+and then refers to footnote 53, which says
+
+The name ‘‘lvalue’’ comes originally from the assignment expression E1 = E2, in which the left
+  operand E1 is required to be a (modifiable) lvalue. It is perhaps better considered as representing an
+  object ‘‘locator value’’. What is sometimes called ‘‘rvalue’’ is in this International Standard described
+  as the ‘‘value of an expression’’.
+An obvious example of an lvalue is an identifier of an object. As a further example, if E is a unary
+  expression that is a pointer to an object, *E is an lvalue that designates the object to which E points.
+
+In n1548 (draft of the 2011 standard), the same para starts with something worded slightly differently, but with essentially the same meaning;
+
+An
+  lvalue
+  is  an  expression  (with  an  object  type  other  than
+  void
+  )that  potentially
+  designates an object;
+
+This para refers to footnote 64, which is identical in content to footnote 53 from the 1999 C standard.
+Bear in mind that footnotes in the standard are not normative - their purpose is to clarify and explain.
+To answer the original question, the dereference operator (*p) produces an lvalue.   However, the value of the expression can be used as an rvalue.GCC confusing standard header with personal one named the sameIn a project I'm working on, I named one of my files math.h, which obvisouly is also the name of a standard library header.
+Everything worked fine, until I began to use gcc's -I option: I sorted my files into separate directories, like src, obj and inc for headers.
+I ended up with something like
+gcc ... -Iinc/
+
+and now my issue is that another library I use (the SDL, btw) #includes the standard math.h header (located at /usr/include/math.h), and GCC gives it my own math.h (found at like /home/me/my_project/inc/math.h), and obviously this does not compile.
+So my question is, how can I make GCC not think my headers are standard?
+Of course I can just rename the file, but that would just be avoiding the issue -- even if I end up doing so I wish to know the solution in case I come across this issue again.You must rename your file. The C11 standard says that in the current state the behaviour is undefined. C11 7.1.2p3
+
+
+If a file with the same name as one of the above < and > delimited sequences, not provided as part of the implementation, is placed in any of the standard places that are searched for included source files, the behavior is undefined.
+
+
+
+Otherwise, if you're compiling a kernel or similar, use -ffreestanding.Searching in array of struct in C [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+How do I properly compare strings in C?
+
+                                (10 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+How to search on char that has been randomly generated in an array of structures. 
+If char is found the function must return the info[i].num  in array of struct, where info is the array of structures (see code below).
+I got error in gcc 
+ warning: comparison between pointer and integer
+ if(info[j].name == s );
+
+how can I use correct comparison ??
+#include <stdio.h>
+#include <stdlib.h>
+#include<string.h>
+#define InfoSize  3 
+
+int main(int argc, char *argv[]) 
+{  
+char arr[20];
+struct st
+{    
+    char name[20];  
+    int num[5];   
+}; 
+
+struct st info[InfoSize] = {{ "some10",6 },{"some50",8},{"some5",4}};
+
+         int r = rand() % (50 + 1 - 10) + 10 ;
+         char s = sprintf( arr, "some%d", r );
+
+
+  for(int j=0;j<3;j++){
+
+     if(info[j].name == s )
+     printf("found  %s  and it's num =%d",info[j].name,info[j].num);
+
+}the following proposed code:
+
+cleanly compiles
+incorporated the majority of the comments to the question
+performs the desired functionality
+documents why each header file is included
+the code will probably fail to find a matching entry in the strut array because the generation of the arr[] contents could have been any value from 10 to 50  so will never result in a 5 appended to the string: some. And is unlikely to append a 10 or 50.
+
+And now the proposed code
+#include <stdio.h>    // printf(), sprintf()
+#include <stdlib.h>   // rand(), srand()
+#include <string.h>   // strcmp()
+#include <time.h>     // time()
+
+
+#define INFO_SIZE   3
+#define MAX_ARR_LEN 20
+
+int main( void )
+{
+    char arr[ MAX_ARR_LEN +1 ];
+
+    struct st
+    {
+        char name[20+1];  // +1 to allow for trailing NUL byte
+        int num;
+    };
+
+    struct st info[ INFO_SIZE ] =
+    {
+        { "some10",6 },
+        { "some50",8 },
+        { "some5",4  }
+    };
+
+    srand( (unsigned int)time( NULL ) );
+    int r = (rand() % 41) + 10 ;
+    sprintf( arr, "some%d", r );
+
+
+    for(int j=0; j<INFO_SIZE; j++ )
+    {
+         if( strcmp( info[j].name, arr )  == 0 )
+         {
+             printf("found  %s  and it's num =%d",info[j].name,info[j].num);
+         }
+    }
+}Your program is missing quite a few things.
+First order of business is you need to set seed for rand function in order to get pseudo random numbers. 
+The warning you're getting ( not error, at least on my compiler) tells you you're comparing pointer with integer because an arrays in c are actually plain old pointers.
+char s = sprintf( arr, "some%d", r );
+
+According  to https://www.tutorialspoint.com/c_standard_library/c_function_sprintf.htm
+sprintf sends output to your arr variable and retruns a value depending on the success of the operation so the following code:
+if(info[j].name == s )
+
+should be written as
+if(strcmp(info[j].name,arr)==0)
+
+I suggest you try to grasp core concepts of C as it can be of great help in your future programming life even if you never use C again.test C program with some inputsI wrote a program in C and I want to try it with some inputs. The inputs
+are not numbers so I can't use a for loop or something like this in the code.
+So I want to write a file with inputs and give it to the program so it will take every time (it waits to input) 1 line from the text file or something like this, is it possible?If your program reads input from stdin - i.e. if you're using a function like gets or scanf to get your input -  you can achieve what you're asking about by using input redirection. Let's say you create a file called test_input.dat which contains your test data. If this file and your program reside in the same directory, you can change to that directory using
+cd \your_directory
+
+and then run your program, telling it to read input from test_input.dat by doing the following:
+your_program < test_input.dat
+
+This will cause your program to read data from test_input.dat instead of from the terminal, and should work the same for most common operating systems (Windows or Unix variants such as Linux, etc).
+Best of luck.OpenCL: Values of __local array are lost after a barrier callI have a kernel storing some partial results in a local array before reducing
+them into a single value (see the example below). Before the reduction process
+starts, a barrier is placed to ensure all threads have successfully written their
+partial data. However, the barrier resets the values of the temporary array to 
+default values (i.e. 0.0f for floats).
+Minimal example:
+__kernel void simulate_plate(__local float *partial)
+{
+    __private int lpos;
+
+    lpos = get_local_id(0) + get_local_id(1) * get_local_size(1);
+
+    partial[lpos] = 1;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // At this point partial[i] == 0 for all i
+
+    // reduce data...
+}
+
+The argument partial has the following initializer:
+clSetKernelArg(kernel, 0, local_group_size * sizeof(float), NULL);
+
+The clSetKernelArg() call returns a status code CL_SUCCESS and the kernel
+terminates without any errors.
+Another observation is that swapping lines partial[lpos] = 1 and 
+barrier(CLK_LOCAL_MEM_FENCE) achieves the wanted result --- all components of
+the array partial now equal to 1.
+Any input why this behaviour occurs would be much appreciated.I think the index should be like this
+lpos = get_local_id(0) + get_local_id(1) * get_local_size(0);Why cannot we declare a variable after a switch case colon without using curly braces?case 1:
+            { //question is about this curly brace
+                int val;
+                scanf("%d", &val);
+                if(top1 == NULL){
+                    enqueue(top1, val, bottom1);
+                }
+                else{
+                    enqueue(top1, val);
+                }
+                break;
+            }
+
+Without the curly brace after case 1: it gave an error: *
+
+a label can only be part of a statement and a declaration is not a
+  statement: int val;
+
+*That is how the C grammar is defined. Variable declarations are not considered statements:
+int x; //a declaration
+int y = 3; //another declaration
+x = y + 1; //a statement
+
+A label is required to be followed by a statement. A label plus a declaration is not allowed.
+foo: int x; //error
+bar: x = y +1; //ok
+
+That is, IMO, inconvenient:
+while (...)
+{
+    //...
+    goto end;
+    end:   //error, no statement   
+}
+
+And remember that a case is just a special kind of label, so:
+case 1: int x; //error
+case 2: x = y +1; //ok
+
+The issue with braces is that in C they are used to build a compound statement, that of course is a kind of statement. The lines inside the compound statements can be both declarations and statements, all mixed (old C versions only allowed declarations at the beginning, not in the middle). So:
+case 1: int x; //error: label plus declaration
+case 2: { int x; } //ok: label plus compound statement
+
+As a footnote, since modern C allows to intermix declarations and statements you can also write:
+case 1:; int x; //ok: label plus empty statement.
+
+because an isolated ; is an empty statement, it can be used to satisfy the grammar whereever a no-op statement is needed.
+Whether to use a ; or a { ... } is a matter of readability. In the end: example I'd use a ;, but in the case: I prefer the  {...}.
+while (...)
+{
+    //...
+    goto end;
+    end:;   //ok, empty statement   
+}
+
+switch (...)
+{
+    case 1: //ok, compound statement
+    {
+        int x;
+    }
+}
+
+Of course more creative solutions can be written, such as:
+case 1: {} int x; //ok, label plus empty compound statementC Rules About Case Labels
+The rules of the C standard that prevent a declaration from following a case label are:
+
+A case label must be followed by a statement (C 2011 [N1570] 6.8.1).
+The C standard defines a statement as one of labeled-statement, compound-statement, expression-statement, selection-statement, iteration-statement, or jump-statement (6.8).  None of these is a declaration.
+
+The C standard treats declarations and statements separately. The rule that allows declarations to be largely mingled with statements is that a compound-statement is a list of block-items in braces (that is, { block-item-listopt }) (6.8.2), and a block-item is defined as a declaration or a statement. So, inside braces, you can mix declarations and statements. But a case label must be part of a statement; it is not a separate thing you can insert anywhere.
+Declarations can be included inside a switch using two alternatives. One is to use an empty statement after the case label, as in:
+case 123:
+    ;
+    int foo;
+    …
+
+Another is to use a compound statement after the case label, as in:
+case 123:
+{
+    int foo;
+    …
+}
+
+Generally, the latter is preferable, because the scope of foo is limited to the compound statement, so it cannot be used accidentally in another section of the switch statement.
+Reasons For the Rules
+I do not see a reason for this other than history. Originally, declarations were even more restricted than they are now. Inside functions, declarations had to be the first statements inside braces. You could not put a declaration after any statement. That has been relaxed in modern C, but why is there still a restriction on what follows a case label?
+There cannot be a semantic reason that a declaration cannot follow a case label in modern C, because the empty-statement example above would have the same semantics as:
+case 123:
+    int foo;
+
+That is, the compiler would have to be prepared to create and initialize a new object at the same point in execution. Since it has to do that for the legal example code, it would be able to do it for this version too.
+I also do not see a syntactic or grammatical barrier. The colon after the constant expression of a case label is pretty distinct. (The constant expression can have colons in it from ? : operators, but the first : not associated with a ? will be the end of the case label.) Once parsing reaches that colon, the current parsing state seems clean. I do not see why it could not recognize either a declaration or a statement there, just as it was prepared to do before the case.
+(If somebody can find a problem in the grammar that would be caused by allowing a case label to be followed by a declaration, that would be interesting.)First to say, the error you post is a syntax error related to the format of a case label statement.  It allows you to use only an executable statement, and not a declaration.  Put an empty statement before the declaration and you'll be ok.  Try the following:
+#include <stdio.h>
+int main()
+{
+    switch(3) {
+        int x = 3;  /* the initializer is ignored by the compiler
+                     * you can include declarations here, but as
+                     * this code is never executed, the initializer
+                     * never takes place. */
+    case 3:; /* <=== look this semicolon to allow the next declaration */
+        int y = 5;
+        printf("x = %d, y = %d\n", x, y);
+        break;
+    }
+}
+
+The first variable, x, will be declared properly, but the initializer will not be executed, as the case statement selected is the one corresponding to case label 3.  The printf will print
+x = 0, y = 5
+
+(note: this happens on my machine, as the variable x is not initialized, Undefined Behaviour is expected)
+In C, some evolution has been realized over the years, concerning the use of declarations in a block.
+In ancient C, variables can be declared only at the beginning of a block (the piece of code between { and }, but this approach has been thrown for the new possibility of declaring a variable whenever you need it (even after some executable sentences after a block begin)  But a case statement permits only to put an executable statement, and not a declaration, so that's the reason of your compiler error.
+If you follow the ancient C way, you can only declare new local variables only after the opening { curly brace after the switch, as in:
+switch(something) {
+    int var1;
+case BLA_BLA:
+    /* use var1 here */
+
+which, although counterintuitive, is valid since the old K&R code.  The problem with this approach is that the variable is valid from the point of definition until the end of the switch statement, and so, it is global to all the case parts.
+Another way, is the form you propose, in which you declare a new block by opening curly braces.  This works also since the old K&R code, and makes it easier to control the scope of the variables defined.  Personally, I prefer this second approach.  A block is an executable statement, so there's no problem in using it as the labeled case statement of the switch (the declarations happen inside it).
+Case labels don't delimit blocks of code, they label executable statements, so their syntax is specific to the case statement syntax (which finishes after the semicolon of the statement it is attached to, or the closing curly br)Including basics library of C (unistd.h) on windowI've been programming at my school on a Mac for one month. We did C programming on an UNIX shell. 
+Now i'm back at home and I use my own PC that is on window 10. I have tried to make a similar set up, but i don't know much about all that. I installed git and bash, this made it like a UNIX shell. Also I have installed the gcc compiler.
+So, now that i'm making a basic program, it should be working but when I make the include <unistd.h>, the shell can't find it.
+I know my question is probably silly but I really couldn't find how to solve the problem. I downloaded the unistd.h file.
+I also found this http://processors.wiki.ti.com/index.php/Compiler/diagnostic_messages/5
+It explain that i should be putting the .h folder in some kind of defined path, but I don't know how to do that.
+Does anyone know how I can fix this?If you installed gcc as part of mingw or something similar, it should have included a unistd.h.  Just having the gcc compiler is not likely to get you very far.
+You probably want to start over and install something different than you did (mingw or cygwin or just set up a vm as suggested) that provides a more complete environment.What happened about inet_ntoa? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Weird printf behaviour with inet_ntoa
+
+                                (2 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+Let me be puzzled,the example with A different result.Is it somewhere wrong with me.
+#include <stdio.h>
+#include <string.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+
+int main(){
+    struct sockaddr_in src;
+    struct sockaddr_in dest;
+
+    memset(&src, 0, sizeof(src));
+    src.sin_addr.s_addr = 0xEBAE277D;
+
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_addr.s_addr = 0x6700A8C0;
+
+    printf("saddr:%s\n", inet_ntoa(src.sin_addr));
+    printf("daddr:%s\n", inet_ntoa(dest.sin_addr));
+    printf("src:%15s------->dest:%15s\n", inet_ntoa(src.sin_addr), inet_ntoa(dest.sin_addr));
+}
+
+the result:
+saddr:125.39.174.235
+daddr:192.168.0.103
+src: 125.39.174.235------->dest: 125.39.174.235The documentation for inet_ntoa says:
+
+The inet_ntoa() function converts the Internet host address in, given in network byte order, to a string in IPv4 dotted-decimal notation. The string is returned in a statically allocated buffer, which subsequent calls will overwrite.
+
+(That's from the Linux man page; others have different wording but the warning about the static buffer should be in there somewhere)
+So you called inet_ntoa once, the buffer was filled, and a pointer to it was returned. You called it again, the buffer was overwritten, and a pointer to it was returned again. You passed both of those pointers to printf, and it printed the buffer contents twice.
+To do this properly, you need to copy the first inet_ntoa result into your own local buffer before calling it again, or just use 2 printfs.
+Or you can use inet_ntop instead, which requires you to provide the output buffer yourself. (Caller-provided output buffers are more common in newer interfaces; static output buffers seem easy at first but in the long run cause accidents like the one in your code.)Reading all .txt files from a folder?I am trying to read all .txt files which is in the directory named "dataset". All text files has name like 1.txt, 2.txt, 3.txt... And then saving the contents of the files to a structure named FILES.
+I used the dirent.h library and readdir( ) function as I saw in some sources. But the file name which program read from directory does not return correctly. Here is my related code:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+
+typedef struct FILES{
+    char **words;
+    int wordCount;
+}FILES;
+
+void readFiles();
+
+FILES *files;
+int fileCount;
+
+int main(){
+    readFiles();
+
+    return 0;
+}
+
+void readFiles(){
+    FILE *file;
+    DIR *directory;
+    struct dirent *filesInDirectory;
+    int counter;
+
+    fileCount = 1;
+    files = (FILES *)malloc(sizeof(FILES));
+    directory = opendir("dataset");
+    if(directory == NULL){
+        printf("Warning: The directory name that is given in the code is not 
+valid ..!");
+        return;
+    }else{
+        while((filesInDirectory = readdir(directory)) != NULL){
+            printf("%s\n", filesInDirectory->d_name);
+            file = fopen(filesInDirectory->d_name, "r+");
+            if(file == NULL){
+                printf("Warning: The file named %s could not open ..!", 
+filesInDirectory->d_name);
+                return;
+            }
+            files[fileCount-1].wordCount = 1;
+            files[fileCount-1].words = (char **)malloc(files[fileCount-
+1].wordCount * sizeof(char *));
+            counter = 0;
+
+            while(!feof(file)){
+                files[fileCount-1].words[counter] = (char *)malloc(20 * 
+sizeof(char));
+                fscanf(file, "%s", files[fileCount-1].words[counter]);
+                files[fileCount-1].wordCount++;
+                files[fileCount-1].words = (char **)realloc(files[fileCount-
+1].words, files[fileCount-1].wordCount * sizeof(char *));
+                counter++;
+            }
+            fileCount++;            
+            fclose(file);
+        }
+    }
+
+}
+
+The file name that I printed in here "printf("%s\n", filesInDirectory->d_name);" is ".". Where am I doing wrong?THIS IS NOT AN ANSWER BUT TOO BIG FOR A COMMENT
+Here are your problems:
+1.
+ files = (FILES *)malloc(sizeof(FILES));
+
+This is enough size of one FILES. This is will not be enough
+
+After 
+while((filesInDirectory = readdir(directory)) != NULL){
+
+
+Put something like
+size_t len = strlen(filesInDirectory->d_name);
+if (len < 5 || strcmp(filesInDirectory->d_name + len - 4, ".txt") != 0) {
+  continue;
+}
+
+This will check to ensure files end in .txt
+
+Consider using fstat to ensure that the file is a text file
+Remove the casts on malloc
+Perhaps use realloc for files
+while ... feof is bad - see link above
+fscanf(file, "%s", - Buffer overruns is possible. Do something about this. Read the manual pagePrint with junk values,cI'm having a problem and I can not figure out why.
+In main I create 2 arrays of strings.
+The function accepts 2 strings and creates a new array of the appropriate size according to the following requirement:
+For example:
+Array 1: aviv ,
+Array 2: 12 ,
+The new array: a12v12i12v
+The new array must be exactly the size!
+And then send the new array to main and main to print it.
+I also print junk values.
+I checked the size of the new array and it is the right size.
+My code:
+ char* CreateString(char* str1, char* str2)
+    {
+        int length1, length2, length3 = 0;
+        int i,j, index_help = 0;
+        char *str3 = NULL;
+        length1 = strlen(str1);
+        length2 = strlen(str2);
+        for (i = 0; i < length1; i++) // Check the size of the new array
+
+        {
+            length3++;
+            if (i == (length1 - 1))
+            {
+                break;
+            }
+            for (j = 0; j < length2; j++)
+            {
+                length3++;
+            }
+        }
+        str3 = (char*)malloc(length3+1  * sizeof(char));
+        if (str3 == NULL)
+        {
+            printf("There is not enough memory space\n");
+            return 0;
+        }
+        for (i = 0; i < length1; i++) //Copying data
+
+        {
+
+            str3[index_help] = str1[i];
+            if (i == (length1 - 1))
+            {
+                break;
+            }
+            for (j = 0; j < length2; j++) 
+            {
+                index_help++;
+                str3[index_help] = str2[j];
+            }
+            index_help++;
+
+        }
+        return str3;
+    }
+
+    int main()
+    {
+        char *str1 = NULL, *str2 = NULL,*str4=NULL;
+        int size1, size2,i;
+        printf("enter the size of string number 1:\n");
+        scanf("%d", &size1);
+        printf("enter the size of string number2 :\n");
+        scanf("%d", &size2);
+        str1 = (char*)malloc((size1 + 1) * sizeof(char));
+        if (str1 == NULL)
+        {
+            printf("There is not enough memory space\n");
+            return 0;
+        }
+        str2 = (char*)malloc((size2 + 1) * sizeof(char));
+        if (str2 == NULL)
+        {
+            printf("There is not enough memory space\n");
+            return 0;
+        }
+        printf("Enter a value for the first string (the size is:%d):\n", size1);
+        scanf("%s", str1);
+        printf("Enter a value for the second string (the size is:%d):\n", size2);
+        scanf("%s", str2);
+        str4 = CreateString(str1, str2);
+printf("%s",str4);
+        printf("\n");
+        return 0;
+    }The function should be declared like
+ char* CreateString( const char* str1, const char* str2);
+
+because neither string str1 nor string str2 are changed in the function.
+You have to append the result string with a terminating zero.
+The length of the resulted string can be calculated simpler without using loops.
+As the function strlen has the return type size_t then variables that accept the result of a function call should be also declared as having the type size_t instead of the type int.
+The function can be implemented the following way as it is shown in the demonstrative program.
+#include <stdio.h>
+#include <string.h>
+
+char * CreateString(const char *s1, const char *s2)
+{
+    size_t n1 = strlen(s1);
+    size_t n2 = strlen(s2);
+
+    size_t n3 = n1 == 0 ? 0 : n1 + (n1 - 1) * n2;
+
+    char *s3 = ( char * )malloc(n3 + 1);
+
+    if (s3)
+    {
+        if (n2 == 0)
+        {
+            strcpy(s3, s1);
+        }
+        else
+        {
+            char *p = s3;
+
+            while (*s1)
+            {
+                *p++ = *s1++;
+                if (*s1)
+                {
+                    strcpy(p, s2);
+                    p += n2;
+                }
+            }
+
+            *p = '\0';
+        }
+    }
+
+    return s3;
+}
+
+int main( void )
+{
+    char *p = CreateString("aviv", "12");
+
+    printf("\"%s\"\n", p);
+
+    free(p);
+
+    p = CreateString("", "12");
+
+    printf("\"%s\"\n", p);
+
+    free(p);
+
+    p = CreateString("a", "12");
+
+    printf("\"%s\"\n", p);
+
+    free(p);
+
+    p = CreateString("av", "12");
+
+    printf("\"%s\"\n", p);
+
+    free(p);
+
+    p = CreateString("av", "");
+
+    printf("\"%s\"\n", p);
+
+    free(p);
+
+    return 0;
+}
+
+The program output is
+"a12v12i12v"
+""
+"a"
+"a12v"
+"av"Shape modification of sine signal in C using only integer mathI want to generate a sine signal on an ARM Cortex M0 microcontroller that is customizable concerning its shape by a shape parameter n. Have a look at the plot below as an example. Here I modelled the different curves with the function
+$y(x) = (1/2*(1 + sin(x)))^n$
+
+
+For a higher n, the maxima are "shorter" and the minima are "wider". For a lower n, the maxima are "wider" and the minima are "shorter".
+In order to reduce memory consumption and increase performance, I only use integer math to generate the sine signal.
+Here's the code for the sine calculation:
+Input range [0R 2πR] mapped to [0 to 1024].
+
+Output range [-1.0 1.0] mapped to [-16,384 16,384].
+int_fast16_t sin_bam(int angle_bam) {
+  angle_bam %= 1024;
+  if (angle_bam < 0)
+    angle_bam += 1024;
+  uint_fast16_t sub_angle = angle_bam % (1024u / 2);
+  int_fast16_t sn = unsigned_mult16x16_into_32(sub_angle, (1024/2 - sub_angle)) / 4;
+  if (angle_bam & 512) {
+    sn = -sn;
+  }
+  return sn;
+}
+
+Does anyone have an idea how to realize such a shape modification only with integer math?How about this:
+/*
+ * Generate integers to drive an n-bit D/A to make a modified sine wave.
+ *
+ * y = (1/2 * (1 + sin(theta))) ^ q
+ *
+ * y and q are 16-bit fixed-point numbers:
+ *
+ * 1000.000000000000 -> -8.000000000000
+ *      ...
+ * 1111.111111111110 -> -0.000488281250
+ * 1111.111111111111 -> -0.000244140625
+ * 0000.000000000000 ->  0.000000000000
+ * 0000.000000000001 ->  0.000244140625
+ * 0000.000000000010 ->  0.000488281250
+ *      ...
+ * 0111.111111111111 ->  7.999755859375
+ *
+ * theta is an 8-bit integer where
+ *  0x00 -> 0
+ *  0xff -> pi
+ */
+#include <iostream>
+#include <string>
+using namespace std;
+#include <sys/types.h>
+#include <stdlib.h>
+#include <math.h>
+
+string
+fp2str( uint16_t n )
+{
+    char     buf[64];
+    bool     neg = ((n & 0x8000) != 0);
+
+    if (neg) {
+        n = ~n + 1;
+        buf[0] = '-';
+    }
+
+    sprintf( buf + 1, "%14.12f", double(n) / double(0x1000) );
+
+    return neg ? buf : buf + 1;
+}
+
+uint16_t fpsin( uint16_t theta ) {  // 0 < theta < 1024 ==> 0 to 2pi
+    static uint16_t sintbl[256] = {
+        0x0000,0x0019,0x0032,0x004c,0x0065,0x007e,0x0097,0x00b1,0x00ca,0x00e3,0x00fc,0x0115,0x012e,0x0148,0x0161,0x017a,
+        0x0193,0x01ac,0x01c5,0x01de,0x01f7,0x0210,0x0229,0x0242,0x025b,0x0274,0x028d,0x02a6,0x02bf,0x02d8,0x02f1,0x0309,
+        0x0322,0x033b,0x0354,0x036c,0x0385,0x039d,0x03b6,0x03cf,0x03e7,0x0400,0x0418,0x0430,0x0449,0x0461,0x0479,0x0491,
+        0x04aa,0x04c2,0x04da,0x04f2,0x050a,0x0522,0x053a,0x0551,0x0569,0x0581,0x0598,0x05b0,0x05c8,0x05df,0x05f7,0x060e,
+        0x0625,0x063d,0x0654,0x066b,0x0682,0x0699,0x06b0,0x06c7,0x06de,0x06f4,0x070b,0x0722,0x0738,0x074f,0x0765,0x077c,
+        0x0792,0x07a8,0x07be,0x07d4,0x07ea,0x0800,0x0816,0x082c,0x0841,0x0857,0x086c,0x0882,0x0897,0x08ac,0x08c1,0x08d6,
+        0x08eb,0x0900,0x0915,0x092a,0x093f,0x0953,0x0968,0x097c,0x0990,0x09a4,0x09b8,0x09cc,0x09e0,0x09f4,0x0a08,0x0a1b,
+        0x0a2f,0x0a42,0x0a56,0x0a69,0x0a7c,0x0a8f,0x0aa2,0x0ab5,0x0ac7,0x0ada,0x0aed,0x0aff,0x0b11,0x0b23,0x0b35,0x0b47,
+        0x0b59,0x0b6b,0x0b7d,0x0b8e,0x0b9f,0x0bb1,0x0bc2,0x0bd3,0x0be4,0x0bf5,0x0c05,0x0c16,0x0c27,0x0c37,0x0c47,0x0c57,
+        0x0c67,0x0c77,0x0c87,0x0c97,0x0ca6,0x0cb5,0x0cc5,0x0cd4,0x0ce3,0x0cf2,0x0d01,0x0d0f,0x0d1e,0x0d2c,0x0d3a,0x0d48,
+        0x0d56,0x0d64,0x0d72,0x0d80,0x0d8d,0x0d9a,0x0da8,0x0db5,0x0dc2,0x0dcf,0x0ddb,0x0de8,0x0df4,0x0e00,0x0e0d,0x0e19,
+        0x0e24,0x0e30,0x0e3c,0x0e47,0x0e53,0x0e5e,0x0e69,0x0e74,0x0e7e,0x0e89,0x0e94,0x0e9e,0x0ea8,0x0eb2,0x0ebc,0x0ec6,
+        0x0ecf,0x0ed9,0x0ee2,0x0eeb,0x0ef4,0x0efd,0x0f06,0x0f0f,0x0f17,0x0f1f,0x0f28,0x0f30,0x0f38,0x0f3f,0x0f47,0x0f4e,
+        0x0f56,0x0f5d,0x0f64,0x0f6a,0x0f71,0x0f78,0x0f7e,0x0f84,0x0f8a,0x0f90,0x0f96,0x0f9c,0x0fa1,0x0fa6,0x0fac,0x0fb1,
+        0x0fb6,0x0fba,0x0fbf,0x0fc3,0x0fc7,0x0fcc,0x0fd0,0x0fd3,0x0fd7,0x0fda,0x0fde,0x0fe1,0x0fe4,0x0fe7,0x0fea,0x0fec,
+        0x0fef,0x0ff1,0x0ff3,0x0ff5,0x0ff7,0x0ff8,0x0ffa,0x0ffb,0x0ffc,0x0ffd,0x0ffe,0x0fff,0x0fff,0x1000,0x1000,0x1000
+    } ;
+
+    uint16_t val;
+
+    theta &= 0x3ff;
+
+    if (theta < 0x100)
+        val = sintbl[theta];
+    else
+    if (theta < 0x200)
+        val = sintbl [0x200 - theta - 1];
+    else
+    if (theta < 0x300)
+        val = (~sintbl[theta - 0x200] + 1); // negate
+    else
+        val = (~sintbl[0x400 - theta -1] + 1);  // negate
+
+    return val;
+}
+
+
+/*
+ * Natural-log table.  Smallest value is ln(2/4096) -> -7.624618986159398403
+ * (values smaller than 2/4096 have logs less than -8, which smaller than we
+ * can represent in our fixed-point format).  Largest is 2.0776, which is ln(8)
+ */
+int16_t fplog( int16_t n )
+{
+    static uint16_t lntbl[512] = {
+        /*0.00048828*/ 0x8602,0xbdf3,0xc8cc,0xcf34,0xd3c3,0xd74f,0xda36,0xdcaa,0xdecb,0xe0ab,0xe259,0xe3df,0xe542,0xe689,0xe7b8,0xe8d2,
+        /*0.25048828*/ 0xe9da,0xead2,0xebbb,0xec98,0xed6a,0xee32,0xeef0,0xefa6,0xf054,0xf0fb,0xf19b,0xf236,0xf2ca,0xf35a,0xf3e5,0xf46b,
+        /*0.50048828*/ 0xf4ed,0xf56b,0xf5e5,0xf65c,0xf6cf,0xf73f,0xf7ac,0xf816,0xf87e,0xf8e3,0xf946,0xf9a6,0xfa04,0xfa60,0xfaba,0xfb12,
+        /*0.75048828*/ 0xfb68,0xfbbd,0xfc0f,0xfc60,0xfcb0,0xfcfe,0xfd4a,0xfd96,0xfddf,0xfe28,0xfe6f,0xfeb5,0xfefa,0xff3d,0xff80,0xffc2,
+        /*1.00048828*/ 0x0002,0x0041,0x0080,0x00be,0x00fa,0x0136,0x0171,0x01ab,0x01e4,0x021d,0x0254,0x028b,0x02c2,0x02f7,0x032c,0x0360,
+        /*1.25048828*/ 0x0394,0x03c6,0x03f9,0x042a,0x045b,0x048c,0x04bc,0x04eb,0x051a,0x0548,0x0576,0x05a3,0x05d0,0x05fc,0x0628,0x0653,
+        /*1.50048828*/ 0x067e,0x06a9,0x06d3,0x06fc,0x0725,0x074e,0x0776,0x079e,0x07c6,0x07ed,0x0814,0x083a,0x0860,0x0886,0x08ac,0x08d1,
+        /*1.75048828*/ 0x08f5,0x091a,0x093e,0x0962,0x0985,0x09a8,0x09cb,0x09ee,0x0a10,0x0a32,0x0a54,0x0a75,0x0a96,0x0ab7,0x0ad8,0x0af8,
+        /*2.00048828*/ 0x0b18,0x0b38,0x0b58,0x0b77,0x0b96,0x0bb5,0x0bd4,0x0bf2,0x0c10,0x0c2e,0x0c4c,0x0c6a,0x0c87,0x0ca4,0x0cc1,0x0cde,
+        /*2.25048828*/ 0x0cfa,0x0d17,0x0d33,0x0d4f,0x0d6b,0x0d86,0x0da2,0x0dbd,0x0dd8,0x0df3,0x0e0d,0x0e28,0x0e42,0x0e5c,0x0e76,0x0e90,
+        /*2.50048828*/ 0x0eaa,0x0ec3,0x0edd,0x0ef6,0x0f0f,0x0f28,0x0f41,0x0f59,0x0f72,0x0f8a,0x0fa2,0x0fba,0x0fd2,0x0fea,0x1001,0x1019,
+        /*2.75048828*/ 0x1030,0x1047,0x105f,0x1075,0x108c,0x10a3,0x10ba,0x10d0,0x10e6,0x10fc,0x1113,0x1129,0x113e,0x1154,0x116a,0x117f,
+        /*3.00048828*/ 0x1195,0x11aa,0x11bf,0x11d4,0x11e9,0x11fe,0x1213,0x1227,0x123c,0x1250,0x1265,0x1279,0x128d,0x12a1,0x12b5,0x12c9,
+        /*3.25048828*/ 0x12dc,0x12f0,0x1304,0x1317,0x132a,0x133e,0x1351,0x1364,0x1377,0x138a,0x139d,0x13af,0x13c2,0x13d5,0x13e7,0x13fa,
+        /*3.50048828*/ 0x140c,0x141e,0x1430,0x1442,0x1454,0x1466,0x1478,0x148a,0x149c,0x14ad,0x14bf,0x14d0,0x14e2,0x14f3,0x1504,0x1515,
+        /*3.75048828*/ 0x1526,0x1537,0x1548,0x1559,0x156a,0x157b,0x158c,0x159c,0x15ad,0x15bd,0x15ce,0x15de,0x15ee,0x15fe,0x160f,0x161f,
+        /*4.00048828*/ 0x162f,0x163f,0x164f,0x165e,0x166e,0x167e,0x168e,0x169d,0x16ad,0x16bc,0x16cc,0x16db,0x16ea,0x16fa,0x1709,0x1718,
+        /*4.25048828*/ 0x1727,0x1736,0x1745,0x1754,0x1763,0x1772,0x1780,0x178f,0x179e,0x17ac,0x17bb,0x17c9,0x17d8,0x17e6,0x17f5,0x1803,
+        /*4.50048828*/ 0x1811,0x181f,0x182d,0x183c,0x184a,0x1858,0x1866,0x1873,0x1881,0x188f,0x189d,0x18ab,0x18b8,0x18c6,0x18d4,0x18e1,
+        /*4.75048828*/ 0x18ef,0x18fc,0x1909,0x1917,0x1924,0x1931,0x193f,0x194c,0x1959,0x1966,0x1973,0x1980,0x198d,0x199a,0x19a7,0x19b4,
+        /*5.00048828*/ 0x19c1,0x19cd,0x19da,0x19e7,0x19f4,0x1a00,0x1a0d,0x1a19,0x1a26,0x1a32,0x1a3f,0x1a4b,0x1a57,0x1a64,0x1a70,0x1a7c,
+        /*5.25048828*/ 0x1a88,0x1a95,0x1aa1,0x1aad,0x1ab9,0x1ac5,0x1ad1,0x1add,0x1ae9,0x1af5,0x1b01,0x1b0c,0x1b18,0x1b24,0x1b30,0x1b3b,
+        /*5.50048828*/ 0x1b47,0x1b53,0x1b5e,0x1b6a,0x1b75,0x1b81,0x1b8c,0x1b98,0x1ba3,0x1bae,0x1bba,0x1bc5,0x1bd0,0x1bdc,0x1be7,0x1bf2,
+        /*5.75048828*/ 0x1bfd,0x1c08,0x1c13,0x1c1e,0x1c29,0x1c34,0x1c3f,0x1c4a,0x1c55,0x1c60,0x1c6b,0x1c76,0x1c80,0x1c8b,0x1c96,0x1ca1,
+        /*6.00048828*/ 0x1cab,0x1cb6,0x1cc1,0x1ccb,0x1cd6,0x1ce0,0x1ceb,0x1cf5,0x1d00,0x1d0a,0x1d15,0x1d1f,0x1d29,0x1d34,0x1d3e,0x1d48,
+        /*6.25048828*/ 0x1d53,0x1d5d,0x1d67,0x1d71,0x1d7b,0x1d85,0x1d90,0x1d9a,0x1da4,0x1dae,0x1db8,0x1dc2,0x1dcc,0x1dd6,0x1ddf,0x1de9,
+        /*6.50048828*/ 0x1df3,0x1dfd,0x1e07,0x1e11,0x1e1a,0x1e24,0x1e2e,0x1e38,0x1e41,0x1e4b,0x1e54,0x1e5e,0x1e68,0x1e71,0x1e7b,0x1e84,
+        /*6.75048828*/ 0x1e8e,0x1e97,0x1ea1,0x1eaa,0x1eb4,0x1ebd,0x1ec6,0x1ed0,0x1ed9,0x1ee2,0x1eec,0x1ef5,0x1efe,0x1f07,0x1f10,0x1f1a,
+        /*7.00048828*/ 0x1f23,0x1f2c,0x1f35,0x1f3e,0x1f47,0x1f50,0x1f59,0x1f62,0x1f6b,0x1f74,0x1f7d,0x1f86,0x1f8f,0x1f98,0x1fa1,0x1faa,
+        /*7.25048828*/ 0x1fb2,0x1fbb,0x1fc4,0x1fcd,0x1fd6,0x1fde,0x1fe7,0x1ff0,0x1ff8,0x2001,0x200a,0x2012,0x201b,0x2024,0x202c,0x2035,
+        /*7.50048828*/ 0x203d,0x2046,0x204e,0x2057,0x205f,0x2068,0x2070,0x2079,0x2081,0x2089,0x2092,0x209a,0x20a2,0x20ab,0x20b3,0x20bb,
+        /*7.75048828*/ 0x20c4,0x20cc,0x20d4,0x20dc,0x20e5,0x20ed,0x20f5,0x20fd,0x2105,0x210d,0x2115,0x211d,0x2126,0x212e,0x2136,0x213e
+    } ;
+
+    return (n >= 0x0002) ? lntbl[ (n - 2) >> 6 ] : 0x8000;
+}
+
+/*
+ * Exponential table -- from -8.0 to 2.xxx.  Layout is tricky.
+ */
+int16_t fpexp( int16_t n ) {
+    static int16_t pos_exp[] = {
+        /*0000*/ 0x1000,0x1041,0x1082,0x10c5,0x1108,0x114d,0x1193,0x11d9,0x1221,0x126a,0x12b5,0x1300,0x134d,0x139b,0x13ea,0x143a,
+        /*0400*/ 0x148b,0x14de,0x1532,0x1588,0x15df,0x1637,0x1690,0x16eb,0x1748,0x17a5,0x1805,0x1866,0x18c8,0x192c,0x1991,0x19f8,
+        /*0800*/ 0x1a61,0x1acc,0x1b38,0x1ba5,0x1c15,0x1c86,0x1cf9,0x1d6e,0x1de4,0x1e5d,0x1ed7,0x1f54,0x1fd2,0x2052,0x20d4,0x2159,
+        /*0c00*/ 0x21df,0x2268,0x22f2,0x237f,0x240e,0x24a0,0x2533,0x25c9,0x2662,0x26fd,0x279a,0x2839,0x28dc,0x2980,0x2a28,0x2ad1,
+        /*1000*/ 0x2b7e,0x2c2d,0x2ce0,0x2d94,0x2e4c,0x2f07,0x2fc4,0x3085,0x3149,0x320f,0x32d9,0x33a6,0x3476,0x354a,0x3621,0x36fb,
+        /*1400*/ 0x37d8,0x38ba,0x399e,0x3a87,0x3b72,0x3c62,0x3d56,0x3e4d,0x3f48,0x4047,0x414a,0x4251,0x435d,0x446c,0x4580,0x4698,
+        /*1800*/ 0x47b5,0x48d6,0x49fc,0x4b26,0x4c55,0x4d89,0x4ec1,0x4fff,0x5141,0x5289,0x53d6,0x5527,0x567f,0x57db,0x593e,0x5aa5,
+        /*1c00*/ 0x5c13,0x5d86,0x5eff,0x607e,0x6203,0x638e,0x6520,0x66b7,0x6855,0x69fa,0x6ba5,0x6d57,0x6f10,0x70d0,0x7296,0x7464
+    } ;
+    static int16_t neg_exp[] = {
+        /*8000*/ 0x0001,0x0001,0x0001,0x0001,0x0001,0x0001,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,
+        /*8400*/ 0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,
+        /*8800*/ 0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0002,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,
+        /*8c00*/ 0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0003,0x0004,0x0004,0x0004,0x0004,
+        /*9000*/ 0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0004,0x0005,0x0005,0x0005,0x0005,
+        /*9400*/ 0x0005,0x0005,0x0005,0x0005,0x0005,0x0005,0x0005,0x0005,0x0005,0x0006,0x0006,0x0006,0x0006,0x0006,0x0006,0x0006,
+        /*9800*/ 0x0006,0x0006,0x0006,0x0006,0x0007,0x0007,0x0007,0x0007,0x0007,0x0007,0x0007,0x0007,0x0007,0x0008,0x0008,0x0008,
+        /*9c00*/ 0x0008,0x0008,0x0008,0x0008,0x0008,0x0009,0x0009,0x0009,0x0009,0x0009,0x0009,0x0009,0x000a,0x000a,0x000a,0x000a,
+        /*a000*/ 0x000a,0x000a,0x000a,0x000b,0x000b,0x000b,0x000b,0x000b,0x000c,0x000c,0x000c,0x000c,0x000c,0x000c,0x000d,0x000d,
+        /*a400*/ 0x000d,0x000d,0x000d,0x000e,0x000e,0x000e,0x000e,0x000f,0x000f,0x000f,0x000f,0x000f,0x0010,0x0010,0x0010,0x0010,
+        /*a800*/ 0x0011,0x0011,0x0011,0x0012,0x0012,0x0012,0x0012,0x0013,0x0013,0x0013,0x0014,0x0014,0x0014,0x0015,0x0015,0x0015,
+        /*ac00*/ 0x0015,0x0016,0x0016,0x0017,0x0017,0x0017,0x0018,0x0018,0x0018,0x0019,0x0019,0x001a,0x001a,0x001a,0x001b,0x001b,
+        /*b000*/ 0x001c,0x001c,0x001c,0x001d,0x001d,0x001e,0x001e,0x001f,0x001f,0x0020,0x0020,0x0021,0x0021,0x0022,0x0022,0x0023,
+        /*b400*/ 0x0023,0x0024,0x0025,0x0025,0x0026,0x0026,0x0027,0x0028,0x0028,0x0029,0x0029,0x002a,0x002b,0x002b,0x002c,0x002d,
+        /*b800*/ 0x002e,0x002e,0x002f,0x0030,0x0030,0x0031,0x0032,0x0033,0x0034,0x0034,0x0035,0x0036,0x0037,0x0038,0x0039,0x003a,
+        /*bc00*/ 0x003a,0x003b,0x003c,0x003d,0x003e,0x003f,0x0040,0x0041,0x0042,0x0043,0x0044,0x0045,0x0046,0x0048,0x0049,0x004a,
+        /*c000*/ 0x004b,0x004c,0x004d,0x004f,0x0050,0x0051,0x0052,0x0054,0x0055,0x0056,0x0058,0x0059,0x005a,0x005c,0x005d,0x005f,
+        /*c400*/ 0x0060,0x0062,0x0063,0x0065,0x0067,0x0068,0x006a,0x006b,0x006d,0x006f,0x0071,0x0072,0x0074,0x0076,0x0078,0x007a,
+        /*c800*/ 0x007c,0x007e,0x0080,0x0082,0x0084,0x0086,0x0088,0x008a,0x008c,0x008e,0x0091,0x0093,0x0095,0x0098,0x009a,0x009c,
+        /*cc00*/ 0x009f,0x00a1,0x00a4,0x00a6,0x00a9,0x00ac,0x00ae,0x00b1,0x00b4,0x00b7,0x00ba,0x00bd,0x00c0,0x00c3,0x00c6,0x00c9,
+        /*d000*/ 0x00cc,0x00cf,0x00d2,0x00d6,0x00d9,0x00dc,0x00e0,0x00e3,0x00e7,0x00eb,0x00ee,0x00f2,0x00f6,0x00fa,0x00fe,0x0102,
+        /*d400*/ 0x0106,0x010a,0x010e,0x0112,0x0117,0x011b,0x0120,0x0124,0x0129,0x012d,0x0132,0x0137,0x013c,0x0141,0x0146,0x014b,
+        /*d800*/ 0x0150,0x0156,0x015b,0x0160,0x0166,0x016c,0x0171,0x0177,0x017d,0x0183,0x0189,0x018f,0x0196,0x019c,0x01a2,0x01a9,
+        /*dc00*/ 0x01b0,0x01b7,0x01bd,0x01c4,0x01cc,0x01d3,0x01da,0x01e2,0x01e9,0x01f1,0x01f9,0x0201,0x0209,0x0211,0x0219,0x0222,
+        /*e000*/ 0x022a,0x0233,0x023c,0x0245,0x024e,0x0257,0x0261,0x026a,0x0274,0x027e,0x0288,0x0292,0x029d,0x02a7,0x02b2,0x02bd,
+        /*e400*/ 0x02c8,0x02d3,0x02de,0x02ea,0x02f6,0x0302,0x030e,0x031a,0x0327,0x0333,0x0340,0x034d,0x035b,0x0368,0x0376,0x0384,
+        /*e800*/ 0x0392,0x03a0,0x03af,0x03be,0x03cd,0x03dc,0x03ec,0x03fc,0x040c,0x041c,0x042d,0x043d,0x044e,0x0460,0x0471,0x0483,
+        /*ec00*/ 0x0496,0x04a8,0x04bb,0x04ce,0x04e1,0x04f5,0x0509,0x051d,0x0532,0x0547,0x055c,0x0572,0x0588,0x059e,0x05b4,0x05cb,
+        /*f000*/ 0x05e3,0x05fb,0x0613,0x062b,0x0644,0x065d,0x0677,0x0691,0x06ab,0x06c6,0x06e2,0x06fd,0x071a,0x0736,0x0753,0x0771,
+        /*f400*/ 0x078f,0x07ad,0x07cc,0x07ec,0x080c,0x082c,0x084d,0x086e,0x0890,0x08b3,0x08d6,0x08fa,0x091e,0x0943,0x0968,0x098e,
+        /*f800*/ 0x09b4,0x09db,0x0a03,0x0a2c,0x0a55,0x0a7e,0x0aa9,0x0ad3,0x0aff,0x0b2b,0x0b58,0x0b86,0x0bb5,0x0be4,0x0c14,0x0c45,
+        /*fc00*/ 0x0c76,0x0ca8,0x0cdb,0x0d0f,0x0d44,0x0d79,0x0daf,0x0de7,0x0e1f,0x0e58,0x0e91,0x0ecc,0x0f08,0x0f44,0x0f82,0x0fc0
+    } ;
+
+    if (n >= 0 && n < 0x2000) return pos_exp[n >> 6];
+
+    if (n < 0) return neg_exp[ (uint16_t(n) - 0x8000u) >> 6 ];
+
+    cerr << "can't compute exp( 0x" << hex << n << " " << fp2str( n ) << ")" << endl;
+
+    exit( 0 );
+}
+
+int
+main( int, char ** )
+{
+#ifdef TESTING
+    for (uint16_t a = 2; a < 0x7000; a += 0x0529) {
+        cout << "ln(" << fp2str(a) << " (0x" << hex << a << ")) = "
+             << fp2str( fplog( a ) ) << " ... " << log( double(a) / double(0x1000) ) << endl;
+    }
+
+    for (uint16_t a = 0; a < 0x2000; a += 0x0727) {
+        cout << "exp(" << fp2str(a) << " (0x" << hex << a << ")) = "
+             << fp2str( fpexp( a ) ) << " ... " << exp( double(a) / double(0x1000) ) << endl;
+    }
+
+    for (int16_t a = -1; a > -30000; a -= 0x0ab7) {
+        cout << "exp(" << fp2str(a) << " (0x" << hex << a << ")) = "
+             << fp2str( fpexp( a ) ) << " ... " << exp( double(a) / double(0x1000) ) << endl;
+    }
+
+    for (uint16_t a = 10; a < 0x7fff; a += 0x0ab7) {
+        cout << "exp( log(" << fp2str(a) << " (0x" << hex << a << "))) = "
+             << fp2str( fpexp( fplog( a ) ) ) << endl;
+    }
+#else
+
+    // Implementation of y = (1/2 * (1 + sin( x ))) ^ n is left as an exercise for the reader.
+    // Note that fplog() doesn't work on numbers smaller than 2/4096, and fpexp() doesn't work
+    // on numbers larger than about (2 - 1/4096)
+
+#endif
+
+    return 0;
+}
+
+I generated the lookup tables with this Perl script:
+#!/usr/bin/perl -w
+
+use Math::Trig ':pi';
+use POSIX;
+
+#
+# Fixed-point values have 12 fractional bits ... 2^12 => 4096
+#
+my $LSB = 1.0 / 4096.0;
+
+#
+# print sin table values
+#
+if (0) {
+    for ($i = 0; $i < 0x100; $i += 1) {
+        $s = sin( $i * pip2 / 255 );
+        printf( "0x%04x,", POSIX::floor( 0x1000 * $s + 0.5) );
+        print "\n" if (($i & 15) == 15);
+    }
+}
+
+#
+# print log table values
+#
+if (0) {
+    $x = $LSB * 2.0;
+    for ($n = 0; $n < 32000; ++$n) {
+        printf( "/*%10.8f*/ ", $x ) if (($n & 15) == 0);
+        printf( "0x%04x,", POSIX::floor( 0x1000 * log($x) + 0.5) & 0xffff );
+        print "\n" if (($n & 15) == 15);
+        $x += $LSB * 64.0;
+        last if ($x >= 8.0);
+    }
+}
+
+#
+# print exp table values -- this is tricky because we want all the negative
+# numbers (0xffff ~ 0x8000) but only positive numbers between 0x0000 and 0x2000.
+#
+if (1) {
+    for ($n = 0; $n < 0x2000; $n += 64) {
+        printf( "/*%04x*/ ", $n & 0xffff ) if ((($n >> 6) & 15) == 0);
+        # printf( "%8.5f,", $n / 4096.0 );
+        printf( "0x%04x,", POSIX::floor( exp( $n / 4096.0 ) * 0x1000 + 0.5 ) );
+        print "\n" if ((($n >> 6) & 15) == 15);
+    }
+    print "\n\n";
+    for ($n = -32768; $n < 0; $n += 64) {
+        printf( "/*%04x*/ ", $n & 0xffff ) if ((($n >> 6) & 15) == 0);
+        # printf( "%8.5f,", $n / 4096.0 );
+        printf( "0x%04x,", POSIX::floor( exp( $n / 4096 ) * 0x1000 + 0.5 ) );
+        print "\n" if ((($n >> 6) & 15) == 15);
+    }
+}
+
+The tricky bit will be moving and scaling the signal to a range where fplog() and fpexp() work reasonably well.  You'll do a 16x16->32 multiply to exponentiate, so I guess you'll take something like the upper 16 bits as your fixed-point number, which you feed to fpexp() to get the final output.Does anyone have an idea how to realize such a shape modification only with integer math?
+n could also have a range of 1 to 10 for example
+$y(x) = (1/2*(1 + sin(x)))^n$
+
+OP has a sine approximation function sin_bam() and then uses that to form 1/2*(1 + sin(x)) which is the hacovercosin(θ).  All that is left is a scale power function.
+#include <inttypes.h>
+#define SCALE 16384
+
+int pow_scale(int x, unsigned n) {
+  unsigned y = SCALE;
+  while (n>0) {
+    if (n%2) {
+      y = unsigned_mult16x16_into_32(x,y)/SCALE; // 16-bit x 16-bit --> 32-bit product.
+    }
+    n /= 2;
+    x = unsigned_mult16x16_into_32(x,x)/SCALE;
+  }
+  return x;
+}
+
+
+// x is the angle in 1024 BAM per period
+// output is scaled to range [0....SCALE]
+int shaped(int x, unsigned n) {
+  return pow_scale(SCALE/2 + sin_bam(x)/2), n);
+}What should be the output of the following and why it should depend on compiler?Please help me to understand the output.Here we know, we can't say that f1() is evaluated before f2() due to Left to Right associativity of '+' because associativity only happens when there are 2 or more than 2 operators of the same precedence.So what should be the concept used to determine the answer?
+// Associativity is not used in the below program.
+int x = 0; 
+int f1() {
+  x = 5;
+  return x;
+} 
+int f2() {
+  x = 10;
+  return x;
+}
+int main() {
+  int p = f1() + f2();
+  printf("%d ", x);
+  return 0;
+}These two function calls are indeterminately sequenced w.r.t. each other. C11 6.5.2.2p10:
+
+There is a sequence point after the evaluations of the function designator and the actual arguments but before the actual call. Every evaluation in the calling function (including other function calls) that is not otherwise specifically sequenced before or after the execution of the body of the called function is indeterminately sequenced with respect to the execution of the called function.
+
+And indeterminately sequenced means that C11 5.1.2.3p3
+
+Evaluations A and B are indeterminately sequenced when A is sequenced either before or after B, but it is unspecified which
+
+Therefore either f1 or f2 will be called first, and the execution of the functions would not be interleaved. You can tell it afterwards by checking the value of x - if it is 5 then f2 was called first; if 10, f1 was called first.
+The footnote 86 says also:
+
+In an expression that is evaluated more than once during the execution of a program, unsequenced and indeterminately sequenced evaluations of its subexpressions need not be performed consistently in different evaluations.
+
+I.e. if you did this in a loop, on first iteration f1 might be called first and on next f2 might be called first...
+
+The operator associativity and precedence have almost nothing at all to do with actual order of evaluation - the order of evaluation of operands of +, like almost all other operators, is unspecified - and unsequenced (C11 6.5p3).Because the standard doesn't impose any constraint in it.
+The section that says this is from 6.5
+
+The grouping of operators and operands is indicated by the syntax.85)
+  Except as specified later, side effects and value computations of
+  subexpressions are unsequenced.
+
+From standard itself 6.5.2.2 (Showing an example that standard doesn't impose any constraint)
+
+In the function call
+
+  (*pf[f1()]) (f2(), f3() + f4())
+
+
+the functions f1, f2, f3, and f4 may be called in any order. All side
+  effects have to be completed before the function pointed to by
+  pf[f1()] is called.
+
+The answer to your question would be unspecified. You can't say something for sure. If f1() is called first result would be something and if it is other way round then the result would be different.
+To support what I said check this link
+
+... In the expression f(i++) + g(j++) + h(k++), f is called with a
+  parameter of the original value of i, but i is incremented before
+  entering the body of f. Similarly, j and k are updated before
+  entering g and h respectively. However, it is not specified in
+  which order f(), g(), h() are executed, nor in which order i, j, k
+  are incremented. If the body of f accesses the variables j and k, it
+  might find both, neither, or just one of them to have been
+  incremented. (The function call f(a,b,c) is not a use of the comma
+  operator; the order of evaluation for a, b, and c is unspecified.)makefile error - Unity testing framework - Keil uvision 5 - STM32CubeMxI have been trying to integrate  Unity Testing Framework  into Keil version 5, naturally I faced a lot of issues and errors and was able to solve a lot of them, now I am facing an error that I would like to get your support with.
+ A brief summary: 
+This is my thesis project, which is Embedded software testing and the implementation teams are using Keil uvision 5 with code skeleton and configuration generated using STM32CubeMx for the development of a self-driving car project at my university.
+ The enviroment 
+OS: Windows 10
+IDE-Version:
+µVision V5.24.2.0
+Tool Version Numbers:
+Toolchain:        MDK-ARM Professional  Version: 5.24.1
+Toolchain Path:    C:\Keil_v5\ARM\ARMCC\Bin
+C Compiler:         Armcc.exe        V5.06 update 5 (build 528)
+Assembler:          Armasm.exe        V5.06 update 5 (build 528)
+Linker/Locator:     ArmLink.exe        V5.06 update 5 (build 528)
+Library Manager:    ArmAr.exe        V5.06 update 5 (build 528)
+Hex Converter:      FromElf.exe        V5.06 update 5 (build 528)
+CPU DLL:               SARMCM3.DLL          V5.24.1
+Dialog DLL:         DCM.DLL              V1.16.0.0
+Target DLL:             STLink\ST-LINKIII-KEIL_SWO.dll      V3.0.1.0
+Dialog DLL:         TCM.DLL              V1.32.0.0
+Practice board: STM32F446ZETx
+
+ The approach  
+I plan to integrate Unity FW by using a makefile to compile and run the tests in the pre-build option available withing Keil. for now I am trying to make the makefile work using commandline outside Keil, once it works, I believe it will easy to just run it with a make command from Keil pre-build option. I followed this tutorial to create the makefile http://www.throwtheswitch.org/build/make
+I edited the makefile by adding the appropriate armcc and armlinker with the commandline options that were present in the keil configuration of the project and the arm compiler alternatives for what the tutorial was adding to their gcc as you will see in the makefile below
+ The structure 
+The following is sample structure of a Blinky project using TIM10 timer created using STM32CubeMx and Unity FW is added manually to the folder
+--root
+----Drivers
+--------CMSIS --> "Drivers related files"
+--------STM32F4xx_HAL-Driver --> "Drivers related files"
+----Inc
+---------gpio.h
+---------main.h
+---------stm32f4xx_hal_config.h
+---------stm32f4xx_it.h
+---------tim.h
+----MDK-ARM
+---------"Other STM32 related folders and files"
+----Src
+---------gpio.c
+---------main.c
+---------stm32f4xx_hal_msp.c
+---------stm32f4xx_hal_config.c
+---------stm32f4xx_it.c
+---------tim.c
+----Unity
+---------build
+-------------depends --> "autogenerated by makefile"
+-------------objs --> "autogenerated by makefile"
+-------------results --> "autogenerated by makefile"
+-------------testing --> "autogenerated by makefile"
+-------------TIM10_LED_1_Ceedling_try1.map
+---------src
+-------------stm32f4xx_hal.h
+-------------unity_internals.h
+-------------unity.c
+-------------unity.h
+---------test
+-------------Testgpio.c
+--.mxproject
+--makefile
+--mx.scratch
+--TIM10_LED_1_Ceedling_try1.ioc
+
+ The makefile 
+ifeq ($(OS),Windows_NT)
+  ifeq ($(shell uname -s),) # not in a bash-like shell
+    CLEANUP = del /F /Q
+    MKDIR = mkdir
+  else # in a bash-like shell, like msys
+    CLEANUP = rm -f
+    MKDIR = mkdir -p
+  endif
+    TARGET_EXTENSION=exe
+else
+    CLEANUP = rm -f
+    MKDIR = mkdir -p
+    TARGET_EXTENSION=out
+endif
+
+.PHONY: clean
+.PHONY: test
+
+PATHU = Unity/src/
+PATHS = Src/
+PATHI = Unity/src/
+PATHI2 = Inc
+PATHI3 = Drivers/STM32F4xx_HAL_Driver/Inc
+PATHI4 = Drivers/STM32F4xx_HAL_Driver/Inc/Legacy
+PATHI5 = Drivers/CMSIS/Device/ST/STM32F4xx/Include
+PATHI6 = Drivers/CMSIS/Include
+PATHT = Unity/test/
+PATHB = Unity/build/testing/
+PATHD = Unity/build/depends/
+PATHO = Unity/build/objs/
+PATHR = Unity/build/results/
+
+BUILD_PATHS = $(PATHB) $(PATHD) $(PATHO) $(PATHR)
+
+SRCT = $(wildcard $(PATHT)*.c)
+
+COMPILE=armcc -c --cpu Cortex-M4.fp -D__MICROLIB -g -O3 --apcs=interwork --split_sections
+LINK=armlink --library_type=microlib --libpath="C:\Keil_v5\ARM\ARMCC\lib" --strict --scatter "MDK-ARM\TIM10_LED_1_Ceedling_try1\TIM10_LED_1_Ceedling_try1.sct" --diag_suppress=L6329 --summary_stderr --info summarysizes --map --xref --callgraph --symbols --info sizes --info totals --info unused --info veneers --list "TIM10_LED_1_Ceedling_try1.map" -o "MDK-ARM\TIM10_LED_1_Ceedling_try1\TIM10_LED_1_Ceedling_try1.axf"
+DEPEND=armcc --no_depend_system_headers --depend_dir=$(PATHD)
+CFLAGS=-I. -I$(PATHU) -I$(PATHS) -I$(PATHI) -I$(PATHI2) -I$(PATHI3) -I$(PATHI4) -I$(PATHI5) -I$(PATHI6)
+
+RESULTS = $(patsubst $(PATHT)Test%.c,$(PATHR)Test%.txt,$(SRCT) )
+
+PASSED = `grep -s PASS $(PATHR)*.txt`
+FAIL = `grep -s FAIL $(PATHR)*.txt`
+IGNORE = `grep -s IGNORE $(PATHR)*.txt`
+
+test: $(BUILD_PATHS) $(RESULTS)
+    @echo "-----------------------\nIGNORES:\n-----------------------"
+    @echo "$(IGNORE)"
+    @echo "-----------------------\nFAILURES:\n-----------------------"
+    @echo "$(FAIL)"
+    @echo "-----------------------\nPASSED:\n-----------------------"
+    @echo "$(PASSED)"
+    @echo "\nDONE"
+
+$(PATHR)%.txt: $(PATHB)%.$(TARGET_EXTENSION)
+    -./$< > $@ 2>&1
+
+$(PATHB)Test%.$(TARGET_EXTENSION): $(PATHO)Test%.o $(PATHO)%.o $(PATHU)unity.o $(PATHD)Test%.d
+    $(LINK) $@ $^
+
+$(PATHO)%.o:: $(PATHT)%.c
+    $(COMPILE) $(CFLAGS) $< -o $@
+
+$(PATHO)%.o:: $(PATHS)%.c
+    $(COMPILE) $(CFLAGS) $< -o $@
+
+$(PATHO)%.o:: $(PATHU)%.c $(PATHU)%.h
+    $(COMPILE) $(CFLAGS) $< -o $@
+
+$(PATHD)%.d:: $(PATHT)%.c
+    $(DEPEND) $@ $<
+
+$(PATHB):
+    $(MKDIR) $(PATHB)
+
+$(PATHD):
+    $(MKDIR) $(PATHD)
+
+$(PATHO):
+    $(MKDIR) $(PATHO)
+
+$(PATHR):
+    $(MKDIR) $(PATHR)
+
+clean:
+    $(CLEANUP) $(PATHO)*.o
+    $(CLEANUP) $(PATHB)*.$(TARGET_EXTENSION)
+    $(CLEANUP) $(PATHR)*.txt
+
+.PRECIOUS: $(PATHB)Test%.$(TARGET_EXTENSION)
+.PRECIOUS: $(PATHD)%.d
+.PRECIOUS: $(PATHO)%.o
+.PRECIOUS: $(PATHR)%.txt
+
+ The current output and error 
+$ makecc -I. -IUnity/src/ -ISrc/ -IUnity/src/ -IInc -IDrivers/STM32F4xx_HAL_Driver/Inc -IDrivers/STM32F4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32F4xx/Include -IDrivers/CMSIS/Include   -c -o Unity/src/unity.o Unity/src/unity.c
+armcc --no_depend_system_headers --depend_dir=Unity/build/depends/ Unity/build/depends/Testgpio.d Unity/test/Testgpio.c
+Error: C4065E: type of input file 'Unity/build/depends/Testgpio.d' unknown
+
+make: *** [makefile:74: Unity/build/depends/Testgpio.d] Error 1
+rm Unity/src/unity.o
+
+ UPDATE -- simple makefile to test dependency error 
+SRC = $(wildcard *.c)
+TAR = $(SRC:.c=.d)
+DEPEND=armcc --no_depend_system_headers
+
+all: $(TAR)
+
+%.d: %.c
+    $(DEPEND) $@ $<
+
+Unfortunately it returned armcc --no_depend_system_headers test.d test.c
+Error: C4065E: type of input file 'test.d' unknow
+but when changed the compiler and flags into 
+SRC = $(wildcard *.c)
+TAR = $(SRC:.c=.d)
+DEPEND=gcc -MM -MG -MF
+
+all: $(TAR)
+
+%.d: %.c
+    $(DEPEND) $@ $<
+
+it worked and test.d is created from test.c -- all files are in the same folder
+ Update 
+I have managed to get the armcc to work, after checking the docs I updated my makefile as follows:
+SRC = $(wildcard *.c)
+TAR = $(SRC:.c=.d)
+DEPEND=armcc --no_depend_system_headers --ignore_missing_headers --md --depend
+
+all: $(TAR)
+
+%.d: %.c
+    $(DEPEND) $@ $<
+
+with makefile and the source file in the same folder it works fine.
+Now, when returned to the main makefile and updated the DEPEND flags to the following
+armcc --no_depend_system_headers --ignore_missing_headers --md --depend
+It returned a different error, that has to do with armlink, I do not know how the process goes, what is fired first and which depends on the other, but the fact remains when I run make now it gives the following error:
+$ make
+cc -I. -IUnity/src/ -ISrc/ -IUnity/src/ -IInc -IDrivers/STM32F4xx_HAL_Driver/Inc -IDrivers/STM32F4xx_HAL_Driver/Inc/Legacy -IDrivers/CMSIS/Device/ST/STM32F4xx/Include -IDrivers/CMSIS/Include   -c -o Unity/src/unity.o Unity/src/unity.c
+armlink --library_type=microlib --libpath="C:\Keil_v5\ARM\ARMCC\lib" --strict --scatter "MDK-ARM\TIM10_LED_1_Ceedling_try1\TIM10_LED_1_Ceedling_try1.sct" --diag_suppress=L6329 --summary_stderr --info summarysizes --map --xref --callgraph --symbols --info sizes --info totals --info unused --info veneers --list "TIM10_LED_1_Ceedling_try1.map" -o "MDK-ARM\TIM10_LED_1_Ceedling_try1\TIM10_LED_1_Ceedling_try1.axf" Unity/build/testing/Testgpio.exe Unity/build/objs/Testgpio.o Unity/build/objs/gpio.o Unity/src/unity.o
+Fatal error: L6002U: Could not open file Unity/build/testing/Testgpio.exe: No such file or directory
+Finished: 0 information, 0 warning, 0 error and 1 fatal error messages.
+make: *** [makefile:62: Unity/build/testing/Testgpio.exe] Error 1
+rm Unity/src/unity.o
+
+I will continue working on it, but if someone can help please do
+ great Update! 
+The previous error is gone and I am starting to see actual progress !
+I commented out $(PATHD)Test%.d in the LINK step as it was commented out in the orignal file I got, when I included it, the error is gone and I am now facing syntax errors and warning from actual files :) please check below and advise
+$ make
+armcc --no_depend_system_headers --ignore_missing_headers --depend Unity/build/depends/Testgpio.d Unity/test/Testgpio.c
+"Unity/test/Testgpio.c", line 13: Warning:  #223-D: function "TEST_ASSERT_EQUAL" declared implicitly
+      TEST_ASSERT_EQUAL(2, AddFunction_ReturnCorrect(1, 1));
+      ^
+"Unity/test/Testgpio.c", line 13: Warning:  #223-D: function "AddFunction_ReturnCorrect" declared implicitly
+      TEST_ASSERT_EQUAL(2, AddFunction_ReturnCorrect(1, 1));
+                           ^
+"Unity/test/Testgpio.c", line 19: Warning:  #223-D: function "UnityBegin" declared implicitly
+        UnityBegin("test/Testgpio.c");
+        ^
+"Unity/test/Testgpio.c", line 20: Warning:  #223-D: function "RUN_TEST" declared implicitly
+        RUN_TEST(test_AddFunction_ReturnCorrect_ShouldReturnCorrectSum);
+        ^
+"Unity/test/Testgpio.c", line 22: Warning:  #223-D: function "UnityEnd" declared implicitly
+        return (UnityEnd());
+                ^
+Unity/test/Testgpio.c: 5 warnings, 0 errors
+Error: L6218E: Undefined symbol AddFunction_ReturnCorrect (referred from Testgpio.o).
+Error: L6218E: Undefined symbol RUN_TEST (referred from Testgpio.o).
+Error: L6218E: Undefined symbol TEST_ASSERT_EQUAL (referred from Testgpio.o).
+Error: L6218E: Undefined symbol UnityBegin (referred from Testgpio.o).
+Error: L6218E: Undefined symbol UnityEnd (referred from Testgpio.o).
+Finished: 0 information, 0 warning and 5 error messages.
+make: *** [makefile:74: Unity/build/depends/Testgpio.d] Error 1
+
+ Update 
+I am not what is happening here, after 3 4 makes the previous error returned
+ Update 
+OK so If I delete the build folder and run make, it gives the L6218E errors, if I run make again it gives the L6002U error. Also someone can explain why at the end of each make it runs rm Unity/src/unity.o ?Why should be there the involvement of type promotion in this code?In the code below the sizeof(int) will produce a signed int with a value of 4 bytes (suppose on a particular compiler) and -1 is also signed int, then my answer should be Yes but it displays No.
+#include <stdio.h>
+int main()
+{
+    if (sizeof(int) > -1)
+        printf("Yes");
+    else
+        printf("No");
+    return 0;
+}Well it is the famous signed unsigned comparison. Here -1 which is signed number when compared to unsigned numbers - promoted to an unsigned number resulting in a big magnitude value (SIZE_MAX). So it is always false.
+The explanation why there would be type promotion here when comparing:
+From standard §6.3.1.8
+
+Otherwise, if the operand that has unsigned integer type has rank
+  greater or equal to the rank of the type of the other operand, then
+  the operand with signed integer type is converted to the type of the
+  operand with unsigned integer type.
+
+Also from §6.5.8 under relational operators
+
+If both of the operands have arithmetic type, the usual arithmetic
+  conversions are performed.
+
+And what sizeof returns? 
+Under The sizeof and _Alignof operators §6.5.3.4
+
+The value of the result of both operators is implementation-defined, and its type (an unsigned integer type) is
+  size_t, defined in  (and other headers).
+
+And in section §7.19 under Common definitions
+
+size_t which is the unsigned integer type of the result of the sizeof
+  operator;
+
+To clarify a bit further when you are converting -1 to size_t it will have the value (Basically modulo SIZE_MAX+1)
+SIZE_MAX+1+(-1)
+
+Also from standard §6.2.5 (Explaining the conversion)
+
+A computation involving unsigned operands can never overflow, because
+  a result that cannot be represented by the resulting unsigned integer
+  type is reduced modulo the number that is one greater than the largest
+  value that can be represented by the resulting type.function to fill the top part of a tableI have a function that allows me to fill the top part of a table by a number like in this example with 1: 
+2 3 3 4
+2 3 3 4 
+2 3 4 5
+3 4 2 4
+
+becomes after applying the function : 
+2 1 1 1
+2 3 1 1
+2 3 4 1
+3 4 2 4
+
+This is my code (using an if test):
+/* function */
+void remplitPartieSup(int tab[N][N])
+{ 
+   int i,j;
+   for (i=0;i<N;i++)
+      {
+        for (j=0;j<N;j++)
+         {
+           if (i<j)
+             tab[i][j]=1;
+         }
+      }
+}
+
+Question
+How can I achieve the same result without using an if test?Try this.
+void remplitPartieSup(int tab[N][N])
+{ 
+   int i,j;
+   for (i=0;i<N;i++)
+      {
+        for (j=i+1;j<N;j++)
+         {
+             tab[i][j]=1;
+         }
+      }
+}c program for calculating expressionsI have made this program to calculate expressions like '2 + 6 - 9'(with spaces between numbers and operators), but the last if block is not correct. How can I break the loop when \n is received, and also store the input if not.
+#include <stdio.h>
+#include<stdlib.h>
+
+void main()
+{
+    char oper;
+    int sum,y;
+    scanf("%d %c",&sum,&oper);
+    while(1)
+    {
+                scanf("%d",&y);
+
+                if(oper=='+')
+                        sum += y;
+                else if(oper=='-')
+                        sum -= y;
+                else if(oper=='/')
+                        sum /= y;
+                else if(oper=='*')
+                        sum += y;
+                if((scanf("%c",&oper))=='\n')
+                        break;
+        }
+        printf("\n =%d",sum);
+}See the documentation for scanf
+
+On success, the function returns the number of items of the argument list successfully filled.
+
+Replace this part:
+if((scanf("%c",&oper))=='\n')
+    break;
+
+with:
+if(scanf("%c",&oper) && oper=='\n')
+    break;
+
+This:
+
+checks whether scanf() has put any value into oper
+if yes then it checks if the value is equal to \nChange colors of keywords in linux terminal while typingI'm writing an interpreter in C, which runs in ubuntu console. I want to change the colors of keywords like int, double, function while typing.
+Example: functio should be white, but as soon as I finish typing a keyword function its color should be changed to blue.
+Simple example that would answer my question: I want to set the text color in terminal to blue when the number of letters is odd and red when it's even and it should happen while typing (not after pressing enter).
+How to operate on text in terminal and change its colors while typing?Live text editing on a terminal console is much of a black art, because there is no reliable way to be sure that the console supports any and all escape sequences that you need. For a full-screen editor, you could use ncurses, but "inline" is harder than it looks. An example: my otherwise fairly compliant Mac OS X's own Terminal handles single line input gracefully but it gets confused when a text string contains nonprintables or spans more than can fit in the Terminal's width.
+The following not-so-quick (but still dirty) C program allows very basic input. A few of the hoops it required jumping through: on OS X, getchar echoes its input back to the command line; the terminal itself (!) does not forward its input to the running program until an Enter was entered. Other consoles may have other quirks.
+With single-line editing working, the only remarkable thing is how to process the running line to display parts in color. That's left to walking over the string while it's being displayed, using ANSI Escape Codes to toggle color on and off. My syntax highlighting method is very basic; if you have many more keywords, you may want to look in a quicker way of looking them up. It's also  not able to handle wildcards, so you cannot highlight stuff like "any decimal number".
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include <unistd.h>
+#include <termios.h>
+
+#define PP_INVERSE  "\x1b[7m"
+
+#define PP_RED      "\x1b[31m"
+#define PP_BLUE     "\x1b[34m"
+
+#define PP_RESET    "\x1b[39m\x1b[0m"
+
+const char *keyword_list[] = {
+    "int",
+    "double",
+    "function"
+};
+
+
+/* ha ha */
+#define SURELY_LARGE_ENOUGH 256
+
+char line_buf[SURELY_LARGE_ENOUGH] = "";
+
+void display_line (char *text, int cursor)
+{
+    char *startptr, *endptr;
+    int i;
+
+    printf ("\r>");
+
+    startptr = text;
+
+    do
+    {
+        /* hop from one 'word' to another */
+
+        /* check for non-word first */
+        while (*startptr && !isalnum(*startptr))
+        {
+            putchar (*startptr);
+            startptr++;
+        }
+
+        if (*startptr)
+        {
+            endptr = startptr;
+
+            /* gather next word */
+            while (*endptr && isalnum(*endptr))
+                endptr++;
+
+            /* check if it's a known keyword */
+            for (i=0; i<sizeof(keyword_list)/sizeof(keyword_list[0]); i++)
+            {
+                if (keyword_list[i][0] == *startptr && strlen(keyword_list[i]) == endptr - startptr)
+                {
+                    if (!strncmp (startptr, keyword_list[i], strlen(keyword_list[i])))
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if (i<sizeof(keyword_list)/sizeof(keyword_list[0]))
+            {
+                printf (PP_INVERSE "%s" PP_RESET, keyword_list[i]);
+                startptr = endptr;
+            } else
+            {
+                if ((endptr - startptr) & 1)
+                {
+                    printf (PP_BLUE);
+                } else
+                {
+                    printf (PP_RED);
+                }
+                while (startptr < endptr)
+                {
+                    putchar (*startptr);
+                    startptr++;
+                }
+                printf (PP_RESET);
+            }
+        }
+    } while (*startptr);
+
+    /* erase any following leftovers */
+    printf ("\x1B[K");
+
+    /* position cursor */
+    printf ("\r\x1B[%dC", cursor+1);
+    fflush (stdout);
+}
+
+/* turn off echo for getchar
+    see https://stackoverflow.com/questions/558009/ansi-c-no-echo-keyboard-input
+*/
+void getch_disable_echo (void)
+{
+    struct termios t;
+
+    tcgetattr(STDIN_FILENO, &t);
+    t.c_lflag &= ~ECHO;
+    t.c_lflag &= ~ICANON;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+}
+
+void getch_enable_echo (void)
+{
+    struct termios t;
+
+    tcgetattr(STDIN_FILENO, &t);
+    t.c_lflag |= ECHO;
+    t.c_lflag |= ICANON;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+}
+
+int get_input (void)
+{
+    int cursor_pos = 0;
+    int key;
+
+    do
+    {
+        display_line (line_buf, cursor_pos);
+        key = getchar();
+        if (isprint(key))
+        {
+            if (!line_buf[cursor_pos])
+                line_buf[cursor_pos+1] = 0;
+            line_buf[cursor_pos] = key;
+            cursor_pos++;
+        }
+        /* poor man's backspace */
+        if (key == 127)
+        {
+            if (cursor_pos)
+            {
+                cursor_pos--;
+                line_buf[cursor_pos] = 0;
+            }
+        }
+        if (key == '\n')
+        {
+            printf ("\r%s \n", line_buf);
+            line_buf[0] = 0;
+            cursor_pos = 0;
+        }
+    } while (key != EOF);
+
+    return 0;
+}
+
+int main (void)
+{
+    getch_disable_echo();
+
+    strcpy (line_buf, "this is a function test");
+    get_input ();
+
+    getch_enable_echo();
+    return 0;
+}
+
+As you can see this already is quite a large program, and it only allows basic editing. I left out tab completion, cursor movement, undo, and various other niceties users may expect from a full line editor. Rather than re-inventing the wheel, you could look at the sources of GNU readline and check if it would be easier to adjust its redraw routine to allow your custom syntax highlighting.
+Other than that, it works just nicely:understanding the pointersSo I have the following code, I am trying to understand the basics of pointers, so I want to change the value/string inside first, while also preserving it hence using second.
+Problem is, whatever the input is, the function will print 0 followed by 1 (the value of i)
+then crash. I can clearly see it has to do the with loop, but I can't understand why!
+Can anyone explain to me why this is happening and how I can avoid this?
+#include <stdio.h>
+#include <string.h>
+
+void spells( char **str ){
+    int i = 0, len = strlen(*str);
+    while( i < len ){
+        printf("%d\n",i); //just to check 
+        if( ( (int)*str[i] )%3 == 0 ){// if the ascii value is divided by 3
+            *str[i] = '#';
+        }
+        i++;
+    } puts("done");
+}
+int main(){
+    char first[20];
+    char* second = &first;
+    scanf("%s", first);
+    spells( &second );
+    printf("%s", second);
+    printf("\n%s", first);
+    return 0;
+}Try doing this:
+(it is a precedence problem. Hint: if you did str[1] inside that function what had to be its value?)
+if( (*str)[i] %3 == 0 ){// if the ascii value is divided by 3
+            (*str)[i] = '#';
+ }
+
+But you are not preserving anything this way because from spells function you are still modyfing the instance of the string created inside main: char first[20].
+If you want to preserve anything make a copy of the string and operate on the copy.Don't complicate things - here you are complicating things (By the way you accessed array index out of bound and then you got seg fault in the called function).
+Easy way to do things
+ char* second = first;
+
+Array decays into pointer to the first element. Then with the same logic you do one thing
+spells( second );
+
+And then
+void spells( char *str ){
+    size_t i = 0, len = strlen(str);
+    while( i < len ){
+        printf("%zu\n",i); //just to check 
+        if( str[i] % 3 == 0 ){// if the ascii value is divided by 3
+             str[i] = '#';
+        }
+        i++;
+    } 
+    puts("done");
+}
+
+You are not creating any copy - well if you need to use allocate memory or just copy it to some already allocated memory.
+Explanation of what might have gone wrong in your case
+For your clarity &first is of type char (*)[20]. pointers are not same if the values are equal. You are assigning the value of it to char* and the you pass it's address. Now when you pass it to the function you do this *(*(str+i))
+So now str is  being incremented by i*sizeof char** - what ever the size of char** maybe it will result in the accessing the memory out of bound, resulting in undefined behavior which in your case turns out to be segmentation fault.
+
+scanf use can be way better by doing two thing
+if( scanf("%19s", first) != 1){
+    fprintf(stderrm,"%s\n","Error in input");
+    exit(1);
+}
+
+saving you from possible case of buffer overrun and also checking whether the input got successful or not.
+
+To be clear, my earlier edit was lacking in explaining the problem. To be more explicit, the pointers have two aspect to it - it's value and it's type. The second dictates all the pointer arithmetic.
+Here when I said incrementing str would be out of bound by 80 Bytes that will be true only if relevant type information is passed to the function. Something like
+spells(&first)
+
+and
+void spell(char(*str)[20])
+
+But here we didn't pass that information - we instead assigned the value of char(*)[20] to a char*.(Ofcourse compiler complained) And started working with char**.
+Now when I say
+str+i
+    
+
+Actually we move
+str+ i*sizeof(str)
+
+more clearly
+str+ i*sizeof(char**)
+
+Here in your case this str originally contains some arbitrary address of a char*, it has no relation with address directly. This memory location now it points to after addition is not your concern and that is some memory to which you have no permission to access.
+With (*str) now you get the address of the base of the array. Then you index into it. That's a right thing to do and doesn't create any illegal memory access.Memory Leak from C Socket Read FunctionI am writing a small code to read ADS-B data from a Socket. The data is in following format 
+
+MSG,6,1,1,4242D7,1,2017/12/25,12:04:05.695,2017/12/25,12:04:05.695,,,,,,,,6142,0,0,0,
+  MSG,4,1,1,80068D,1,2017/12/25,12:04:05.695,2017/12/25,12:04:05.695,,,183,268,,,-576,,,,,0
+  MSG,2,1,1,800B6F,1,2017/12/25,12:04:05.695,2017/12/25,12:04:05.695,,,7,165,28.53949,77.10886,,,,,,-1
+  MSG,5,1,1,4242D7,1,2017/12/25,12:04:05.695,2017/12/25,12:04:05.696,KAR2440
+  ,32025,,,,,,,0,,0
+
+The strings are terminated by CRLF
+I am presently using a readline function to read the data from the socket line by line
+int readline(int fd, char ** out)
+{
+    /* Keep reading till header "MSG" is received
+ * store it in buffer
+ * keep reading till newline is encountered
+ * exit function
+ */
+int buf_size = 512;
+int bytesloaded = 0;
+int ret;
+char buf;
+char * buffer = malloc(buf_size * sizeof(*buffer));
+if (NULL == buffer)
+{
+    free(buffer);
+    return -1;
+}
+//loop till header is received
+while (1)
+{
+    bzero(buffer,buf_size);
+    ret = read(fd, &buf, 1);
+    if (ret < 0)
+    {
+        free(buffer);
+        return -1;
+    }
+    if (buf=='M')   //Got M; now wait for S
+    {
+        bytesloaded=0;
+        buffer[bytesloaded] = buf;
+        bytesloaded++;
+        ret = read(fd, &buf, 1);
+        if (ret < 1)
+        {
+            free(buffer);
+            return -1;
+        }
+        if (buf=='S')   //Got S; now wait for G
+        {
+            buffer[bytesloaded] = buf;
+            bytesloaded++;
+            ret = read(fd, &buf, 1);
+            if (ret < 1)
+            {
+                free(buffer);
+                return -1;
+            }
+            if (buf=='G')   //Got G; now wait for CR-LF
+            {
+                buffer[bytesloaded] = buf;
+                bytesloaded++;
+                while(1)
+                {
+                    ret = read(fd, &buf, 1);
+                    if (ret < 1)
+                    {
+                        free(buffer);
+                        return -1;
+                    }
+                    if (buf=='\n')
+                        break;
+                    buffer[bytesloaded] = buf;
+                    bytesloaded++;
+                }
+                buffer[bytesloaded] = '\0';
+                *out = buffer; // complete line
+        //free(buffer);
+                return bytesloaded;
+            }
+        }
+    }
+}
+}
+
+The above function is called from main using the following routine
+
+bytesread=readline(netfd, &netbuf);
+
+The problem is the code footprint in the memory increases gradually indicating a memory leak. Valgrind also points to the readline function.
+There is no memory leak if I uncomment the second last line (free(buffer)). But doing so gives me no data at output.
+What am I missing here.Your design indicates that the function readline allocates the memory required and returns a pointer to the calling function.
+Using this design, the calling function MUST call free to avoid a memory leak.
+I should point out that this design is often problematic and increases the chances for memory leaks.
+A better design keeps memory management concerns together (the allocating function should free the memory. When this is impossible or impractical, the function name should clearly indicate the allocation and a destructor should be written (i.e., line_alloc and line_free), minimizing any confusion.Do I have to initialize a char* after malloc?I have a program that reads chars into a dynamic string buffer. We do not know the size of the string, and it is a requirement that we do not simply set a fixed-size, "large-enough" buffer.
+The relevant function works like this:
+char* read_field(FILE* data)
+{
+    int size = 8;
+
+    char *field = malloc(size);
+    if (field == NULL)
+        exit(1);
+
+    char *tmp = NULL;
+    int idx = 0;
+    int ch = EOF;
+
+    while (ch) {
+        ch = fgetc(data);
+
+        // Double size if full
+        if (size <= idx) {
+            size *= 2;
+            tmp = realloc(field, size);
+            if (!tmp) 
+                exit(1);
+            field = tmp;
+        }
+
+        field[idx++] = ch;
+
+        // Relevant termination in my use case
+        if (ch == ';' || ch == '\n')
+            ch = 0;
+    }
+
+    printf("field: %s\n"); // value correct, but sometimes valgrind error
+
+    return field; // field is free'd by the caller
+}
+
+Now the program seems to work, but when running it through Valgrind I get the errors Uninitialised value was created by a heap allocation and Conditional jump or move depends on uninitialised value(s). These error appears arbitrarily (sometimes) when I call functions like printf or strlen, as seen in the code above.
+This problem is sorted if I use calloc instead of malloc / realloc, but then the reallocation process becomes messier.
+Is the Valgrind error something that could be ignored if the program works fine? What are the implications of not initializing the memory to zero? If this can't be ignored, what's the best design to sort it out?You should put a string terminator at the end of the string.
+PS:
+If you want to clear some memory use memset, it's faster than a for cycleuse calloc , its much better than malloc and memset.
+Example
+char *string = calloc( 100 , sizeof(char*));
+// Calloc automatically fills the memory blocks
+// Its much faster than malloc and memset
+// In addition , only in C you don't need typecast for memory allocatorsWhat are the following notations pointing to?For an integer array declared as- int arr[4][3][2]
+&arr 
+arr
+arr[0]
+&arr
+arr[0][0]
+&arr[0][0]
+arr[0][0][0]
+&arr[0][0][0]
+
+My analysis:
+
+arr:- pointing to the base address of the three dimensional array
+&arr:- The same thing as arr just here the array name does not decompose
+arr[0]:-The pointer pointing to the first element of a 3 dimensional array that is pointer to the base address of a 2d array
+arr[0][0]:The pointer pointing to the first element of first cell of first 2D array of the first 3D array.
+
+Am I thinking on the correct lines?
+Which ones out of these are pointing to the same thing?int arr[4][3][2] means arr is 3D array, consists four 2D array, each 2D array having three 1D array and each 1D array having two-two elements.
+Let's Have a pictorial representation of arr : Assume arr base address is 0x100.
+arr[0][0][0]                               arr[1][0][0]                          arr[2][0][0]                            arr[3][0][0]
+ 0x100      0x104         0x108   0x112     0x116    0x120      0x124      0x128  0x132    0x136       0x140      0x144   0x148       0x152    0x156          0x160     <--1D array elements
+   |         |              |       |        |         |          |         |      |        |            |         |       |           |         |              |
+   ----------                --------         ----------           ----------      ----------            -----------       ------------           ---------------
+        |                       |                 |                     |              |                      |                 |                       |
+        arr[0][0]               arr[0][1]       arr[1][0]            arr[1][1]       arr[2][0]              arr[2][1]         arr[3][0]               arr[3][1]
+        0x100                   0x108           0x116                 0x124          0x132                   0x140             0x148                   0x156            <---1D array
+        |                       |               |                       |              |                       |                |                       |
+        ------------------------                -------------------------              -------------------------                ------------------------
+                |                                      |                                      |                                         |
+                arr[0]                               arr[1]                                 arr[2]                                    arr[3]                            <---2D array
+                0x100                                0x116                                  0x132                                     0x148
+                |                                      |                                      |                                         |
+                -------------------------------------------------------------------------------------------------------------------------
+                                                                        |
+                                                                       arr                                                                                              <---3D array
+                                                                      0x100
+
+If you analyse above figure, you will come to know that arr,arr[0],arr[0][0] and &arr[0][0][0] all are same, all are holding arr base address that is 0x100.
+Note that arr[0][0][0] is value but &arr[0][0][0] is address of first elements, so both are different.
+arr and &arr also same because arr name itself address so by putting & doesn't make any difference.
+arr[0][0]  and &arr[0][0] also same because arr[0][0] is one dimensional array i.e single pointer pointing to two elements called arr[0][0][0] and arr[0][0][1].
+as      
+arr[0][0]               ==      & arr[0][0]
+*( *(arr+0) + 0)        ==      & *( *(arr+0) + 0)
+*( *(0x100 + 0x16) + 0) ==      & *( *(0x100 + 0x16) + 0)
+*( *(0x100))            ==      & *( *(0x100))
+*( 0x100)               ==      & *( 0x100)
+0x100                   ==      & 0x100
+0x100                   ==      0x100Matrix multiplication in 2 different ways (comparing time)I've got an assignment - compare 2 matrix multiplications - in the default way, and multiplication after transposition of second matrix, we should point the difference which method is faster. I've written something like this below, but time and time2 are nearly equal to each other. In one case the first method is faster, I run the multiplication with the same size of matrix, and in another one the second method is faster. Is something done wrong? Should I change something in my code?
+clock_t start = clock();
+
+    int sum;
+    for(int i=0; i<size; ++i) {
+        for(int j=0; j<size; ++j) {
+            sum = 0;
+            for(int k=0; k<size; ++k) {
+                sum = sum + (m1[i][k] * m2[k][j]);
+            }
+            score[i][j] = sum;
+        }
+    }
+
+    clock_t end = clock();
+    double time = (end-start)/(double)CLOCKS_PER_SEC;
+
+    for(int i=0; i<size; ++i) {
+        for(int j=0; j<size; ++j) {
+            int temp = m2[i][j];
+            m2[i][j] = m2[j][i];
+            m2[j][i] = temp;
+        }
+    }
+
+    clock_t start2 = clock();
+
+    int sum2;
+    for(int i=0; i<size; ++i) {
+        for(int j=0; j<size; ++j) {
+            sum2 = 0;
+            for(int k=0; k<size; ++k) {
+                sum2 = sum2 + (m1[k][i] * m2[k][j]);
+            }
+            score[i][j] = sum2;
+        }
+    }
+
+    clock_t end2 = clock();
+    double time2 = (end2-start2)/(double)CLOCKS_PER_SEC;You have multiple severe issues with your code and/or your understanding. Let me try to explain.
+Matrix multiplication is bottlenecked by the rate at which the processor can load and store the values to memory. Most current architectures use cache to help with this. Data is moved from memory to cache and from cache to memory in blocks. To maximize the benefit of caching, you want to make sure you will use all the data in that block. To do that, you make sure you access the data sequentially in memory.
+In C, multi-dimensional arrays are specified in row-major order. It means that the rightmost index is consecutive in memory; i.e. that a[i][k] and a[i][k+1] are consecutive in memory.
+Depending on the architecture, the time it takes for the processor to wait (and do nothing) for the data to be moved from RAM to cache (and vice versa), may or may not be included in the CPU time (that e.g. clock() measures, albeit at a very poor resolution). For this kind of measurement ("microbenchmark"), it is much better to measure and report both CPU and real (or wall clock) time used; especially so if the microbenchmark is run on different machines, to get a better idea of the practical impact of the change.
+There will be a lot of variation, so typically, you measure the time taken by a few hundred repeats (each repeat possibly making more than one operation; enough to be easily measured), storing the duration of each, and report their median. Why median, and not minimum, maximum, average? Because there will always be occasional glitches (unreasonable measurement due to an external event, or something), which typically yield a much higher value than normal; this makes the maximum uninteresting, and skews the average (mean) unless removed. The minimum is typically an over-optimistic case, where everything just happened to go perfectly; that rarely occurs in practice, so is only a curiosity, not of practical interest. The median time, on the other hand, gives you a practical measurement: you can expect 50% of all runs of your test case to take no more than the median time measured.
+On POSIXy systems (Linux, Mac, BSDs), you should use clock_gettime() to measure the time. The struct timespec format has nanosecond precision (1 second = 1,000,000,000 nanoseconds), but resolution may be smaller (i.e., the clocks change by more than 1 nanosecond, whenever they change). I personally use
+#define _POSIX_C_SOURCE 200809L
+#include <time.h>
+
+static struct timespec  cpu_start, wall_start;
+double                  cpu_seconds, wall_seconds;
+
+void timing_start(void)
+{
+    clock_gettime(CLOCK_REALTIME, &wall_start);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start);
+}
+
+void timing_stop(void)
+{
+    struct timespec  cpu_end, wall_end;
+    clock_gettime(CLOCK_REALTIME, &wall_end);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end);
+
+    wall_seconds = (double)(wall_end.tv_sec - wall_start.tv_sec)
+                 + (double)(wall_end.tv_nsec - wall_start.tv_nsec) / 1000000000.0;
+    cpu_seconds = (double)(cpu_end.tv_sec - cpu_start.tv_sec)
+                + (double)(cpu_end.tv_nsec - cpu_start.tv_nsec) / 1000000000.0;
+}
+
+You call timing_start() before the operation, and timing_stop() after the operation; then, cpu_seconds contains the amount of CPU time taken and wall_seconds the real wall clock time taken (both in seconds, use e.g. %.9f to print all meaningful decimals).
+The above won't work on Windows, because Microsoft does not want your C code to be portable to other systems. It prefers to develop their own "standard" instead. (Those C11 "safe" _s() I/O function variants are a stupid sham, compared to e.g. POSIX getline(), or the state of wide character support on all systems except Windows.)
+Matrix multiplication is
+c[r][c] = a[r][0] * b[0][c]
+        + a[r][1] * b[1][c]
+        :         :
+        + a[r][L] * b[L][c]
+
+where a has L+1 columns, and b has L+1 rows.
+In order to make the summation loop use consecutive elements, we need to transpose b. If B[c][r] = b[r][c], then
+c[r][c] = a[r][0] * B[c][0]
+        + a[r][1] * B[c][1]
+        :         :
+        + a[r][L] * B[c][L]
+
+Note that it suffices that a and B are consecutive in memory, but separate (possibly "far" away from each other), for the processor to utilize cache efficiently in such cases.
+OP uses a simple loop, similar to the following pseudocode, to transpose b:
+For r in rows:
+    For c in columns:
+        temporary = b[r][c]
+        b[r][c] = b[c][r]
+        b[c][r] = temporary
+    End For
+End For
+
+The problem above is that each element participates in a swap twice. For example, if b has 10 rows and columns, r = 3, c = 5 swaps b[3][5] and b[5][3], but then later, r = 5, c = 3 swaps b[5][3] and b[3][5] again! Essentially, the double loop ends up restoring the matrix to the original order; it does not do a transpose.
+Consider the following entries and the actual transpose:
+b[0][0] b[0][1] b[0][2]      b[0][0] b[1][0] b[2][0]
+b[1][0] b[1][1] b[1][2]  ⇔   b[0][1] b[1][1] b[2][1]
+b[2][0] b[2][1] b[2][2]      b[0][2] b[1][2] b[2][2]
+
+The diagonal entries are not swapped. You only need to do the swap in the upper triangular portion (where c > r) or in the lower triangular portion (where r > c), to swap all entries, because each swap swaps one entry from the upper triangular to the lower triangular, and vice versa.
+So, to recap:
+
+Is something done wrong?
+
+Yes. Your transpose does nothing. You haven't understood the reason why one would want to transpose the second matrix. Your time measurement relies on a low-precision CPU time, which may not reflect the time taken by moving data between RAM and CPU cache. In the second test case, with m2 "transposed" (except it isn't, because you swap each element pair twice, returning them back to the way they were), your innermost loop is over the leftmost array index, which means it calculates the wrong result. (Moreover, because consecutive iterations of the innermost loop accesses items far from each other in memory, it is anti-optimized: it uses the pattern that is worst in terms of speed.)
+All the above may sound harsh, but it isn't intended to be, at all. I do not know you, and I am not trying to evaluate you; I am only pointing out the errors in this particular answer, in your current understanding, and only in the hopes that it helps you, and anyone else encountering this question in similar circumstances, to learn.Time optimization for string formatting: pad a line to length K by adding spaces between wordsI have written code to extend string to length K using spacebar symbol. My code works, but is not fast enough for lengthy strings. My tries at optimizing the code were insufficient, so any help would be appreciated.
+Example:
+Input:
+16
+i love apples
+Output:
+i   love  apples
+
+The goal is to make any string process in 1 second, if K = BUFSIZE.
+Here is the code:
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BUFSIZE 1000005
+
+int main(void) {
+    char s = ' ';
+    char str[BUFSIZE], res[BUFSIZE] = "";
+    int K;
+    scanf("%d\n", &K);
+    fgets(str, BUFSIZE, stdin);
+    int i, j = 0, len = strlen(str) - 1, maxP = 0, p = 0, c = 0, sum = 0;
+    if (K == len) {
+        printf("%s", str);
+        return 0;
+    }
+    for (i = 0; i < len; i++) {
+        if (str[i] == s) {
+            p++;
+            sum++;
+        }
+        else if (str[i] != s && i - 1 >= 0 && str[i - 1] == s) {
+            if (p > maxP) {
+                maxP = p;
+                p = 0;
+            }
+            else {
+                p = 0;
+            }
+            c++;
+        }
+    }
+    i = 0;
+    K -= len;
+    do {
+        if (str[i] == s) {
+            res[j] = s;
+            p++;
+            j++;
+            i++;
+        }
+        else if (str[i] != s && i - 1 >= 0 && str[i - 1] == s) {
+            if (sum / c == maxP && K > 0) {
+                res[j] = s;
+                K--;
+                j++;
+            }
+            if (p < maxP && K > 0) {
+                sum++;
+                res[j] = s;
+                K--;
+                j++;
+                p = 0;
+            }
+            res[j] = str[i];
+            i++;
+            j++;
+        }
+        else {
+            res[j] = str[i];
+            i++;
+            j++;
+        }
+        if (i == len) {
+            i = 0;
+            j = 0;
+            strcpy(str, res);
+            len = strlen(str);
+            strcpy(res, "");
+        }
+    } while (K > 0);
+    if (i < len) {
+        while (i < len) {
+            res[j] = str[i];
+            i++;
+            j++;
+        }
+    }
+    printf("%s", res);
+    return 0;
+}I'm running on an Android phone so I'm not posting code here, but I'll give you some hint.
+First, you don't need to insert spaces one-by-one. You can create an array of strings, separate the sentence into an array of words and store them.
+Now you have the number of words. You can use a very simple integer division to determine how many spaces should every "word separation" have, as well as how many remaining spaces to be added from left to right.
+You've done all of them. You can now concatenate the words and add the spaces during concatenation. The whole procedure can be done in a time of O(N), where N is the length of the original string.Most linear algorithms should be fast enough in this case. The performance is  likely limited by I/O.
+Here's a straightforward O(n) algorithm to pad a line to width with spaces:
+
+find number of words in the input line described by /([ ]*[^ ]*)*/ regex:
+size_t count_words(const char* str)
+{
+  size_t count = 0;
+  for ( ; ; ) { // ([ ]*[^ ]*)*
+    for ( ; *str && *str == ' '; ++str) ; // skip separator
+
+    if (!*str)
+      break;
+
+    ++count; // found word
+
+    for ( ; *str && *str != ' '; ++str) ; // skip word chars
+
+  }
+  return count;
+}
+
+find total number of spaces required knowing the desired line width and the number of word (nonspace) characters in the input:
+size_t count_nonspaces(const char* str)
+{
+  size_t count = 0;
+  for ( ; *str; ++str)
+    if (*str != ' ')
+      ++count;
+  return count;
+}
+
+it allows to find the desired number of spaces between words. If spaces can't be evenly distributed between words then the remainder is inserted from left to right by adjusting the space between words if necessary
+the main loop copies words from the source to destination inserting the computed number of spaces between words:
+int main(void)
+{
+  const size_t max_width = 1000005;
+  assert (max_width <= (SIZE_MAX - 2));
+
+  // read desired width, line
+  size_t width, len;
+  char *line;
+  if (!(line = malloc(max_width + 2)) // '\n' + '\0'
+      || !fgets(line, max_width + 2, stdin) // read 1st line
+      || sscanf(line, "%zu", &width) != 1
+      || width > max_width
+      || !fgets(line, max_width + 2, stdin) // read 2nd line
+      || !(len = strlen(line)) // last char is always '\n'
+      || line[len-1] != '\n') {
+    exit(EXIT_FAILURE); //NOTE: let OS free memory hereafter
+  }
+
+  if (len > width) {     // input line is wide enough
+    fputs(line, stdout); // output as is
+    exit(EXIT_SUCCESS);
+  }
+
+
+  // pad *line* to *width* with spaces, normalize space
+  line[--len] = '\0'; // chop newline
+  const size_t word_count = count_words(line);
+  // total number of spaces
+  const size_t m = width - count_nonspaces(line);
+  // number of spaces between words
+  const size_t space_count = word_count > 1 ? m / (word_count - 1) : m;
+  // the rest of spaces
+  size_t rest = word_count > 1 ? m % (word_count - 1) : 0;
+
+  // insert spaces between words
+  char *str = line, *dest = malloc(width + 1);
+  if (!dest) exit(EXIT_FAILURE);
+  char *start = dest, *end = dest + width;
+  for ( ; ; ) { // ([ ]*[^ ]*)*
+    for ( ; *str == ' '; ++str) ; // skip separator
+
+    // copy found word
+    for ( ; *str && *str != ' '; ++str)
+      *dest++ = *str;
+
+    if (dest == end) {
+      *dest = '\0';
+      break;
+    }
+
+    // append spaces
+    size_t nspaces = space_count;
+    if (rest) { // distribute the rest of spaces: one for each word from
+      // left to right
+      --rest;
+      ++nspaces;
+    }
+    memset(dest, ' ', nspaces);
+    dest += nspaces;
+  }
+  puts(start);
+}
+
+
+Example:
+$ cc *.c && ./a.out <<<$'16\n i love apples'
+i   love  appleswritev(or pwritev) will conflict with O_DIRECT in c?I tried to combine writev with direct IO. But I got failed when I combined with them.
+Below code works, but failed if I add O_DIRECT when open()
+I always got "Invalid arguments" when failed.
+int main(){
+    char *str0 = "hello ";
+    char *str1 = "world\n";
+    struct iovec iov[2];
+    ssize_t nwritten;
+
+    iov[0].iov_base = str0;
+    iov[0].iov_len = strlen(str0);
+    iov[1].iov_base = str1;
+    iov[1].iov_len = strlen(str1);
+
+    int fd = open("./foo",O_RDWR|O_CREAT);// will fail if add O_DIRECT
+    nwritten = writev(fd, iov, 2);
+    printf("num:%ld,%s\n", nwritten, strerror(errno));
+
+    close(fd);
+    return 0;
+}
+
+So I thought it might be memory alignment problem, so I adjust them into a memaligned buffer like below:
+#define BLOCKSIZE 512
+int main(){
+    char *str0 = "hello ";
+    char *str1 = "world\n";
+    struct iovec iov[2];
+    ssize_t nwritten;
+
+    void *buffer, *buffer1;
+    posix_memalign(&buffer, BLOCKSIZE, BLOCKSIZE);
+    memcpy(buffer, str0, strlen(str0));
+    posix_memalign(&buffer1, BLOCKSIZE, BLOCKSIZE);
+    memcpy(buffer1, str1, strlen(str1));
+
+    iov[0].iov_base = buffer;
+    iov[0].iov_len = strlen(buffer);
+    iov[1].iov_base = buffer1;
+    iov[1].iov_len = strlen(buffer1);
+
+    int fd = open("./foo",O_RDWR|O_CREAT|O_DIRECT);
+    nwritten = writev(fd, iov, 2);
+    printf("num:%ld,%s\n", nwritten, strerror(errno));
+
+    close(fd);
+    free(buffer);
+    return 0;
+}
+
+But it still failed.
+Is there anyway to solve this?You should try set the both iov_len to BLOCKSIZE, but the file size would not be strlen(str0) + strlen(str1).With DIRECT_IO there are alignment and size restrictions on the buffers you write from/read into.
+That means your write buffer must be properly aligned to the physical block size of the device and its size must be dividable by the physical block size of the device.
+Whereas the physical block size of the device can be looked up via /sysfs and usually is 512 or 4k bytes. Using 4k thus would be a 'safe' choice.
+Your strlen(buffer) and strlen(buffer1) sizes certainly aren't dividable by a physical block size.8 Byte Number as Hex in CI have given a number, for example n = 10, and I want to calculate its length in hex with big endian and save it in a 8 byte char pointer. In this example I would like to get the following string:
+"\x00\x00\x00\x00\x00\x00\x00\x50".
+How do I do that automatically in C with for example sprintf?
+I am not even able to get "\x50" in a char pointer:
+char tmp[1];
+sprintf(tmp, "\x%x", 50); // version 1
+sprintf(tmp, "\\x%x", 50); // version 2
+
+Version 1 and 2 don't work.I have given a number, for example n = 10, and I want to calculate its length in hex 
+
+Repeatedly divide by 16 to find the number of hexadecimal digits.  A do ... while insures the result is 1 when n==0.
+int hex_length = 0;
+do {
+  hex_length++;
+} while (number /= 16);
+
+
+save it in a 8 byte char pointer.
+
+C cannot force your system to use 8-byte pointer.  So if you system uses 4 byte char pointer, we are out of luck.  Let us assume OP's system uses 8-byte pointer.  Yet integers may be assigned to pointers.  This may or may not result in valid pointer.
+assert(sizeof (char*) == 8);
+char *char_pointer = n;
+printf("%p\n", (void *) char_pointer);
+
+
+In this example I would like to get the following string: "\x00\x00\x00\x00\x00\x00\x00\x50".
+
+In C, a string includes the various characters up to an including a null character. "\x00\x00\x00\x00\x00\x00\x00\x50" is not a valid C string, yet is a valid string literal. Code cannot construct string literals at run time, that is a part of source code. Further the relationship between n==10 and "\x00...\x00\x50" is unclear.  Instead perhaps the goal is to store n into a 8-byte array (big endian).
+char buf[8];
+for (int i=8; i>=0; i--) {
+  buf[i] = (char) n;
+  n /= 256;
+}
+
+
+OP's code certainly will fail as it attempts to store a string  which is too small.  Further "\x%x" is not valid code as \x begins an invalid escape sequence.
+char tmp[1];
+sprintf(tmp, "\x%x", 50); // version 1Just do:
+int i;
+...
+int length = round(ceil(log(i) / log(16)));
+
+This will give you (in length) the number of hexadecimal digits needed to represent i (without 0x of course).
+log(i) / log(base) is the log-base of i. The log16 of i gives you the exponent.
+To make clear what we're doing here: When rising 16 to the power of the found exponent, we get back i: 16^log16(i) = i.
+By rounding up this exponent using ceil(), you get the number of digits.How do I read last n characters of a string in a single file?I want to read the last n characters of a line in the file "passwordhashes.txt". If "$1$$" is detected in a line, I want to print the last 26 characters of that line and if "$6$$" is detected instead, I want to print the last 90 characters of that line. The following code returns the first 26 characters if md5 is detected and first 90 characters if sha512 is detected but that is not what I want.
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+
+int printDataError()
+{      
+  printf("Data error: Invalid entry found (Skipped)\n");
+}    
+
+int main(void)
+{
+  char buf[1024];
+  char **arr2 = NULL;
+  int size2 = 0;
+  FILE *f2;
+  f2 = fopen("passwordhashes.txt", "r");
+
+  while(fgets(buf, 1024, f2)) {
+    size2++;
+    arr2 = realloc(arr2, sizeof(char*) * size2);
+    arr2[size2 - 1] = strdup(buf);
+  }
+
+  char line[1000];
+  char hash[1000];      
+  char md5[5]= "$1$$";
+  char sha512[5]="$6$$";
+  char *ret;
+  char *ret2;
+
+  // Read file line by line     
+  for(int j = 0; j < size2; j++) {      
+    memset(hash, '\0', sizeof(hash));
+    strcpy(line, arr2[j]);
+
+    // Search for md5 
+    md5[4]='\0';
+    ret = strstr(line, md5);
+
+    // Search for sha512
+    sha512[4]='\0';
+    ret2 = strstr(line, sha512);
+
+    if (ret) {
+      strncpy(hash, line,26);     
+      printf("Line %d hash: %s\n", j+1,hash);
+    } else if (ret2) {
+      strncpy(hash, line,90);    
+      printf("Line %d hash: %s\n", j+1,hash);    
+    } else {
+      printDataError();
+    }
+  }
+  return 0;
+}
+
+A few lines in the passwordhashes.txt (there are a total of 219128 lines in this file so I will just list out a few):
+a:$1$$Ij31LCAysPM23KuPlm1wA/
+a:$6$$ek/ucQg0IM8SQLyD2D66mpoW0vAF26eA0/pqoN95V.F0nZh1IFuENNo0OikacRkDBk5frNqziMYMdVVrQ0o.51
+aah:$1$$bh5o1cAKfH43fc/B1.AjF0
+aah:$6$$jdxDww2LkNSlQPmWe5iDRAoBBT5IXa9241nN2bcm2Aukdrr4iH27Y6dj801MjLFaDQxbDBNxY4jvlXdIemiCY/
+aahed:$1$$zA2Ef92JR9W7kqAf8Km5B0
+aahed:$6$$mYQU7f3NL9Dysccvwv2BAyiCb/gxh9lN1gGnC9sa2uwHGX9VVb7jp3b7u/EZbdObqWrRFgiOLcRn7PEW1cOcz.
+aahing:$1$$lDHqezDzqgN4GXlWys7LB0
+aahing:$6$$rqJD4oAdyTJ3EasAFN.FeNwTFiCIIklFEo2YcxSS1X5Vutrlqu7r91c4G0PnsVAISIUIBX9.d.8riuVMmKddy/Here is a simple remake of strncpy which is a standard function which copies n characters from a source to a destination.
+This function copies n characters from the last from src and copy it to dest. if n is greater than the length of src , it does nothing.
+#include <string.h>
+void strlncpy(char *dest , char *src , size_t n){
+    size_t len = 0;
+    if(!dest || !src || (len = strlen(src)) < n)
+            return;
+    char *p = src + (len - n);
+    strcpy(dest , p);
+}
+
+Here is a remake of your program using strlncpy,
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#define DELIM ':'
+#define MD5_SIGN "$1$$"
+#define SHA512_SIGN "$6$$"
+#define MD5_LEN 22 /* I changed this to get only the hash. */
+#define SHA512_LEN 86
+
+void strlncpy(char *dest , const char *src , size_t n){
+    size_t len = 0;
+    if(!dest || !src || (len = strlen(src)) < n)
+            return;
+    char *p = src + (len - n);
+    strcpy(dest , p);
+}
+
+int main(){
+ssize_t r = 0;
+size_t n =0;
+char *o = NULL , *p  = NULL , hash[100];
+FILE *fp = NULL;
+if((fp = fopen("passwordhash.txt", "r")) == NULL){
+    printf("cannot open file!\n");
+    return -1;
+}
+while((r = getline(&o , &n , fp)) != -1){
+        p = o;
+        /* Print the raw text. */
+        printf("RAW TEXT:: ");
+        while(*p != DELIM){
+                putchar(*p);
+                ++p;
+        }
+        putchar('\n');
+        p = o; 
+        if(strstr(p , MD5_SIGN)){
+                /* plus one is for the newline. */
+                strlncpy(hash , p , MD5_LEN + 1);
+                hash[strlen(hash)-1] = '\0'; /* remove newline. */
+                printf("MD5 HASH:: %s\n" , hash); 
+        }else if(strstr(p , SHA512_SIGN)){
+                strlncpy(hash , p , SHA512_LEN + 1);
+                hash[strlen(hash)-1] = '\0'; 
+                printf("SHA512 HASH:: %s\n" , hash);
+        }
+}
+fclose(fp); // Also close files!
+return 0;
+}
