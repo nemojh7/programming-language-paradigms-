@@ -1,0 +1,3804 @@
+How to read connections at the same time using select? sockets/c#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+
+int port = 3008;
+int listenfd;
+
+extern void makelistener();
+int main(int argc, char **argv)
+{
+    makelistener();
+    int clientfd, nready;
+    socklen_t len;
+    struct sockaddr_in q;
+    int i;
+
+    // initialize allset and add listenfd to the
+    // set of file descriptors passed into select
+    fd_set allset;
+    fd_set rset;
+    int maxfd;
+    FD_ZERO(&allset);
+    FD_SET(listenfd, &allset); // set of file descriptors
+
+    maxfd = listenfd;
+    int ret;
+
+    while (1)
+    {
+        // make a copy of the set before we pass it into select
+        rset = allset;
+        /*select will wait until an exceptional event occurs when tv is NULL*/
+
+
+        nready = select(maxfd + 1, &rset, NULL, NULL, NULL);
+        if (nready == 0) {
+            continue;
+        }
+
+        if (nready == -1) {
+            perror("select");
+            continue;
+        }
+
+        //FD_ISSET returns 1 when a new connection is attempted
+        if(FD_ISSET(listenfd, &rset)){
+            //printf("a new client is connecting\n");
+            len = sizeof(q); //accept connection of listenfd stream socket
+            if ((clientfd = accept(listenfd, (struct sockaddr *)&q, &len)) < 0) {
+                perror("accept");
+                exit(1);
+            }
+            FD_SET(clientfd, &allset);
+            if (clientfd > maxfd) {
+                maxfd = clientfd;
+            }
+
+            static char msg[] = "What is your name?\r\n";
+            write(clientfd, msg, sizeof msg - 1);
+            printf("connection from %s\n", inet_ntoa(q.sin_addr));
+            char buf[256];
+            ret = read(clientfd, buf, sizeof(buf));
+            buf[ret] = '\0';
+            printf("%s", buf);
+       }
+
+
+
+   }
+
+
+
+
+
+}
+
+
+void makelistener()
+{
+    struct sockaddr_in r;
+
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket");
+        exit(1);
+    }
+
+    memset(&r, '\0', sizeof r);
+    r.sin_family = AF_INET;
+    r.sin_addr.s_addr = INADDR_ANY;
+    r.sin_port = htons(port);
+    if (bind(listenfd, (struct sockaddr *)&r, sizeof r)) {
+        perror("bind");
+        exit(1);
+    };
+
+    if (listen(listenfd, 5)) {
+        perror("listen");
+        exit(1);
+    }
+}
+
+above code is for the server and it does this
+$ ./above.c
+(does nothing but runs forever)
+
+How to connect as a client:
+$ nc 127.0.0.1 3000
+What is your name?
+(waiting for my input) so if I put bob, it would output it to the server
+
+It works as intended. But I want it too work concurrently with multiple clients.
+for example:
+server
+$ ./above.c
+(does nothing but runs forever)
+
+client1
+$ nc 127.0.0.1 3000
+What is your name?
+
+client 2  
+$ nc 127.0.0.1 3000
+What is your name? (Currently client2 wont show up until client1 is answered which is what I'm trying to fix)
+
+How do I make it so the clients can run concurrently without waiting for the first client to finish? To explain the code a little bit, listener just binds and listens to a connection. Inside the while(1) is where select and calls are.How do I make it so the clients can run concurrently without waiting for the first client to finish?
+
+By paying attention to which sockets select() reports to you.  You are asking select() to monitor multiple sockets for readability, but you are only checking if the listening socket is readable, you are not checking the client sockets.  You need to keep track of the connected clients so you can enumerate them when needed.
+Try something like this:
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+int port = 3008;
+#define MAX_CLIENTS (FD_SETSIZE - 1)
+
+int listenfd = -1;
+
+extern void makelistener();
+
+int main(int argc, char **argv)
+{
+    int clientfd, nready;
+    socklen_t len;
+    struct sockaddr_in q;
+    int i, j, ret;
+    fd_set allset;
+    fd_set rset;
+    int clients[MAX_CLIENTS];
+    int num_clients = 0;
+    int maxfd;
+    char buf[256];
+
+    makelistener();
+
+    // initialize allset and add listenfd to the
+    // set of file descriptors passed into select
+    FD_ZERO(&allset);
+    FD_SET(listenfd, &allset);
+    maxfd = listenfd;
+
+    while (1)
+    {
+        // make a copy of the set before we pass it into select
+        FD_COPY(&allset, &rset);
+
+        // select will wait until an exceptional event occurs when tv is NULL
+        nready = select(maxfd + 1, &rset, NULL, NULL, NULL);
+
+        if (nready < 0) {
+            perror("select");
+            continue;
+        }
+
+        if (nready == 0) { // should never happen since no timeout was requested
+            continue;
+        }
+
+        //FD_ISSET returns 1 when a socket is readable
+
+        if (FD_ISSET(listenfd, &rset)) {
+            //printf("a new client is connecting\n");
+            len = sizeof(q); //accept connection of listenfd stream socket
+            if ((clientfd = accept(listenfd, (struct sockaddr *)&q, &len)) < 0) {
+                perror("accept");
+                exit(1);
+            }
+
+            printf("Client %d connected from %s\n", clientfd, inet_ntoa(q.sin_addr));
+
+            if (num_clients == MAX_CLIENTS) {
+                static char msg[] = "Max number of clients are already connected\r\n";
+                write(clientfd, msg, sizeof(msg)-1);
+                close(clientfd);
+            }
+            else {
+                static char msg[] = "What is your name?\r\n";
+                if (write(clientfd, msg, sizeof(msg)-1) < 0) {
+                    close(clientfd);
+                }
+                else {
+                    clients[num_clients++] = clientfd;
+                    FD_SET(clientfd, &allset);
+                    if (clientfd > maxfd) {
+                        maxfd = clientfd;
+                    }
+                }
+            }
+        }
+
+        for (i = 0; i < num_clients; ++i) {
+            clientfd = clients[i];
+
+            if (!FD_ISSET(clientfd, &rset)) {
+                continue;
+            }
+
+            ret = read(clientfd, buf, sizeof(buf));
+            if (ret <= 0) {
+                //printf("a client has disconnected\n");
+                close(clientfd);
+                FD_CLR(clientfd, &allset);
+                for (j = i + 1; j < num_clients; ++j) {
+                    clients[j-1] = clients[j];
+                }
+                --num_clients;
+
+                if (clientfd == maxfd) {
+                    maxfd = listenfd;
+                    for (j = 0; j < num_clients; ++j) {
+                        if (clients[j] > maxfd) {
+                            maxfd = clients[j];
+                        }
+                    }
+                }
+
+                --i;
+                continue;
+            }
+
+            printf("Client %d: %.*s", clientfd, ret, buf);
+        }
+    }
+
+    return 0;
+}
+
+Note that poll() or epoll() would generally be a better choice to use than select().How do I make it so the clients can run concurrently without waiting for the first client to finish?
+every time that the call to accept() returns, start a thread pthread_create() to handle the actual communication with the client.
+Note: creating/destroying a thread is very time consuming, so suggest learning about thread pools and how to use them.
+When using threads, there is no call to select() (nor poll())  Rather the main function gets blocked on the call to accept() and when that function returns, pass the associated socket to a thread to handle
+There are lots of example code for how a server should communicate with multiple clients on stackoverflow.comprintf() producing garbage [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+char username[50];
+
+printf("[Enter Command]: \n");
+scanf("%s", username);
+
+if (strcmp("exit", username) == 0) {
+    exit(0);
+}
+
+if (strcmp("jobs", username) == 0) {
+    printf("[SERVER] No currently running jobs\n");
+}
+
+char dtm[50];
+char first_word[50];
+char second_word[50];
+
+
+strcpy(dtm, username);
+sscanf(dtm, "%s %s", first_word, second_word);
+
+printf("%s %s\n", first_word, second_word);
+
+I want to extract the first and second word of my inputted string. I don't understand why my printf() statement is producing garbage outputsReplace scanf("%s", username); with gets(username);(line 3).
+Thats where your problem is. Scanf is only taking the first word.Please always keep in my that printf never produce any garbage. It is we creates these issues by our self. While playing with string always be careful and to instruct printf end of a string we must put a end of string character at the end of a string and that is call null character \0 or 0. Some of the C function does not insert a \0 character at the end of the string and hence it is our duty to take care of it. Better always initialize a string with 0 in all the location like below, this is one of the good practice to avoid side effect like this.
+char dtm[50];
+char first_word[50];
+char second_word[50];
+
+memset(dtm, 0, 50);//or memset(dtm, 0, sizeof(dtm));
+memset(first_word, 0, 50);//or memset(first_word, 0, sizeof(first_word));
+memset(second_word, 0, 50);// or memset(second_word, 0, sizeof(second_word));
+
+Below practice is also safe.
+char dtm[50] = "";
+char first_word[50] = "";
+char second_word[50] = "";Heap-corruption when freeing allocated memoryI am writing small school project, and I got stuck with error that I can't fix. When I try to free allocated memory, I get this error:
+
+Here is the code that involves my char pointer temp:
+1. Allocation of memory and setting starting value:
+ char *temprijec(int rng, RIJEC *B, int *len) {
+    int i;
+    char *temp=(char*)calloc(*len + 1, sizeof(char));
+    *len = strlen((B + rng)->rijec);
+    for (i = 0; i < *len; i++) {
+        if (i == 0) {
+            temp[i] = (B + rng)->rijec[i];
+        }
+        else if (i == (*len)) {
+            temp[i] = '\0';
+        }
+        else {
+            temp[i] = '_';
+        }
+    }
+    return temp;
+ }
+
+2. Working with char pointer temp:
+void tijek_igre(char*temp,RIJEC *B,int rng,int len,int*br2pok,int *pokpogreska,int *pokbr,char*pokch) {
+    int i;
+    printf("\nPogodi slovo ili rijec!");
+    *pokch = _getch();
+    for (i = 0; (B + rng)->rijec[i] != '\0'; i++) {
+        if (*pokch == (B + rng)->rijec[i]) {
+            temp[i] = *pokch;
+        }
+    }
+    for (i = 0; (B + rng)->rijec[i] != '\0'; i++) {
+        if (*pokch != (B + rng)->rijec[i]) {
+            (*br2pok)++;
+            if (*br2pok == len) {
+                (*pokpogreska)++;
+            }
+        }
+    }
+    for (i = 0; temp[i] != '\0'; i++) {
+        if (temp[i] != '_') {
+            (*pokbr)++;
+        }
+    }
+}
+
+Everything is fine until I try to free it with free(temp);I fixed the error by changing the way I am passing variables to function,structure instead of pointers and now it works idk why but it works :).Tnx everyone for help.
+Changed code:
+VARIJABLE temprijec(VARIJABLE V, RIJEC *B) {
+    int i;
+    V.len = strlen((B + V.rng)->rijec);
+    V.temp = (char*)calloc(V.len + 1, sizeof(char));
+
+    for (i = 0; i < V.len + 1; i++) {
+        if (i == 0) {
+            V.temp[i] = (B + V.rng)->rijec[i];
+        }
+        else if (i == (V.len)) {
+            V.temp[i] = '\0';
+        }
+        else {
+            V.temp[i] = '_';
+        }
+    }
+    return V;
+}
+
+and
+VARIJABLE tijek_igre(RIJEC *B, VARIJABLE V) {
+    int i;
+    printf("\nPogodi slovo ili rijec!");
+    V.ch = _getch();
+    for (i = 0; (B + V.rng)->rijec[i] != '\0'; i++) {
+        if (V.ch == (B + V.rng)->rijec[i]) {
+            V.temp[i] = V.ch;
+        }
+    }
+    for (i = 0; (B + V.rng)->rijec[i] != '\0'; i++) {
+        if (V.ch != (B + V.rng)->rijec[i]) {
+            (V.pogresno_slovo)++;
+            if (V.pogresno_slovo == V.len) {
+                (V.pogreska)++;
+            }
+        }
+    }
+    for (i = 0; V.temp[i] != '\0'; i++) {
+        if (V.temp[i] != '_') {
+            (V.tocno_slovo)++;
+        }
+    }
+    return V;
+}pass by reference a struct through multiple functions in CI am trying to pass a struct by reference through multiple functions but I am getting garbage value when I try to print the value of the struct in each function. How to correctly pass it by reference, so that the value is passed back until from func3() -> func2() -> func1()-> main() function
+typedef struct _buf {
+   void  *ptr;
+   size_t len;
+} buf;
+
+
+int func3(buf *x){
+  x->ptr = 45;
+  printf("func3 %s \n", (char *)x->ptr);
+  return 0;
+}
+
+int func2(buf *x){
+  func3(&* x);
+  printf("func2 %s \n", (char *)x->ptr);
+  return 0;
+}
+
+
+int func1(buf *x) {
+  func2(&*x);
+  printf("func1 %s \n", (char *)x->ptr);
+  return 0;
+}
+
+
+int main() {
+  buf x = {NULL, 0};
+  func1(&x);
+  printf("main %s \n", (char *)x.ptr);
+  return 0;
+}Without many changes to your code, I have fixed two things here.
+1) You are trying to print a string starting from the address 45.
+That is an issue, obviously it will print garbage.
+2) You can pass the pointer forward as it is.
+#include<stdio.h>
+typedef struct _buf {
+   void  *ptr;
+   size_t len;
+} buf;
+
+
+int func3(buf *x){
+  x->ptr = (void*)"hello";
+  printf("func3 %s \n", (char *)x->ptr);
+  return 0;
+}
+
+int func2(buf *x){
+  func3(x);
+  printf("func2 %s \n", (char *)x->ptr);
+  return 0;
+}
+
+
+int func1(buf *x) {
+  func2(x);
+  printf("func1 %s \n", (char *)x->ptr);
+  return 0;
+}
+
+
+int main() {
+  buf x = {NULL, 0};
+  func1(&x);
+  printf("main %s \n",(char*) x.ptr);
+  return 0;
+}Getting MAC adds of machine in C with MacOSI am dealing with socket programming with C language and Xcode. I can open socket, server and client. I need to learn my machine's Mac address and then, I will send Arp request for server machine. 
+Almost all examples had been written for linux. I need to solve it in Mac OS. 
+Currently, I am using these codes with opening two projects and they are able to communicate. 
+https://www.geeksforgeeks.org/socket-programming-cc/
+Could you give some example or information about this problem?Deleting a member of a struct in CProblem: Struct keeps the data in it after being edited.
+I have a program where it manages Contacts in a struct and for some reason when I update a contact, it doesn't reset or leave the field blank if I choose not to edit it.
+Update function:
+void updateContact(struct Contact contact[], int update) {
+    char contactInput[11] = { '\0' };
+    int ans = 0;
+    int contactIndex;
+    int contactx;
+
+    printf("Enter the cell number for the contact: ");
+    getTenDigitPhone(contactInput);
+
+    contactIndex = findContactIndex(contact, update, contactInput);
+    contactx = findContactIndex(contact, update, contactInput);
+
+    if (contactx == -1) {
+        printf("*** Contact NOT FOUND ***\n");
+    }
+    else {
+        printf("\nContact found:\n");
+        displayContact(&contact[contactIndex]);
+
+        printf("\nDo you want to update the name? (y or n): ");
+        ans = yes();
+
+        if (ans == 1) {
+            getName(&contact[contactIndex].name);
+        }
+
+        printf("Do you want to update the address? (y or n): ");
+        ans = yes();
+
+        if (ans == 1) {
+            getAddress(&contact[contactIndex].address);
+        }
+
+        printf("Do you want to update the numbers? (y or n): ");
+        ans = yes();
+
+        if (ans == 1) {
+                getNumber(&contact[contactIndex].numbers);
+        }      
+    }    
+}
+
+Struct:
+struct Contact contact[MAXCONTACTS] =
+{       {           { "Rick", { '\0' }, "Grimes" },
+        { 11, "Trailer Park", 0, "AJA 2J2", "King City" },
+        { "4161112222", "2162223333", "4163334444" }        },
+
+    {           { "Maggie", "R.", "Greene" },
+        { 55, "Hightop House", 0, "A9A 3K3", "Bolton" },
+        { "9051112222", "9052223333", "9053334444" }        },
+
+getNumber Function:
+void getNumber(struct Number *num) {
+    int response;
+
+    printf("Please enter the contact's cell phone number: ");
+    getTenDigitPhone(num->cell);
+    //      scanf("%10s", num->cell);
+    //      *num->cell = getInt();
+
+    printf("Do you want to enter a home phone number? (y or n): ");
+    response = yes();
+
+    if (response == 1) {
+        printf("Please enter the contact's home phone number: ");
+        getTenDigitPhone(num->home);
+        //      scanf("%10s", num->home);
+        //      *num->home = getInt();
+    }
+
+    printf("Do you want to enter a business phone number? (y or n): ");
+    response = yes();
+
+    if (response == 1) {
+        printf("Please enter the contact's business phone number: ");
+        getTenDigitPhone(num->business);
+        //      scanf("%10s", num->business);
+        //      *num->business = getInt();
+    }    }
+
+I want to leave the field blank (if I didn't update it) after I update the contact. I don't know how to delete a member struct so please help me, I will really appreciate it.Set the struct field to a null pointer, or a pointer to "my blank string"
+*num->cell = 0;
+If you do this, you'll have to check for null later.  
+Or you can do  *num->cell = myBlankString;  , where blank string is defined as
+char myBlankString[1] = "";
+This is a printable, blank string.Seg fault when trying to compute Arithmetic Operation Time in CI am writing a program that multiplies two Matrice's and the third Matrix prints the results. Along with that I want to compute the arithmetic operation time that I specified in my code below, however I keep getting a segmentation fault and I believe I am using the time.h/clock() library function correctly. Ive provided a snippet of the section giving me problems.
+    /**  Third Matrix  **/ 
+    for (i = 0; i < N; i++) {
+        for (x = 0; x < N; x++) {
+            arr3[i][x] = 0;
+            for (y = 0; y < N; y++)
+                arr3[i][x] = arr3[i][x] + arr1[i][y] * arr2[y][x];
+        }
+    }
+
+    arithmeticBegin = clock(); //begins the clock for arithmetic time
+
+    //the following line is what was causing the seg fault
+    arr3[i][x] = arr3[i][x] + arr1[i][y] * arr2[y][x];
+
+    arithmetic_endTime = clock(); //stops the clock for the end of arithmetic time
+    /**  The following computers total arithmetic Time **/
+    arithmeticTime += (double)(arithmetic_endTime - arithmeticBegin) / CLOCKS_PER_SEC;//the following line is what was causing the seg fault
+  arr3[i][x] = arr3[i][x] + arr1[i][y] * arr2[y][x];
+
+
+That's because you are accessing the arrays using out of bounds indices for all the arrays.
+Remove that line. It does not seem to be doing anything useful.
+
+Couple more observations.
+
+Your computations are likely causing integer overflow since rand() can return anything between [0 - RAND_MAX]. You may want to use a smaller number for the elements of your matrix, such as rand() % 100000.
+The printf call creates output without any whitespace between elements. You may want to to add a space between the elements. 
+ printf ("%4d ", arr3[i][x]);What is TCACHE?I'm playing around with binary exploitation on linux for a long time, and recently I'm writing some heap exploitation notes based on ptmalloc, so I go back to view some payloads from past security challenges I've solved and astonishingly they didn't work anymore.  
+For example, the basic double free corruption (not fastbin)
+char *chunk1 = malloc(0xc0);
+free(chunk1);
+free(chunk1);
+
+I expected to see something like  
+*** Error in `main': double free or corruption (top): 0x0000000000c85010 ***  
+
+But no, there's nothing happen and the program exit normally.   
+For that I go to check the glibc source code corresponding to my machine - Debian GLIBC 2.27-2, and found very difference in malloc.c.  
+void *
+__libc_malloc (size_t bytes)
+{     
+...
+#if USE_TCACHE
+  /* int_free also calls request2size, be careful to not pad twice.  */
+  size_t tbytes;
+  checked_request2size (bytes, tbytes);
+  size_t tc_idx = csize2tidx (tbytes);
+
+  MAYBE_INIT_TCACHE ();
+
+  DIAG_PUSH_NEEDS_COMMENT;
+  if (tc_idx < mp_.tcache_bins
+      /*&& tc_idx < TCACHE_MAX_BINS*/ /* to appease gcc */
+      && tcache
+      && tcache->entries[tc_idx] != NULL)
+    {
+      return tcache_get (tc_idx);
+    }
+  DIAG_POP_NEEDS_COMMENT;
+#endif
+
+the USE_TCACHE also appears in many other places.  
+then I went back my program above and found chunk1 was not placed in small bin but in tcache_entry.  
+what's the purpose of TCACHE ? I search a lot and still confused.The Thread Local Cache (tcache) is a performance optimization in glibc. Unfortunately, it comes at the expense of security and make some attacks much easier, as you have since discovered.
+From https://sourceware.org/glibc/wiki/MallocInternals#Thread_Local_Cache_.28tcache.29
+
+While this malloc is aware of multiple threads, that's pretty much the extent of its awareness - it knows there are multiple threads. There is no code in this malloc to optimize it for NUMA architectures, coordinate thread locality, sort threads by core, etc. It is assumed that the kernel will handle those issues sufficiently well.
+Each thread has a thread-local variable that remembers which arena it last used. If that arena is in use when a thread needs to use it the thread will block to wait for the arena to become free. If the thread has never used an arena before then it may try to reuse an unused one, create a new one, or pick the next one on the global list.
+Each thread has a per-thread cache (called the tcache) containing a small collection of chunks which can be accessed without needing to lock an arena. These chunks are stored as an array of singly-linked lists, like fastbins, but with links pointing to the payload (user area) not the chunk header. Each bin contains one size chunk, so the array is indexed (indirectly) by chunk size. Unlike fastbins, the tcache is limited in how many chunks are allowed in each bin (tcache_count). If the tcache bin is empty for a given requested size, the next larger sized chunk is not used (could cause internal fragmentation), instead the fallback is to use the normal malloc routines i.e. locking the thread's arena and working from there.How do you check if a serial port is open in Linux?How does one check if a serial port is already open in Linux using Posix/C functions? I want to check the status of the serial port to check if the serial port is open or not.
+I would like to know what methods work for:
+
+Checking the file descriptor to see if the serial port is open and
+Checking the serial port file name to see if the the serial port is open which in the example below is "/dev/ttyUSB0"
+
+--
+// This code is for example purposes only
+
+int open_port()
+{
+  int fd;
+
+  fd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_NDELAY);
+  if (fd < 0)
+  {
+    perror("open_port: Unable to open /dev/ttyf1 - ");
+  }
+
+  return fd;
+} 
+
+I imagine there is a "standard" way of doing this, and that is what I am trying to get to.There are two aspects to the stated question, which really require two different solutions:
+
+An application or service daemon using a serial port should exclude other processes from using the port concurrently.
+There are two ways of doing this: exclusive mode, and an advisory lock. An application can choose to do one, or both.
+
+After opening the device, use ioctl(fd, TIOCEXCL) to put the serial port into exclusive mode. Until the descriptor is closed, or the process issues ioctl(fd, TIOCNXCL), any attempt to open the device will fail with EBUSY error code.
+After opening the device, use flock(fd, LOCK_EX | LOCK_NB) to try and place an exclusive advisory lock on the open device. Other processes can still open the device normally, and even read and write to it, but trying to place an advisory flock lock on it will fail with EWOULDBLOCK (or block until unlocked or closed if placed without LOCK_NB). 
+
+The difference between the above two approaches is that the latter is co-operative, allowing other processes to open the device; while the former disallows further opens.
+The reason to use both, is to detect if another process has already opened the device without putting it into exclusive mode, but has hopefully set the advisory lock. In that case, the open() and ioctl() both succeed, but the flock() fails.
+(We can use the second aspect of this question discussed below — after having opened the device, set it to exclusive mode, and even obtained the exclusive lock on it —, to detect if other processes have the device open but not exclusive or locked. Personally, I wouldn't bother; I do expect users to only use sane applications on their systems. If they really did that, I'd expect them to have a reason for it, so I'd prefer to allow that oddball scenario. It definitely should not occur with standard utilities.) 
+An application or daemon can use lsof (from the lsof package) to examine if any process has the specified file or device open.
+The idea is to run the equivalent of LANG=C LC_ALL=C lsof -F -p DEVICE with root privileges. The output will contain zero or more lines. The lines beginning with p (and immediately followed with the PID and a newline \n) specify the processes that have DEVICE open. (Each such line is followed by one or more lines starting with f, describing which descriptor in that process refer to the device.)
+If the application or daemon does not have root privileges, a helper program that is installed setuid root is needed. It is supplied with one or more device names. The helper program verifies each one is a character device using stat() and S_IFCHR(st_mode) (to avoid the helper being used in security exploits); and if they are, executes the above-mentioned command. In Linux, such helpers are usually installed in /usr/lib/APPLICATION/, where APPLICATION is the name of the application or daemon.
+The application or daemon itself can execute the helper via popen("/path/to/helper 2>/dev/null", "r"), and read the input using for example fscanf(). (Remember to use pclose() to obtain the status, and use e.g. (WIFEXITED(status) && !WEXITSTATUS(status)) to verify the command was successful.
+Note that the helper program approach allows easier portability to other POSIXy systems from Linux, by simply replacing the helper program with one appropriate to the new system. Even if it is not installed as setuid root, it gives system maintainers an easy hook to modify the behaviour of the application or service, if such need arises.  I personally warmly recommend the helper approach.How to read a variable found in the middle of a file [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+So my file has this content: 
+Name: Bob Charles
+Address: 10 strawberry avenue, port
+Age: 19
+Tel num: 2383234
+Balance: $100.00
+
+I want to read the balance and store it in a float variable. If I use fseek it will only work for this specific person, as another person may have a different address, balance etc. I've tried to following as a second option: 
+FILE *fp;
+fp = fopen(query, "r");
+fscanf(fp, "\n\n\n\n Balance: $%f", &newBal);    
+fclose(fp);
+printf("bal: %d", newBal);
+
+This prints newBal as 0
+Any help is appreciatedThe best strategy for dealing with such files is:
+
+Read a line of text.
+Decide how to interpret the contents of the line.
+Repeat until there are no more lines.
+
+
+// Make it as large as you need
+#define LINE_SIZE 200
+
+char line[LINE_SIZE];
+FILE *fp;
+fp = fopen(query, "r");
+if ( fp == NULL )
+{
+   // Deal with error
+   exit(1);
+}
+
+while ( fgets(line, LINE_SIZE, fp) != NULL )
+{
+    processLine(line);
+}
+
+fclose(fp);
+
+where processLine can be defined as:
+void processLine(char* line)
+{
+    char const* nameToken = "Name:";
+    char const* addressToken = "Address:";
+    char const* ageToken = "Age:";
+    char const* telNumToken = "Tel num:";
+    char const* balanceToken = "Balance:";
+
+    if ( startsWith(line, nameToken) )
+    {
+        // Deal with name
+    }
+
+    else if ( startsWith(line, addressToken) )
+    {
+        // Deal with address
+    }
+
+    else if ( startsWith(line, ageToken) )
+    {
+        // Deal with age
+    }
+
+    else if ( startsWith(line, telNumToken) )
+    {
+        // Deal with tel number
+    }
+
+    else if ( startsWith(line, balanceToken) )
+    {
+        // Deal with balance
+    }
+}
+
+and  startsWith can be defined as:
+bool startsWith(char* line, char const* token)
+{
+   return (strncmp(line, token, strlen(token)) == 0);
+}You can use fgets to read a file line by line.
+ssize_t read = -1;
+
+size_t len = 0;
+
+FILE * file = NULL;
+
+file = fopen("file.txt", "r");
+
+if (file == NULL)
+{
+    // handle error
+}
+
+char line[256];
+
+size_t line_sz = sizeof(line) - 1;
+
+while (fgets(line, line_sz, file) != NULL)
+{
+    char *key = NULL;
+
+    char *value = NULL;
+
+    sscanf(line, "%s:%s", &key, &value);
+
+    // handle key and value
+}Functions not being Called in C [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+Hi i am trying to use Functions to output the contents of an array through ascending order but the Function is incorrectly working to my specific outcome, specifically inside the Bubblesort Function Does anyone know why?
+
+I have been trying to figure this out for numerous hours, so would be great to get some emphasis.
+The comments towards the bottom are for the descending order output.
+current output of Ascending Function
+int main() 
+{
+   int arrayHeight, array[100][2], xCoord, yCoord, i;
+   printf ("***** Bubble Sort ***** \n");
+   printf("How many items of data do you wish to enter? ");
+   scanf("%d",&arrayHeight);
+   for(i=0; i<arrayHeight; i++)
+   {
+      printf("Please enter in the X coordinate: ");
+      scanf("%d", &xCoord);
+      printf("Please enter in the Y coordinate: ");
+      scanf("%d", &yCoord);
+      array[i][0] = xCoord;
+      array[i][1] = yCoord;
+   }
+   DisplayArray(array,arrayHeight);
+   Bubblesort (array, arrayHeight);
+}
+
+int DisplayArray(int array[100][2],int arrayHeight, int swap) 
+{
+   /*Displaying Array elements*/
+   int i, j;
+   printf("\n The 2-D Array contains : \n");
+   for(i=0; i<arrayHeight; i++)
+   {
+      printf("[%d][%d]\n\r", array[i][0], array[i][1]);
+   }
+}  
+
+int BubbleSort(int array[100][2], int arrayHeight) /*Start of the Function Usage*/
+{   
+   /*Sorts the Array elements into appropriate chosen sorting order - Ascending*/
+   int swap, i, j;
+   /*for(k =0; k< arrayHeight; k++) {*/
+      for (i = 0; i <arrayHeight ; i++) {
+         for (j = i+1; j < 3; ++j) {
+            if (array[i][0] > array[i][1])  {
+               swap = array[i][0];
+               array[i][0] = array[i][1];
+               array[i][1] = swap;
+            }
+         }  
+      }
+      ("\n Printing in Asending Order: ");
+      for (i=0; i<arrayHeight; i++)
+      {
+         for (j=0; j<arrayHeight; j++)
+         {
+            printf("\n %d ", swap);
+         }
+      }
+   BubbleSort(array, swap);  
+   }
+   for(k =0; k< 2; k++) {/* These lines of code sort out the stored array 
+number into the appropriate order - Descending
+   for (i = 0; i < 3; i++) {
+      for (j = i+1; j < 3; ++j) {
+         if (a[k][j] > a[k][i])  {
+            int swap = a[k][j];
+            a[k][j] = a[k][i];
+            a[k][i] = swap;
+         }
+      }
+   } 
+}   
+printf("\n Printing in Descending Order: ");
+for (j=0; j<2; j++)
+{
+    for (i=0; i<3; i++)
+    {
+        printf("\n %d ", a[j][i]);
+        if (i==2)
+        {
+            printf("\n");
+        }   
+    }
+}of all declare the prototype of the function or write the function above the main
+first call the Bubblesort and then call the DisplayArray function
+i think the logic of the program is broken here
+enter code here
+ //this is wrong code logically  !!!!!!!!!
+for (i = 0; i <arrayHeight ; i++) {
+for (j = i+1; j < 3; ++j) {
+   if (array[i][0] > array[i][1])  {
+       swap = array[i][0];
+       array[i][0] = array[i][1];
+       array[i][1] = swap;
+    }
+}
+
+}
+
+the looping done using j but it is not used anywhere in the program i think it is a mistakeARM assembly recursive power functionNeed to convert the following C code into ARM assembly subroutine:
+ int power(int x, unsigned int n) 
+ {          
+   int y; 
+   if (n == 0)  
+     return 1; 
+   if (n & 1) 
+     return x * power(x, n - 1); 
+   else 
+   { y = power(x, n >> 1); 
+     return y * y; 
+   } 
+ }     
+
+Here's what I have so far but cant figure out how to get the link register to increment after each return (keeps looping back to the same point)
+pow             CMP             r0, #0
+                MOVEQ           r0, #1
+                BXEQ            lr
+                TST             r0, #1
+                BEQ             skip
+                SUB             r0, r0, #1
+                BL              pow
+                MUL             r0, r1, r0
+                BX              lr
+skip            LSR             r0, #1
+                BL              pow
+                MUL             r3, r0, r3
+                BX              lrThe BL instruction does not automatically push or pop anything from the stack. This saves a memory access. It's the way it works with RISC processors (in part because they offer 30 general purpose registers.)
+STR   lr, [sp, #-4]!   ; "PUSH lr"
+BL    pow
+LDR   lr, [sp], #4     ; "POP lr"
+
+If you repeat a BL call, then you want to STR/LDR on the stack outside of the loop.Mechanism for including header files in C main bodyFor a large software developed by C, we first declare all the self-defined functions in a separate header file (e.g. myfun.h). After that, once we write a code (e.g. main.c) that uses the functions listed in myfun.h, we have to #include "myfun.h". I'm wondering how it works, because even if I include the function names declared in header file before the main body, the code cannot see the function details in main.c. I guess it will search the library to get the function details...Am I right?When you say "it will search the library for the function details" you're not far off, but that isn't quite right. A function declaration, i.e.. a function prototype only contains enough information for the compiler to do two things:
+
+First, the compiler will register the function as a known identifier so that it knows what you're taking about when you call it, as opposed to a random string of letters with parentheses (to the compiler, they are essentially the same thing without a function prototype for either - an error). 
+Second, the compiler uses the function prototype for checking code correctness. Correctness in this sense means that a function call will match the prototype in both arity and type. In other words a function call to int square(int a, int b); will have two arguments, both integers.
+
+The program doesn't "search the library," though. Function names without parentheses are not function calls but rather function's address. Therefore, when you call a function, the processor jumps to the memory location of the function. (This assumes the function has not been inlined.)
+Where is this function located though? It depends. If you wrote the function in the same module, i.e... a .c file that got compiled into an object linked with the main.c file into a single executable, then the location of the function will be somewhere in the .TEXT section of the executable. In other words, it's just a slight offset from the main function's entry point. In a huge project this offset won't be so slight, but it will be shorter than the offset of separate objects.
+Having said that, if you compiled this hypothetical function into a DLL which you call from your main program, then the function's address will be determined in one of two ways:
+
+Either you will have generated a .lib/.a? (depending on whether you're on Windows or Linux) file containing the function declaration's and addresses, or:
+You will use run-time linking where the main program will calculate the function addresses when it loads the .dll/.so into its address space. First, it will determine where to load it. You can set DLL's to have preferred offsets to optimize load time. Otherwise, libraries will start loading from the first segment available and any additional libraries will need their function address recalculated using this new address, hampering initial load times. Once they are loaded into the program's memory though, there shouldn't be any performance hits thereafter.
+
+
+Going back to the preprocessor, it's important to note two things. First, it runs before any compilation takes place. This is important. Since the program is not really being "compiled" when the preprocessor is doing its thing, macros are not type-safe. (Insert Haskell joke about C "type safety") This is why you don't -or shouldn't- see macros in C++. Anything that can be accomplished with macros in C can be accomplished by const and inline functions in C++, with the added benefit of type safety.
+Second, the preprocessor is almost just a search and replace engine. For example, in the following code, nothing happens because the preprocessor if statement evaluates to false, since I never defined anything. The preprocessor removes the code in this section. Remember that since the compiler has not run in earnest yet, this removed code will not be compiled. This fact is usually utilized to implement functions for debugging or logging in debug builds. In release builds the preprocessor definition is then manipulated such that the debug code is not included.
+#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+    #if TRUE
+    printf("Hello, World!");
+    #endif
+
+return EXIT_SUCCESS;
+}
+
+In fact, the EXIT_SUCCESS macro I used is defined in stdlib.h, and replaced by 0. (EXIT_FAILURE =1).
+Back in the day, the preprocessor was used as duct tape, basically, to compensate for faults in C.
+For example, since const values can't be used as array sizes, macros were used instead, like this:
+// Not valid C89, possibly even C99
+const int DEFAULT_BUFFER_SIZE = 128;
+char user_input[DEFAULT_BUFFER_SIZE]; 
+
+// Legal since the dawn of time
+#define DEFAULT_BUFFER_SIZE 128
+char user_input[DEFAULT_BUFFER_SIZE];
+
+Another significant use of the preprocessor was for code portability, for example:
+#ifdef WIN32 
+// Do windows things
+#elif
+// Handle other OS
+#endif
+
+One trick was to define a generic function and set it to the appropriate OS-dependent one (Remember that functions without the parentheses represent the function's address, not an actual function call), like this:
+void RequestSomeKernelAction();
+
+#ifdef WIN32
+RequestSomeKernelAction = WindowsVersion;
+#else
+RequestSomeKernelAction = OtherOSFunction;
+#endif
+
+This is all to say that the code you see in header files follows these same rules. If I have the following header file:
+#ifndef SRC_INCLUDES_TEST_H
+#define SRC_INCLUDES_TEST_H
+
+int square(int a);
+
+#endif /** SRC_INCLUDES_TEST_H */
+
+And I have this main.c file:
+#define SRC_INCLUDES_TEST_H
+#include "test.h"
+
+int main()
+{
+    int n = square(4);
+}
+
+This program will not compile. The square function will not be known to main.c because while I did include the header file where square is declared, my #define SRC_INCLUDES_TEST_H statement tells the preprocessor to copy all the header file contents over to main except those in the block where SRC_INCLUDES_TEST_H is defined, i.e... nothing.
+These preprocessor commands can be nested, and there are several, which I highly recommend you look up, if only for historical or pedagogical reasons.
+The last point I will make is that while the C preprocessor has its faults, it was a powerful tool in the right hands, and in fact, the first C++ compiler Bjarne Stroustroup wrote was essentially just a  preprocessor.write on closed connection doesn't generate sigpipe immediatelyI've this problem with my server/client on C. If I close the server socket after a SIGINT, and then I try to write on this closed connection from the client, I've to do write two times before than client generates SIGPIPE. Shouldn't it generate it immediately? Is this a normal behaviour or something I need to fix? This is my code. I'm testing things on ubuntu, same PC, connecting via 127.0.0.1.
+server.c
+sigset_t set;
+struct sigaction sign;
+int sock_acc;
+int sock;
+
+void closeSig(){
+    close(sock_acc);
+    close(sock);
+    exit(1);
+}
+
+
+int main(){
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sig.sa_sigaction = &closeSig;
+    sig.sa_flags = SA_SIGINFO;
+    sig.sa_mask = set;
+    sigaction(SIGINT, &sig, NULL);
+    //other code to accept the connection from the client
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+    //write/read calls
+}
+
+client.c
+void closeSigPipe(){
+    close(ds_sock);
+    printf("Stop...");
+    exit(1);
+}
+
+int main(){
+    sigpipe.sa_sigaction = &closeSigPipe;
+    sigpipe.sa_flags = SA_SIGINFO;
+    sigaction(SIGPIPE, &sigpipe, NULL);
+    //other code to connect the server, and write/read calls
+}
+
+The problem is that when I close the server terminal with CTRL+C, the first write to the connection from the client works without any problem... perror("Error:"); prints "success"...The TCP protocol doesn't provide a way for the receiver to tell the sender that it's closing the connection. When it closes the connection, it sends a FIN segment, but this just means that it's done sending, not that it can no longer receive.
+The way the sender detects that the connection has been closed is that it tries to send data, and the receiver sends back a RST segment in response. But writing to a socket doesn't wait for the response, it just queues the data and returns immediately. The signal occurs when the RST is received, which will be a short time later.
+The reason you have to do two writes may be because of Nagle's Algorithm. To avoid excessive network overhead, TCP tries to combine short messages into a single segment. The Wikipedia page includes some workarounds for this.How to return a string by replacing with another string in c#include<stdio.h>
+
+char str(char *s) {  
+    char s1[100];
+    printf("another string to replace:");
+    scanf("%d",s1);  
+    s=s1;  
+    return s;
+}
+
+void main() {  
+    char s[100],s2[100];  
+    scanf("%s",s);  
+    s2=str(s);  
+    printf("%s",s);
+}
+
+How to return a string by replacing with another string in c??I'm unable to replace the string using functionsWhat you're going to want to do is copy the values of the characters in s1 into your s variable. not just set one equal to the other. either using strcpy or looping through your characters in s1 and copying them directly to the correct locations in s.
+https://www.tutorialspoint.com/c_standard_library/c_function_strcpy.htm
+this works for me without using strcpy:
+#include<stdio.h>
+
+void str(char *s) {  
+    char s1[100];
+    printf("another string to replace:");
+    scanf("%s",s1);  
+    // not real safe but we know s and s1 have 100 characters.
+    for(int i = 0; i < 100; i++) {
+        s[i] = s1[i];
+    }   
+}
+
+int main() {  
+    char s[100],s2[100];  
+    scanf("%s",s);  
+    str(s);  
+    printf("%s",s);
+}There a several things to say about your code.
+
+You can't copy strings using =
+The return type is wrong. Must be char*
+The scanf format string is wrong. Use %s for strings.
+You don't need an extra array in the function. Just scanf directly into s
+Never do scanf("%s", ... Always put a limit to it like scanf("%99s", ...
+
+Something like:
+char* str(char *s) {  
+    printf("another string to replace:");
+    scanf("%99s",s);  
+    return s;
+}
+
+void main() {  
+    char s[100],s2[100];  
+    scanf("%99s",s);    
+    strcpy(s2, str(s));  
+    printf("%s",s);
+}
+
+I am, however, not sure what you want the code to do. As it is now s and s2 just end as identical strings.
+If you just want a function that can read a new value into s it can be done like:
+void str(char *s) {  
+    printf("another string to replace:");
+    scanf("%99s",s);  
+}
+
+void main() {  
+    char s[100];  
+    scanf("%99s",s);    
+    str(s);
+    printf("%s",s);
+}Initializing a dynamically allocated array with a specific value in CSo, I have dynamically allocated memory for an array and I want initialize all its values to a specific value (which is an element of an enumeration).
+Here's what I've done so far:
+    typedef enum{APPLE, BANANA, ORANGE} fruit;
+    typedef struct Smoothie Smoothie;
+    struct Smoothie {
+        fruit* tab;
+    };
+
+This is all the structures I've defined so far. Now, to create the "Smoothie", I do the following:
+    Smoothie init(size_t n) {
+         Smoothie* juice = malloc(sizeof(Smoothie));
+         if (juice == NULL) {
+             //error msg in case the allocation has failed.
+         }
+         juice->tab = calloc(n, sizeof(fruit));
+         if (juice->tab == NULL) {
+              //error msg in case the allocation has failed.
+         }
+         memset(juice->tab, APPLE, n*sizeof(fruit));
+         return *juice;
+    }
+
+My question is the following. From what I've been able to read on the internet, I know that  calloc() already initializes all the values of the array at 0. In an enumeration, all the elements have a numerical value (by default, my enumeration has the following values: Apple = 0  BANANA = 1  ORANGE  = 2). So, since I want to initialize all the values of my array to APPLE, is it very useful to use memset() ?
+In other words, what happens if I do not use memset()? How can I be sure that the compiler will understand that the values in my array are fruit variables and not just integers?
+PS: I know that I could use a loop ot initilize my array, but the whole point of this is to actually avoid using the loop.So, since I want to initialize all the values of my array to APPLE, is it very useful to use memset()?
+
+No. memset() fills an area with a byte value. The size of an enum can vary, but it is normally an int, which is larger than a byte. You will fill your memory with something undefined. (Except of course for the enum member with the value 0)
+
+How can I be sure that the compiler will understand that the values in my array are fruit variables and not just integers?
+
+You already did that by declaring it of type fruit. But it doesn't help much, because the conversion between integer and enum value in C is implicit.
+
+All in all, if you need to initialize memory to an enum value other than 0, you will need to write a loop. If you indeed want the value corresponding to 0, calloc() will do, it doesn't matter as 0 is still 0 :)C: fprintf does not workI have a long C code. At the beginning I open two files and write something on them:  
+  ffitness_data = fopen("fitness_data.txt","w");
+  if( ffitness_data == NULL){
+    printf("Impossible to open the fitness data file\n");
+    exit(1);
+  }else{
+    fprintf(ffitness_data,"#This file contains all the data that are function of fitness.\n");
+    fprintf(ffitness_data,"#Columns: f,<p>(f),<l>(f).\n\n");
+  }
+  fmeme_data = fopen("meme_data.txt","w");
+  if( fmeme_data == NULL){
+    printf("Impossible to open the meme data file\n");
+    exit(1);
+  }else{
+    fprintf(fmeme_data,"#This file contains all the data relative to memes.\n");
+    fprintf(fmeme_data,"#Columns: fitness, popularity, lifetime.\n\n");
+  }  
+
+Everything is fine at this step: files are open and two lines are written on them. 
+Then I have a long simluation of a stochastic process, whose code is not interesting for the question's purposes: the files and their pointers are never used. At the end of the process I have:
+for(i=0;i<data;i++){ 
+ fprintf(fmeme_data,"%f\t%d\t%f\n",meme[i].fitness,meme[i].popularity,meme[i].lifetime);
+}
+for(i=0;i<40;i++){
+ fprintf(ffitness_data,"%f\t%f\t%f\n",(1.0/40)*(i+0.5),popularity_histo[i],lifetime_histo[i]);
+}
+
+Then I DO fflush() and fclose() of both files. 
+If I make the code run on my laptop, both files are filled. If the code runs on a remote server, the file fitness_data.txt contains only the first print, i.e. the print starting with # but doesn't contain the data. I want you to note that:
+
+The other file never gives me problems.
+I'm used to this server. Something similar never happened.
+
+Given all these information, the question is: 
+Why it is happening that a certain command, used always in the same way and in the same code, always works on a server while on a different server it works sometime but sometime it doesn't?
+Admins: I don't think this question is a duplicate. All similar questions were solved by asjusting the code (here) or adding fflush() (here) and similar things. Here is not a problem in the code (in my modest opinion) because on my laptop it works. I bet it works on most.We can't say for certain what's going on here, because we don't have your full program nor do we have access to the server where the problem happens.  But, we can give you some debugging advice.
+
+When a C program behaves differently on one computer than another, the very first thing you should suspect is memory corruption.  The best available tool for finding memory corruption is valgrind.  Fix the first invalid operation it reports and repeat until it reports no more invalid operations.  There are excellent odds that the problem will have then gone away.
+Turn up the warning levels as high as they can go and fix all of the complaints, even the ones that look silly.
+You say you are calling fflush and fclose, but are you checking whether they failed?  Check thoroughly, like this:
+if (ferror(ffitness_data) || fflush(ffitness_data) || fclose(ffitness_data)) {
+    perror("write error on fitness_data.txt");
+    exit(1);
+}
+
+Does the problem go away if you change the optimization level you are compiling with?  If so, you may have a bug that causes "undefined behavior".  Unfortunately there are a lot of possible ways to do that and I can't easily explain how to look for them.
+Use a tool like C-Reduce to cut your program down to a smaller program that still doesn't work correctly but is short enough to post here in its entirety.
+Read and follow the instructions in the article "How to Debug Small Programs"..How to compile zlib into a DLL on Visual Studio 2017?I have a hard time trying to do something I think is really simple (I must not be the first one to want to do that). I use Visual Studio 2017 on Windows 7 to do some C code, and I need inflate/deflate for zip.
+I search a little, and I found zlib. It seem to be exactly what I search: free, cool copyright, no patent and extensively used and tested in other project.
+So, I start to download the latest version (zip of 1.2.11) and here I go, trying to "simply" get the DLL.
+However, the documentation state that in order to compile "zlib1.dll", I have to use "./contrib/vstudio/vc..", with ".." the right Visual Studio. But I have Visual Studio 2017 and there are only "vc9" to "vc14", "vc14" being Visual Studio 2015.
+The doc say that I have to use Microsoft Visual C++ 2015, and indeed, when I force open with vs2017, I have integrity error.
+So I try to install MVC++ 2015, but then it say that I can't install it because I already have something (VS2017) installed.
+Is there really no way to achieve something so basic, or there is knowledge that I don't know?Open source projects can be a challenge to build as their support tends to lag well behind the latest versions of Visual Studio. This is one reason why Visual Studio now supports cmake directly.
+That said, the easiest way to build zlib for Windows is just use a NuGet package. I personally use zlib-msvc14-x86 or zlib-msvc14-x64 which are binary compatible with VS 2015 Update 3, VS 2017, and VS 2019. They also provide a static library instead of a DLL.Is there any restriction about the compare function used in qsort()I wrote this code snippet to sort an array of strings into an order that minimises their concatenation:
+#include<stdio.h>
+#include<string.h>
+#include<stdlib.h>
+
+int cmpstr(const void* p1, const void* p2){
+    int p1l = strlen((const char*)p1);
+    int p2l = strlen((const char*)p2);
+    int r = strncmp((const char*)p1, (const char*)p2, p1l<p2l?p1l:p2l);
+    if(r == 0 && p1l != p2l){
+        if(p1l < p2l){
+            return cmpstr(p1, (const char*)p2 + p1l);
+        }
+        return cmpstr((const char*)p1 + p2l, p2);
+    }
+    return r;
+}
+
+int main(){
+    const char* arrstr[] = {"93", "936", "15", "152", "946"};
+    int num = sizeof(arrstr) / sizeof(char*);
+    qsort(arrstr, num, sizeof(char*), cmpstr);
+    for(int i = 0; i < num; i++){
+        printf("%s\n", arrstr[i]);
+    }
+}
+
+These strings should sort in the order 15 152 936 93 946.  We want 93 to be between 936 and 946 because 936 93 < 93 936 and 93 946 < 946 93 (ignoring the spaces added for clarity).
+But the code didn't work as expected. The array didn't get sorted at all, although my tests of cmpstr() worked exactly as I expected.
+What did I get wrong?
+I noticed that when I change the cast part of the cmpstr() from *(char* const*) to (char*), qsort() doesn't work as well.  Why is that?The comparison function passed to qsort receives the address of the two array elements to compare.  Since each array element is a char *, the address of each of these elements is a char **.  So you're missing one level of indirection.
+You need to cast each parameter to a char * const *, then dereference to get the pointer to the string:
+int cmpstr(const void* p1p, const void* p2p){
+    char *p1 = *(char * const *)p1p;
+    char *p2 = *(char * const *)p2p;
+    ...
+}
+
+EDIT:
+Because you want to call this function recursively, you need a non-recursive wrapper function around your recursive function since the parameters they take are not the same:
+// internal recursive function that takes two strings
+static int cmpstr_int(const char* p1, const char* p2){
+    int p1l = strlen(p1);
+    int p2l = strlen(p2);
+    int r = strncmp(p1, p2, p1l<p2l?p1l:p2l);
+    if(r == 0 && p1l != p2l){
+        if(p1l < p2l){
+            return cmpstr_int(p1, p2 + p1l);
+        }
+        return cmpstr_int(p1 + p2l, p2);
+    }
+    return r;
+}
+
+// comparison function that extracts desired datatype from void * params
+// and passes them to recursive function
+static int cmpstr(const void* p1p, const void* p2p){
+    const char *p1 = *(char * const *)p1p;
+    const char *p2 = *(char * const *)p2p;
+    return cmpstr_int(p1, p2);
+}Your comparison function receives pointers to the elements of the array.  Each element is a pointer to char, so you'll get a pointer to a pointer to char.
+The comparison logic is also somewhat over-complicated; here's a working version:
+#include<stdio.h>
+#include<string.h>
+#include<stdlib.h>
+
+int cmpstr(const void* a_, const void* b_)
+{
+    const char *const *a = a_;
+    const char *const *b = b_;
+    int la = strlen(*a);
+    int lb = strlen(*b);
+
+    if (la == lb) {
+        /* same length - sort lexicographically */
+        return strcmp(*a, *b);
+    }
+
+    if (la < lb) {
+        /* a is shorter */
+        int result = strncmp(*a, *b, la);
+        if (!result) {
+            /* a is a prefix of b */
+            result = strcmp(*a, *b + la);
+        }
+        return result;
+    }
+
+    /* else, b is shorter - re-enter with arguments swapped,
+       and negate the result */
+    return -cmpstr(b_, a_);
+}
+
+int main() {
+    const char* arrstr[] = {"93", "936", "15", "152", "946"};
+    const size_t num = sizeof arrstr / sizeof *arrstr;
+    qsort(arrstr, num, sizeof *arrstr, cmpstr);
+    for (size_t i = 0; i < num; i++) {
+        printf("%s\n", arrstr[i]);
+    }
+}
+
+Output:
+15
+152
+936
+93
+946
+
+If you think that my cmpstr() above deviates too far from the original, consider this less intrusively-modified code, which uses the recursive comparison that you intended, with a separate wrapper to adapt it to fit qsort():
+int compare_strings(const char *a, const char *b)
+{
+    int la = strlen(a);
+    int lb = strlen(b);
+    int r = strncmp(a, b, la<lb?la:lb);
+    if (r == 0 && la != lb) {
+        if (la < lb) {
+            return compare_strings(a, b + la);
+        }
+        return compare_strings(a + lb, b);
+    }
+    return r;
+}
+
+int compare_strings_qsort(const void* a_, const void* b_)
+{
+    const char *const *a = a_;
+    const char *const *b = b_;
+    return compare_strings(*a, *b);
+}
+
+I still had to change your variable names, as I find p1l and the like hard to read.  I could simplify a bit further, which I think is clearer than both the original function and my first attempt above (but probably needs some comments):
+int compare_strings(const char *a, const char *b)
+{
+    const int la = strlen(a);
+    const int lb = strlen(b);
+    const int r = strncmp(a, b, la<lb?la:lb);
+
+    return (la == lb || r)
+        ? r
+        : (la < lb)
+        ? compare_strings(a, b + la)
+        : compare_strings(a + lb, b);
+}Pass a pointer to an array value from Cython to CI have a structure in C that looks like this:
+typedef struct {
+    uint32_t id;
+    uint8_t *buf; // pointer to message data
+} msg_t;
+
+and some function that receives that a pointer to such structure and modifies it.
+void recv_msg( msg_t *msg ) {
+    // Stuff happens to message here
+    return;
+}
+
+With cytpes I tried something like this:
+from cytpes import CDLL, Structure, POINTER, c_ubyte, c_uint32
+
+class Msg(Structure):
+    _fields_ = [("id", c_uint32), ("buf", POINTER(c_ubyte * 10))]
+
+lib = CDLL("this_example.so")
+get_msg = lib.recv_msg
+get_msg.argtypes = [POINTER(Msg)]
+get_msg.restype = None
+
+sample_data_array = POINTER(c_ubyte * 10)()
+data = sample_data_array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+sample_msg = Msg(1, data)
+get_msg(sample_msg)
+print sample_msg.id, sample_msg.buf[0]  # Should change data
+
+I'm getting a TypeError('expected LP_c_ubyte_Array_10 instance, got list',)
+I've also tried a similar approach using Cython:
+from libc.stdint cimport uint8_t, uint32_t
+
+cdef extern from "this_example.h":
+    ctypedef struct msg_t:
+        uint32_t id;
+        uint8_t *buf;
+
+    void get_msg (msg_t *)
+
+def recv_msg():
+    # How I would do this I don't know
+    print msg.id, msg.buf[0]
+
+I should also add, I don't want use numpy (but would reluctantly if I have to). Also, the length of the data array can vary, but I also have a length variable in the msg structure, so I can initialise it to the right length for sending, and just set it to default values and max length for receiving. 
+Any clues? Thanks!I'm open to accepting other answers, but for now I thought I would post my solution in the hopes it might help someone else. 
+I solved it using cytpes and not Cython. I would really like to see a Cython solution though. 
+from ctypes import CDLL, Structure, POINTER, c_uint8, c_uint32, byref
+
+class Msg(Structure):
+    _fields_ = [("id", c_uint32), ("buf", POINTER(c_uint8))]
+
+lib = CDLL('this_example.so')
+get_msg = lib.recv_msg
+get_msg.argtypes = [POINTER(Msg)]
+get_msg.restype = None
+
+data = (c_uint8 * 8)()
+sample_msg = Msg(1, data)
+get_msg(byref(sample_msg))
+print sample_msg.id, sample_msg.buf[0]  # Should see changed dataData corruption due to opening a new file in CI have the following code wherein, I return a memory address to a pointer whose location in which I store a string.
+The code looks something like this:
+char* segs[1];
+segs[0] = (char *) myfunction("name", 100);
+//myfunction(Name,size of the memory to be allocated)
+
+FILE *write_log;
+write_log = fopen(redo_path,"a+");
+
+The function myfunction returns a memory location which is fixed as the base address of segs[0].
+The memory allocation in my goes along the lines of:
+FILE *fp_seg;
+fp_seg = fopen(compare,"r");
+//maps from disk to mem
+void *p;
+p = (void *)malloc(size_to_create); //Mapping
+int c;
+c = fread(p,size_to_create,1,fp_seg);
+
+We open a file on disk and generate a corresponding mapping of the address of the first location in the file. (p is more of a reference to the first location in the file).
+ISSUE:
+Opening an existing file with the write_log file pointer corrupts the contents of the string stored at the memory location segs[0].Upon debugging, I figured out that the memory regions spanned by the file and the segs[0] overlap, i.e.
+segs[0] had a memory location of 0x1cc5de0 and stored "Hello, world".
+write_log had a memory location of 0x1cc5d50
+My guess is that opening a file at that location corrupts the contents of seg[0]. 
+How do I overcome this issue? Is there a way to allocate memory such that the regions do not overlap?
+EDIT:
+My function is something like this:
+myfunction(char * compare, int size_to_create)
+{
+//size_to_create is the size of the memory we want to allocate to seg[0]
+//Create a file with the name compare in the disk
+FILE *fp_seg;
+fp_seg = fopen(compare,"r");
+
+//Read the file (File has no content as of now)
+
+void *p;
+p = (void *)malloc(size_to_create); //p has an address in main memory
+int c;
+c = fread(p,size_to_create,1,fp_seg);
+
+void *t;
+t=p;
+//Future reads will have the same mapping 
+
+free(p); 
+}The issue is with the freeing of the pointer p, which deallocates the memory.
+Thus there is no restriction on the system to not allocate the region originally pointed by p to another part of the code requesting memory.How to change if constructs in CI am working in an assignment for my intro to programming class. 
+Here is what my professor is asking: 
+Change the program without adding another loop, so it determines if the grade entered is valid, and if not, display an error message and keep asking until a valid grade is entered. Change the program, so it counts how many grades scored A, B, C, D, and F. Do NOT use stacked if or if-else constructs. Do NOT use the else if format. Output a table of the count of how many there are for each letter grade.
+Here is my code:
+#include <stdio.h>
+#include <stdlib.h>
+
+/*Ask the user to enter 10 test scores.
+The pass mark is 70%.
+Calculate the average score, and count how many
+of the students have passed the test.
+*/
+
+#define SCORES_COUNT 10
+#define BAD_SCORE 60
+#define PASSING_SCORE 70
+#define GOOD_SCORE 80
+#define EXCELLENT_SCORE 90
+
+int main()
+{
+    int scores[SCORES_COUNT];
+    int i, sum = 0, sum1 = 0, sum2 = 0, sum3 = 0, sum4 = 0;
+
+    for (i = 0; i < SCORES_COUNT; i++)
+        {
+        printf("Enter score for student %i: ", i + 1);
+        scanf("%i", &scores[i]);
+        if (scores[i] > 100 || scores[i] < 0)
+            {
+            printf("\n\tERROR: Invalid number! Enter a score above zero and below one hundred!\n\n");
+            printf("Enter score for student %i: ", i + 1);
+            scanf("%i", &scores[i]);
+            }
+        }
+
+    for (i = 0; i < SCORES_COUNT; i++)
+    {   
+        if (scores[i] >= EXCELLENT_SCORE)
+        {
+            sum++;
+        }
+        if (scores[i] >= GOOD_SCORE && scores[i] < EXCELLENT_SCORE)
+        {
+            sum1++;
+        }
+        if (scores[i] >= PASSING_SCORE && scores[i] < GOOD_SCORE)
+        {
+            sum2++;
+        }
+        if (scores[i] >= BAD_SCORE && scores[i] < PASSING_SCORE)
+        {
+            sum3++;
+        }
+        if (scores[i] < BAD_SCORE)
+        {
+            sum4++;
+        }
+    }
+
+    printf("\nGrades Distribution\n");
+    printf("\nA:  %i", sum);
+    printf("\nB:  %i", sum1);
+    printf("\nC:  %i", sum2);
+    printf("\nD:  %i", sum3);
+    printf("\nF:  %i\n", sum4);
+
+    system("pause");
+    return 0;   
+}
+
+The program works fine, but my teacher told me to not use stacked if or if-else constructs. And since I am a beginner that is the only way I know how to do it. 
+Can somebody please tell me how can I change all the if constructs, or how can I have the same result without using any if constructs?STM32F030R8 RS485 Half Duplex not transmittingI'm using an STM32F030R8 to perform RS485 communications connected to a AD3485. So far I've been able to get it to transmit just fine, but when I setup an interrupt handler it seems like the interrupt is being triggered by my chip's own transmissions and stops all further transmissions.
+Have I missed setting or clearing a flag somewhere? Did I miss something in my RS485 init step? Should I be clearing a flag when my transmissions inevitably trigger the interrupt request?
+Below I've included a very stripped down, but complete version of code I'm using for transmission of data, as well as a capture of data that I'm seeing come out of the RS485 chip that I have hooked up to pins A9 A10 and A12.
+Here's the code:
+#include "stm32f0xx_conf.h"
+#include <stm32f0xx_gpio.h>
+#include <stm32f0xx_rcc.h>
+#include <stm32f0xx_usart.h>
+
+void SysTick_Handler(void) {
+
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+    USART_SendData(USART1, 0xAC);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    USART_SendData(USART1, 0x44);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    USART_SendData(USART1, 0x04);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    USART_SendData(USART1, 0x53);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+
+}
+
+void RS485_Init(){
+    GPIO_InitTypeDef GPIO_InitStruct;
+    USART_InitTypeDef USART_InitStruct;
+    NVIC_InitTypeDef NVIC_InitStruct;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_GPIOA, ENABLE);
+
+    GPIO_InitStruct.GPIO_Pin = GPIO_Pin_9 | GPIO_Pin_10 | GPIO_Pin_12; // Pins 9 (TX) 10 (RX) 12 (DE) are used
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AF; // the pins are configured as alternate function so the USART peripheral has access to them
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz; // this defines the IO speed and has nothing to do with the baudrate!
+    GPIO_InitStruct.GPIO_OType = GPIO_OType_PP; // this defines the output type as push pull mode (as opposed to open drain)
+    GPIO_InitStruct.GPIO_PuPd = GPIO_PuPd_UP; // this activates the pullup resistors on the IO pins
+    GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_PinAFConfig(GPIOA, GPIO_PinSource9, GPIO_AF_1); //
+    GPIO_PinAFConfig(GPIOA, GPIO_PinSource10, GPIO_AF_1);
+    GPIO_PinAFConfig(GPIOA, GPIO_PinSource12, GPIO_AF_1);
+
+    USART_InitStruct.USART_BaudRate = 38400 ; // the baudrate is set to the value we passed into this init function
+    USART_InitStruct.USART_WordLength = USART_WordLength_8b; // we want the data frame size to be 8 bits (standard)
+    USART_InitStruct.USART_StopBits = USART_StopBits_1; // we want 1 stop bit (standard)
+    USART_InitStruct.USART_Parity = USART_Parity_No; // we don't want a parity bit (standard)
+    USART_InitStruct.USART_HardwareFlowControl = USART_HardwareFlowControl_None; // we don't want flow control (standard)
+    USART_InitStruct.USART_Mode = USART_Mode_Tx | USART_Mode_Rx; // we want to enable the transmitter and the receiver
+    USART_Init(USART1, &USART_InitStruct);
+
+    USART_HalfDuplexCmd(USART1, ENABLE);
+    USART_DECmd(USART1, ENABLE);
+    USART_ITConfig(USART1, USART_IT_TXE, DISABLE);
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+    USART_SetDEAssertionTime(USART1, 0x4E2);
+    USART_SetDEDeassertionTime(USART1, 0x4E2);
+    USART_DEPolarityConfig(USART1, USART_DEPolarity_High);
+
+    NVIC_InitStruct.NVIC_IRQChannel = USART1_IRQn;
+    NVIC_InitStruct.NVIC_IRQChannelPriority = 0;
+    NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStruct); //When I comment this out, I'm able to transmit normally, but without an ISR receiving bytes will be difficult
+
+    USART_Cmd(USART1, ENABLE);
+
+}
+
+//This function handles USART1 global interrupt request.
+void USART1_IRQHandler(void)
+{
+
+    if(USART_GetITStatus(USART1, USART_IT_RXNE) != RESET){
+        unsigned char USART_Temp_Byte;
+        USART_ClearITPendingBit(USART1, USART_IT_RXNE);
+        USART_Temp_Byte = (unsigned char) USART_ReceiveData(USART1); //receive a char
+    }
+
+}
+
+int main(void)
+{
+    RS485_Init();
+    SysTick_Config(SystemCoreClock/1000);
+    while(1);
+}
+
+And here's a capture of when I have the interrupt enabled (first capture), vs when I comment out NVIC_Init(&NVIC_InitStruct); and don't have an ISR triggering:This is one of the core principles of half/full duplex communications methods.  RS485, which is a physical layer standard, allows  transmitters to receive their own data.  This is useful for other standards (software layer), such as J1708.  Since there isn't a hard requirement for a single master and multiple slaves, each node can initiate a communication.  If two modules start to talk at the same time, there needs to be a scheme to detect and handle bus contentions/collisions.  With RS485, you have a dominate (driven) state and a recessive (non-driven) state.  When the transmitter begins to transmit, you monitor to see if what you receive matches what you sent, if it doesn't, most likely another device was trying to transmit as the same time.  This works because when you switch from a dominate state to recessive, the bus will either return to the recessive state (no collision), or remain in the dominate state due to another receiver holding the line (collision). When this happens, you stop any further transmission and either start receiving or monitor the bus for an idle state.  Most protocols, like J1708, use a pseudo random generator based on your address to calculate a retry delay, which prevents the same two modules from constantly colliding. 
+Long story short: the fact that you are receiving what you transmit is a good thing.  I would suggest you use the interrupt to compare the byte just transmitted and the byte just received and if they match, send the next byte, else terminate and try again after the next idle state is detected.  Since it's the same interrupt routine, you need to set a flag indicating when you are transmitting and steer the interrupt logic to handle the comparisons (Tx portion) or handle normal recieve (Rx portion)I'm adding this answer as an update to getting half duplex comms working with this particular chip. With this configuration I was able to both transmit and receive. Special Thanks to Joe Thomas for putting me on the right track.
+#include "stm32f0xx_conf.h"
+#include <stm32f0xx_gpio.h>
+#include <stm32f0xx_rcc.h>
+#include <stm32f0xx_usart.h>
+
+void Transmit(void){
+
+    USART_Cmd(USART1, DISABLE);
+    USART_DECmd(USART1, ENABLE);
+    USART_ITConfig(USART1, USART_IT_TXE, ENABLE);
+    USART_ITConfig(USART1, USART_IT_RXNE, DISABLE);
+    USART_Cmd(USART1, ENABLE);
+
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+
+    USART_SendData(USART1, 0xAC);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+
+    USART_SendData(USART1, 0x44);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+
+    USART_SendData(USART1, 0x04);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+
+    USART_SendData(USART1, 0x53);
+    while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+
+    USART_Cmd(USART1, DISABLE);
+    USART_DECmd(USART1, DISABLE);
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+    USART_ITConfig(USART1, USART_IT_TXE, DISABLE);
+    USART_Cmd(USART1, ENABLE);
+
+}
+
+void SysTick_Handler(void) {
+
+}
+
+void RS485_Init(){
+
+    GPIO_InitTypeDef GPIO_InitStruct;
+    USART_InitTypeDef USART_InitStruct;
+    NVIC_InitTypeDef NVIC_InitStruct;
+
+
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_GPIOA, ENABLE);
+
+    GPIO_InitStruct.GPIO_Pin = GPIO_Pin_9 | GPIO_Pin_10 | GPIO_Pin_12;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AF;
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStruct.GPIO_OType = GPIO_OType_PP;
+    GPIO_InitStruct.GPIO_PuPd = GPIO_PuPd_UP;
+    GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_PinAFConfig(GPIOA, GPIO_PinSource9, GPIO_AF_1);
+    GPIO_PinAFConfig(GPIOA, GPIO_PinSource10, GPIO_AF_1);
+    GPIO_PinAFConfig(GPIOA, GPIO_PinSource12, GPIO_AF_1);
+
+    USART_DeInit(USART1);
+    USART_StructInit(&USART_InitStruct);
+    USART_InitStruct.USART_BaudRate = 38400 ;
+    USART_InitStruct.USART_WordLength = USART_WordLength_8b;
+    USART_InitStruct.USART_StopBits = USART_StopBits_1;
+    USART_InitStruct.USART_Parity = USART_Parity_No;
+    USART_InitStruct.USART_HardwareFlowControl = USART_HardwareFlowControl_RTS;
+    USART_InitStruct.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
+    USART_Init(USART1, &USART_InitStruct);
+
+    USART_HalfDuplexCmd(USART1, DISABLE);
+    USART_DECmd(USART1, DISABLE);
+    USART_ITConfig(USART1, USART_IT_TXE, DISABLE);
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+    USART_SetDEAssertionTime(USART1, 0x4E2);
+    USART_SetDEDeassertionTime(USART1, 0x4E2);
+    USART_DEPolarityConfig(USART1, USART_DEPolarity_High);
+
+
+
+    NVIC_InitStruct.NVIC_IRQChannel = USART1_IRQn;
+    NVIC_InitStruct.NVIC_IRQChannelPriority = 0;
+    NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStruct);
+
+    USART_ClearITPendingBit(USART1, USART_IT_RXNE);
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+
+    USART_Cmd(USART1, ENABLE);
+
+}
+
+void USART1_IRQHandler(void)
+{
+
+    if(USART_GetITStatus(USART1, USART_IT_RXNE) != RESET){
+        unsigned char USART_Temp_Byte;
+        USART_ClearITPendingBit(USART1, USART_IT_RXNE);
+        USART_Temp_Byte = (unsigned char) USART_ReceiveData(USART1); //receive a char
+        if(0x53 == USART_Temp_Byte){
+            Transmit();
+        }
+    }
+
+}
+
+int main(void)
+{
+    RS485_Init();
+    SysTick_Config(SystemCoreClock/1000);
+    while(1){};
+}How can gcc -O3 make the run so fast?Let test_speed.c be the following C code : 
+#include <stdio.h>
+int main(){
+    int i;
+    for(i=0; i < 1000000000; i++) {}
+    printf("%d", i);
+}
+
+I run in the terminal :
+gcc -o test_speed test_speed.c 
+
+and then :
+time ./test_speed
+
+I get : 
+
+Now i run the following : 
+gcc -O3 -o test_speed test_speed.c
+
+and then : 
+time ./test_speed
+
+I get : 
+ 
+How can the second run be this fast ? Is it already computed during the compilation ?that's because -O3 aggressive optimization assumes that
+for(i=0; i < 1000000000; i++) {}
+
+has no side effect (except for the value of i) and removes the loop completely (directly setting i to 1000000000).
+Disassembly (x86):
+00000000 <_main>:
+   0:   55                      push   %ebp
+   1:   89 e5                   mov    %esp,%ebp
+   3:   83 e4 f0                and    $0xfffffff0,%esp
+   6:   83 ec 10                sub    $0x10,%esp
+   9:   e8 00 00 00 00          call   e <_main+0xe>
+   e:   c7 44 24 04 00 ca 9a    movl   $0x3b9aca00,0x4(%esp)  <== 1000000000 in hex, no loop
+  15:   3b
+  16:   c7 04 24 00 00 00 00    movl   $0x0,(%esp)
+  1d:   e8 00 00 00 00          call   22 <_main+0x22>
+  22:   31 c0                   xor    %eax,%eax
+  24:   c9                      leave
+  25:   c3                      ret
+
+that optimization level is not suitable for calibrated active-CPU loops as you can see (the result is the same with -O2, but the loop remains unoptimized with just -O)gcc "knows" that there is no body in the loop, and no dependency on any result, temporary or real -- so it removes the loop.
+A good tool for analysis like this is godbolt.org which shows you the generated assembly.  The difference between no optimization at all and the -O3 optmization is stark:
+No optimization
+
+With -O3A compiler only has to keep the observable behavior of a program. Counting a variable without any I/O, interaction, or just using its value isn't observable, so as your loop doesn't do anything, the optimizer just throws it away completely and directly assigns the final value.The compiler recognizes that the loop does nothing, and that removing it would not change the output of the program, so the loop was optimized away entirely.
+Here's the assembly with -O0:
+.L3:
+    .loc 1 4 0 is_stmt 0 discriminator 3
+    addl    $1, -4(%rbp)
+.L2:
+    .loc 1 4 0 discriminator 1
+    cmpl    $999999999, -4(%rbp)        # loop 
+    jle .L3 
+    .loc 1 5 0 is_stmt 1
+    movl    -4(%rbp), %eax
+    movl    %eax, %esi
+    movl    $.LC0, %edi
+    movl    $0, %eax
+    call    printf
+    movl    $0, %eax
+    .loc 1 6 0
+    leave   
+    .cfi_def_cfa 7, 8
+    ret
+
+And with -O3:
+main:
+.LFB23:
+    .file 1 "x1.c"
+    .loc 1 2 0
+    .cfi_startproc
+.LVL0:
+    subq    $8, %rsp
+    .cfi_def_cfa_offset 16
+.LBB4:
+.LBB5:
+    .file 2 "/usr/include/x86_64-linux-gnu/bits/stdio2.h"
+    .loc 2 104 0
+    movl    $1000000000, %edx      # stored value, no loop
+    movl    $.LC0, %esi
+    movl    $1, %edi
+    xorl    %eax, %eax
+    call    __printf_chk
+.LVL1:
+.LBE5:
+.LBE4:
+    .loc 1 6 0
+    xorl    %eax, %eax
+    addq    $8, %rsp
+    .cfi_def_cfa_offset 8
+    ret
+
+You can see that in the -O3 case the loop is removed entirely and the final value of i, 1000000000, is stored directly.What happens when I leave out an argument to a function in C?First of all, I know this way of programming is not good practice. For an explanation of why I'm doing this, read on after the actual question.
+When declaring a function in C like this:
+int f(n, r) {…}
+
+The types of r and n will default to int. The compiler will likely generate a warning about it, but let's choose to ignore that.
+Now suppose we call f but, accidentally or otherwise, leave out an argument:
+f(25);
+
+This will still compile just fine (tested with both gcc and clang). However there is no warning from gcc about the missing argument.
+So my question is:
+
+Why does this not produce a warning (in gcc) or error?
+What exactly happens when it is executed? I assume I'm invoking undefined behaviour but I'd still appreciate an explanation.
+
+Note that it does not work the same way when I declare int f(int n, int r) {…}, neither gcc nor clang will compile this.
+Now if you're wondering why I would do such a thing, I was playing Code Golf and tried to shorten my code which used a recursive function f(n, r). I needed a way to call f(n, 0) implicitly, so I defined F(n) { return f(n, 0) } which was a little too many bytes for my taste. So I wondered whether I could just omit this parameter. I can't, it still compiles but no longer works.
+While optimizing this code, it was pointed out to me that I could just leave out a return at the end of my function – no warning from gcc about this either. Is gcc just too tolerant?You don't get any diagnostics from the compiler because you are not using modern "prototyped" function declarations.  If you had written
+int f(int n, int r) {…}
+
+then a subsequent f(25) would have triggered a diagnostic.  With the compiler on the computer I'm typing this on, it's actually a hard error.
+"Old-style" function declarations and definitions intentionally cause the compiler to relax many of its rules, because the old-style code that they exist for backward compatibility with would do things like this all the dang time.  Not the thing you were trying to do, hoping that f(25) would somehow  be interpreted as f(25, 0), but, for instance, f(25) where the body of f never looks at the r argument when its n argument is 25.
+The pedants commenting on your question are pedantically correct when they say that literally anything could happen (within the physical capabilities of the computer, anyway; "demons will fly out of your nose" is the canonical joke, but it is, in fact, a joke).  However, it is possible to describe two general classes of things that are what usually happens.
+With older compilers, what usually happens is, code is generated for f(25) just as it would have been if f only took one argument.  That means the memory or register location where f will look for its second argument is uninitialized, and contains some garbage value.
+With newer compilers, on the other hand, the compiler is liable to observe that any control-flow path passing through f(25) has undefined behavior, and based on that observation, assume that all such control-flow paths are never taken, and delete them.  Yes, even if it's the only control-flow path in the program.  I have actually witnessed Clang spit out main: ret for a program all of whose control-flow paths had undefined behavior!
+GCC not complaining about f(n, r) { /* no return statement */ } is another case like (1), where the old-style function definition relaxes a rule. void was invented in the 1989 C standard; prior to that, there was no way to say explicitly that a function does not return a value.  So you don't get a diagnostic because the compiler has no way of knowing that you didn't mean to do that.
+Independently of that, yes, GCC's default behavior is awfully permissive by modern standards.  That's because GCC itself is older than the 1989 C standard and nobody has reexamined its default behavior in a long time.  For new programs, you should always use -Wall, and I recommend also at least trying -Wextra, -Wpedantic, -Wstrict-prototypes, and -Wwrite-strings. In fact, I recommend going through the "Warning Options" section of the manual and experimenting with all of the additional warning options. (Note however that you should not use -std=c11, because that has a nasty tendency to break the system headers.  Use -std=gnu11 instead.)First off, the C standard doesn't distinguish between warnings and errors. It only talks about "diagnostics". In particular, a compiler can always produce an executable (even if the source code is completely broken) without violating the standard.1
+
+The types of r and n will default to int.
+
+Not anymore. Implicit int has been gone from C since 1999. (And your test code requires C99 because for (int i = 0; ... isn't valid in C90).
+In your test code gcc does issue a diagnostic for this:
+.code.tio.c: In function ‘f’:
+.code.tio.c:2:5: warning: type of ‘n’ defaults to ‘int’ [-Wimplicit-int]
+
+It's not valid code, but gcc still produces an executable (unless you enable -Werror).
+If you add the required types (int f(int n, int r)), it uncovers the next issue:
+.code.tio.c: In function ‘main’:
+.code.tio.c:5:3: error: too few arguments to function ‘f’
+
+Here gcc somewhat arbitrarily decided not to produce an executable.
+Relevant quotes from C99 (and probably C11 too; this text hasn't changed in the n1570 draft):
+
+6.9.1 Function definitions
+Constraints
+[...]
+
+If the declarator includes an identifier list, each declaration in the declaration list shall
+  have at least one declarator, those declarators shall declare only identifiers from the
+  identifier list, and every identifier in the identifier list shall be declared.
+
+
+Your code violates a constraint (your function declarator includes an identifier list, but there is no declaration list), which requires a diagnostic (such as the warning from gcc).
+
+Semantics
+
+[...] If the
+  declarator includes an identifier list, the types of the parameters shall be declared in a
+  following declaration list.
+
+
+Your code violates this shall rule, so it has undefined behavior. This applies even if the function is never called!
+
+6.5.2.2 Function calls
+Constraints
+[...]
+
+If the expression that denotes the called function has a type that includes a prototype, the
+  number of arguments shall agree with the number of parameters. [...]
+
+Semantics
+[...]
+
+[...] If the number of arguments does not equal the number of parameters, the
+  behavior is undefined. [...]
+
+
+The actual call also has undefined behavior if the number of arguments passed doesn't match the number of parameters the function has.
+As for omitting return: This is actually valid as long as the caller doesn't look at the returned value.
+Reference (6.9.1 Function definitions, Semantics):
+
+
+If the } that terminates a function is reached, and the value of the function call is used by
+  the caller, the behavior is undefined.
+
+
+
+1 The sole exception seems to be the #error directive, about which the standard says:
+
+The implementation shall not successfully translate a preprocessing translation unit
+  containing a #error preprocessing directive unless it is part of a group skipped by
+  conditional inclusion.Implicit Pointer-To-Const-T conversionI was wondering if the implicit conversion to a pointer to a const data type is somewhere defined in the C11 standard:
+T x;
+const T *p = &x;
+
+A pointer to an object of type T is implicitly converted into a pointer to an object of type const T. Is this implicit conversion somewhere defined in the C11 standard? (I know that it makes sense to allow this and how useful it is. I'm just curious to know where it is defined in the standard)
+Furthermore, is an implicit conversion from type T** to const T** forbidden according to C11?
+T *p;
+const T **pp = &p;
+
+This is a well known problematic part and therefore GCC and LLVM/clang raise a warning. Still I'm wondering if this is allowed according to the C11 standard or not. I only found in §6.5.16.1P6 a comment that this should be a constraint violation. However, I do not see which constraint should be violated. Again I know that this should be prohibited and that this implicit conversion can lead to subtle problems. I'm just curious to know if this is (un)defined behaviour according to C11.
+Again, my two questions are not about if this is good or not (which is answered multiple times here) but how/where the C11 standard defines this.
+
+Just for the sake of completeness here is a link to why the second example is problematic: http://c-faq.com/ansi/constmismatch.htmlA pointer to an object of type T is implicitely converted into a
+  pointer to an object of type const-T. Is this implicit conversion
+  somewhere defined in the C11 standard?
+
+Yes. This implicit conversion is mandated by the standard.
+Paragraph 3 of section 6.5.4 Cast Operators says that 
+
+Conversions that involve pointers, other than where permitted by the
+  constraints of 6.5.16.1, shall be specified by means of an explicit
+  cast.
+
+and the referenced 6.5.16.1 under point 3 says:
+
+the left operand has atomic, qualified, or unqualified pointer type,
+  and (considering the type the left operand would have after lvalue
+  conversion) both operands are pointers to qualified or unqualified
+  versions of compatible types, and the type pointed to by the left has
+  all the qualifiers of the type pointed to by the right;
+
+Therefore the implicit conversion for const T *p = &x; holds because you're only adding qualifiers, not removing them.
+const T **pp = &p; doesn't fall under this, so you need an explicit cast (C++ would allow const T*const*pp = &p; (the second const is needed) but C still wouldn't.)
+The pointer conversion through an explicit cast isn't a problem as far as UB is concerned as long as the alignments match (which for pointers to differently qualified types they will) because 
+6.3.2.3p7 guarantees that:
+
+A pointer to an object type may be converted to a pointer to a
+  different object type. If the resulting pointer is not correctly
+  aligned68) for the referenced type, the behavior is undefined.
+  Otherwise, when converted back again, the result shall compare equal
+  to the original pointer. When a pointer to an object is converted to a
+  pointer to a character type, the result points to the lowest addressed
+  byte of the object. Successive increments of the result, up to the
+  size of the object, yield pointers to the remaining bytes of the
+  object.
+
+but you need to be mindful of accesses/dereferences which will be governed by the strict aliasing rule:
+
+An object shall have its stored value accessed only by an lvalue
+  expression that has one of the following types:88)
+a type compatible with the effective type of the object, a qualified
+  version of a type compatible with the effective type of the object, a
+  type that is the signed or unsigned type corresponding to the
+  effective type of the object, a type that is the signed or unsigned
+  type corresponding to a qualified version of the effective type of the
+  object, an aggregate or union type that includes one of the
+  aforementioned types among its members (including, recursively, a
+  member of a subaggregate or contained union), or a character type.Pass a constant two-dimensional array to function as a structure in CI'm a novice in C and I need a structure to pass constant two-dimensional arrays to function as one parameter. I want to make this
+const int a_size_x = 20;
+const int a_size_y = 30;
+const int a_output_array[size_x][size_y] = {{..., ...}, ..., {..., ...}};
+
+const int b_size_x = 20;
+const int b_size_y = 30;
+const int b_output_array[size_x][size_y] = {{..., ...}, ..., {..., ...}};
+
+void function(const int array[], int arr_size_x, int arr_size_y){
+    for (int i = 0; i < arr_size_x; i++) 
+    {
+        for (int j = 0; j < arr_size_y; j++)
+        {
+            printf("%i ", array[i][j];
+        }
+        printf("\n");
+    }
+
+function(a_output_array, a_size_x, a_size_y);
+function(b_output_array, b_size_x, b_size_y);
+
+easier to be able to call function(a) like this:
+const struct OUTPUT
+{
+    const int size_x;
+    const int size_y;
+    const int array[size_x][size_y];
+};
+
+struct OUTPUT a = {.size_x = 20, .size_y = 30, .array = {{...}, ..., {...}};
+....
+struct OUTPUT z = {.size_x = 30, .size_y = 20, .array = {{...}, ..., {...}};
+
+
+function(const struct OUTPUT out){
+    for (int i = 0; i < out.size_x; i++) 
+    {
+        for (int j = 0; j < out.size_y; j++)
+        {
+            printf("%i ", out.array[i][j];
+        }
+        printf("\n");
+    }
+
+function(a);
+function(b);
+
+but of course compiler says that size_x and size_y is undeclared in struct declaration.
+I've read about flexible array members, but there's dynamic memory allocation needed, and in AVR Harvard architecture malloc can't work in program memory, where i put all this data.  
+Is there some way to do it in C? May be, in C++?
+UPDATE Answer that worked for me - create a one-dimensional array of lenght 2 + width*height where first two members are true width and height and use a pointer to work with this. Here's an example function to print out this array:
+char arr [11] = 
+{
+   3 // width
+   3 // height
+   1, 2, 3,
+   4, 5, 6,
+   7, 8, 9
+}
+
+void print_array(char *ptr)
+{
+   char width = *ptr++;
+   char height= *ptr++;
+   for (int i = 0; i < height; i++)
+   {
+      for (int j = 0; j < width; j++)
+      {
+         print("%c\t", *ptr++);
+      }
+      print("\n");
+   }
+}
+
+print_array(arr);For most compilers, 2D arrays can be refered to as 1D as such:
+matrix[3][3]=[1,2,3
+              4,5,6
+              7,8,9]
+Index in 1D is calculated by row size*row number. For example: matrix[5]=6.
+This means you can pass only 1 parameter, the row length, and by calculating the length of the whole vector you can deduce the 2nd parameter (number of rows).
+You can add the row length parameter to the end of your array, and by so passing the array only, if that helps.When declaring an array with an initializer, the bounds of the array must be constants.  A variable with a const qualifier does not qualify as a constant.  You can however use a macro which does a text substitution:
+#define A_SIZE_X 2
+#define A_SIZE_Y 3
+const int a_output_array[A_SIZE_X][A_SIZE_Y] = {{3,4,5},{6,7,8}};
+
+#define B_SIZE_X 2
+#define B_SIZE_Y 3
+const int b_output_array[B_SIZE_X][B_SIZE_Y] = {{1,2,3},{4,5,6}};
+
+When passing a 2D array to a function, the definition must say that it expects a 2D array.  Your is expecting const int array[] which is a 1D array.
+You can have a function accept arrays with different bounds if the bounds are specified first in the definition:
+void function(int arr_size_x, int arr_size_y, const int array[arr_size_x][arr_size_y]) {
+
+You can then call it like this:
+function(A_SIZE_X, A_SIZE_Y, a_output_array);
+function(B_SIZE_X, B_SIZE_Y, b_output_array);Side note first, the first snippet has a wrong signature and your compiler should warn you:
+void function(const int array[], int arr_size_x, int arr_size_y){
+
+here, array is a pointer to int (in a function signature, an array automatically gets adjusted to a pointer), but for passing a 2d array, you would need a pointer to array of int. Did you test that snippet? I assume it doesn't do what you want.
+With C99 and above (assuming the compiler supports VLA, variable length arrays), something like this would be correct:
+void function( int arr_size_x, int arr_size_y, const int (*array)[arr_size_y]){
+
+
+As for your idea with a struct, you could only do it when you keep the second dimension fixed. A C array is contiguous in memory, so to do the indexing correctly, the compiler must know all dimensions except for the first one at compile time. VLAs are an exception to that rule, but you can't declare a VLA statically.
+What you can do however is using a flat array and do the 2d indexing yourself, like in this tiny example:
+struct outputdata
+{
+    size_t rows;
+    size_t cols;
+    int *data;
+};
+
+const int a_data[] = {1, 2, 3, 4, 5, 6};
+const struct outputdata a = {
+    .rows = 2,
+    .cols = 3,
+    .data = a_data
+};
+
+// [...]
+
+void function(const struct outputdata x)
+{
+    for (size_t r = 0; r < x.rows; ++r)
+    {
+        for (size_t c = 0; c < x.cols; ++c)
+        {
+            printf("%d ", x.data[r*x.cols + c]);
+        }
+    }
+}How to treat this error?(stack smashing deteced Aborted(core dumped) )#include <stdio.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <stdlib.h>
+#include <math.h>
+#include <assert.h>
+
+void TreatFile(int first, int last)
+{
+    int fhist, fdata;
+    char fdname[8];
+    int hisSum[256]= {0};
+    unsigned char data_cont;
+    int i, j ,exec_struct;
+    struct timeval tp1, tp2;
+    double tvalue, t_mean,t_devi;
+    double exec_t[128];
+    double t_sum = 0;
+    double t_variance = 0;
+
+    for(i=first; i<=last; i++)
+    {
+        sprintf(fdname,"data%d.bin", i);
+        exec_struct = gettimeofday(&tp1, NULL);
+
+        fhist=open("histogram.bin", O_RDONLY);
+
+        for(j=0; j<256; j++)
+            read(fhist, hisSum+j, 1);
+
+        close(fhist);
+
+        fdata=open(fdname, O_RDONLY);
+
+        for(j=0; j<256*256; j++)
+        {
+            read(fdata,&data_cont,1);
+            hisSum[data_cont]++;
+        }
+
+        close(fdata);
+
+        fhist=open("histogram.bin", O_WRONLY);
+
+        for(j=0; j<256; j++)
+            write(fhist, hisSum+j, 4);
+
+        close(fhist);
+
+        exec_struct = gettimeofday(&tp2, NULL);
+        tvalue = (tp2.tv_sec - tp1.tv_sec) * 1000.0 + (tp2.tv_usec - tp1.tv_usec) / 1000.0;
+
+        printf("[%d]th data execution time : %f\n",i,tvalue);
+
+        exec_t[i] = tvalue;
+        t_sum += tvalue;
+
+    }
+
+    t_mean = t_sum/(last-first+1);
+
+    for(i=0; i<(last-first+1); i++)
+        t_variance += pow(t_mean-exec_t[i],2.0);
+
+    t_devi = sqrt(t_variance/(double) (last-first+1));
+
+    printf("Total execution time is %lf\n", t_sum);
+    printf("Mean of execution time is %lf\n", t_mean);
+    printf("Standard diviation is %lf\n", t_devi);
+}
+
+int main(int argc, char *argv[])
+{
+    int first, last;
+
+    first = atoi(argv[1]);
+    assert(first);
+    last = atoi(argv[2]);
+    assert(last);
+    TreatFile(first, last);
+
+    return 0;
+}
+
+
+first make 128 file! with dd if=/dev/random of=data$i bs=64K count=1
+and make histogram.bin with 
+dd if=/dev/zero of=histogram.bin bs=4 count=256
+
+
+Hello! Here is my code!
+The source code's result makes stack smashing error!
+I think this code -read(fdata,&data_cont,1);- has some problem(stack overflow).
+But I can't get a handle on replacing it with appropriate expression.
+Would you please help me?The main problem is likely to be this line
+sprintf(fdname,"data%d.bin", i);
+
+If i is between 0 and 9, the line above attempts to fill the buffer with 10 characters e.g. data0.bin\0. If i is any larger, the string is even longer. Unfortuantely, you have only defined fdName to be eight bytes long.
+There are some other issues.
+for(j=0;j<256*256;j++)
+{
+    read(fdata,&data_cont,1);
+    hisSum[data_cont]++;
+}
+
+You use data_cont uninitialsed if the read fails to read any bytes. Always check the return value of IO functions.
+In this code
+for(j=0;j<256;j++)
+    write(fhist, hisSum+j, 4);
+
+If j is greater than 252, you read beyond the end of hisSum.
+In main you don't check to make sure argc is at least 3.
+Also, you leak the fhist read file descriptor when you overwrite it with the write file descriptor. without closing it first.C setting a pointer to another pointer and freeingWould p1 also be free'd if I called free(ptr)?
+int* some_function(){
+    int *p1 = malloc(sizeof(int)*10);
+    int *p2 = p1;
+    return p2;
+}
+int main(){
+    int *ptr = some_function();
+    free(ptr);
+    return 0;
+}When you do
+int *p1 = malloc(sizeof(int)*10);
+
+you have something like
+
++----+     +---------------------------------+
+| p1 | --> | Memory enough for 10 int values |
++----+     +---------------------------------+
+
+Then when you do
+int *p2 = p1;
+
+you have something like
+
++----+
+| p1 | --\
++----+    \     +---------------------------------+
+           >--> | Memory enough for 10 int values |
++----+    /     +---------------------------------+
+| p2 | --/
++----+
+
+That is, you have two pointers pointing to the very same memory.
+When you return p2 you simply copy the pointer, much like what happens when you initialize p2, and inside the main function you have
+int *ptr = some_function();
+
+which leads to
+
++-----+     +---------------------------------+
+| ptr | --> | Memory enough for 10 int values |
++-----+     +---------------------------------+
+
+It's different variables, but their contents are all the same, and it is the pointer returned by the initial malloc call.At the time that some_function returns, p1 and p2 have the same value, i.e. a pointer to a region of memory returned by malloc.  That value is then returned from the function with return p2.  There is no memory leak here because the value returned from malloc is returned from some_function.  The fact that this value happened to be stored in multiple local variables is irrelevant.
+When free(ptr) is then called in main, the value of ptr is again the value returned from malloc, so the memory is correctly free'ed.Yes.
+A pointer is a variable whose value is a memory address. You need to free that memory address (you actually free a block starting at that address - free will take care of that) and, in order to do that, you need to pass to free a pointer to it.
+You can have multiple pointers to a memory location, and, since calling free with one of them frees that memory location, they will all now point to free'd memory (be careful with them).*p1 is just an address sized area, which if the system uses long as the address and long's are described with 8 bytes, pointer uses 8 bytes from the memory area. And if you set
+*p2 = p1;
+
+you are simply copying the integer value to another integer value, which will point to the same address. 
+For example:
+int *p = malloc(3);
+
+Just for visualization, if our heap memory starts at 0x0001, p will be reserved for holding the start address which is (0x0001) which points to our 3 byte reserved memory area. 
+int *p1 = p;
+
+this p1 value will also point to that 3 byte memory area, which is described by 0x0001 address, so they will contain the same value. 
+Total memory used:  4 bytes for p, 4 bytes for p1, and 3 bytes for the memory that p and p1 points. 
+*ptr = somefunction();
+
+Then when you return that value to outside, p and p1 will be freed, because of their scope, local variables. We return only 0x0001 which is our memory start address. The reserved memory is still reserved.
+If you free *ptr, it will free the reserved memory (3 bytes at 0x0001 address) because it points to it. 
+And *ptr will still use some memory until the program exists. 
+Upvoted @some-programmer-dude's answer while I was writing this, because he has visualized that better than me.Comparing a user input string to one that is stored in a pointer. CIm trying to get a programme im writing to compare what a user inputs to a word stored in a pointer. The code is below 
+int c_s(char*, char*);
+
+int main()
+{
+printf("Hate crime reporting system\n\n\n");
+
+printf("If the crime you are reporting is an emergency,\nplease call 999, do 
+not proceed any further with this form\n\n\n\nPlease press enter to confirm 
+you have read the above and continue\n");
+char enter = 0;
+while (enter != '\r' && enter != '\n') { enter = getchar(); }
+
+
+int a;
+long long int g;
+char *b, *e;
+char *c = "witness";
+char *d = "yes";
+*c = (long long int) &g;
+
+
+ printf("Are you a victim or witness of the crime?\nPlease answer 
+ victim/witness\n");}
+ scanf("%s", b);  
+    int r = strcmp (b, c);
+    if(r == 0){    
+    printf("Do you know who the witness is? Please answer yes/no\n");}
+    scanf("%s", d);
+       int f = strcmp(e, d);
+       if (d = "no") goto NEXT;
+       if(e == 0){
+         printf("Please enter their details including phone number and 
+address");}
+
+NEXT:
+
+When a user answers "witness" to the question "are you a victim or witness", i want the code to continue and ask the next question, and then the same again if they answer "yes or "no" to the question "do you know who the witness is?". When i run this code i get an overflow error. Im new to coding so if anyone could provide sample code on how to make this work i would greatly appreciate it. Im not sure whether im using the pointer wrong or whether i should be using an array?
+Can someone also please explain how i would make this an if statement, meaning if the user types in "victim" as the answer to the above question, the programme continues to "NEXT:"Before we even get to your string problems, look at this line:
+printf("Are you a victim or witness of the crime?\nPlease answer victim/witness\n");}
+
+It ends with a }, which seems to match the start of main.
+At this point, you've ended the main function, and the rest of your code is not even part of a function.  This likely won't even compile.
+
+To get string input, you must make sure there is memory available for the string:
+char *b;     // WRONG: Uninitialized pointer.
+char b[500]; // CORRECT: b can hold up to 499 bytes (+ one \0 at the end)
+scanf("%s", b); // Get input into the memory you declared.
+
+
+Also, you must make sure the memory is writable:
+this problem is more subtle, and many C programmers have a hard time with this
+char *d = "yes";     // WRONG: "yes" is a constant string in your program, it cannot be changed.
+char d[200] = "yes"; // CORRECT: d is 200 bytes, and is initially set to "yes".  It can be changed later.
+
+
+Even after using strcmp correctly in parts of your program, you still tried to do:
+if (d = "no") goto NEXT;
+
+
+You cannot do string comparisons this way in C.
+Even if you could, it would use a == not a single =
+Never use goto (unless you wish to be attacked by a velociraptor).
+
+
+On this line, you reference variable e, but you never set it to a value.
+int f = strcmp(e, d);
+
+On this line, you treat e like it is an integer, but it was declared char*
+(and it still does not have a valid value)
+if(e == 0) {A string can never be "stored in a pointer", and that's exactly your problem. You just feed scanf() your uninitialized pointer b. This has a random value and doesn't point to any usable memory, so when scanf() tries to write there, your program crashes.
+Solution: provide memory to write to for scanf(). Either declare b as an array (e.g. char b[256];) or use malloc() to dynamically allocate memory. Then make sure you don't write more bytes than you reserved. scanf("%s", ...) will always overflow any buffer if the input is larger, so use a field width with scanf() -- see the manual page.
+Better yet, don't use scanf(). You might want to read my beginners' guide away from scanf for more information.b is an uninitialised pointer. The effect of your scanf is therefore undefined behaviour. Something like 
+char b[100];
+
+Will allocate 100 bytes of space on the stack to b. You will then need to take steps to make sure that no more than 99 bytes are read from stdin by the scanf.
+c is first initialised to point to the string "witness" which is good, but this line:
+*c = (long long int) &g;
+
+Sets the first byte to the lowest byte of the address of g. It's completely unnecessary, get rid of it.
+The next scanf scansd into d which is set to a literal string"yes" I think this is undefined behaviour too, but it's wrong, in any case. You should be allocating some space to e (as per b) and scanning into that.
+Your comparison after the strcmp should use f not e and the printf should really have a \n on it.
+By the way, this example shows the value of using descriptive variable names. In two places, you have used the wrong variable but if you had named them descriptively e.g. f => comparisonResult you might have avoided confusion.A few notes to keep you going:
+1. When declraing a string, you must specify it's size. A string is a an array of chars, and an declaration of an array in c should be given with a size (with at least the number of chars+1), as so:
+char c[10] = "witness";
+
+
+strcmp returns 0 if strings match.this line is wrong as string cannot be stored in the pointer
+char *c = "witness";
+char *d = "yes";
+
+to do so you need to first assign the memory for that pointer
+char *c=(char*)malloc(strlen("witness")*sizeof(char));
+char *d=(char*)malloc(strlen("yes")*sizeof(char));
+strcpy(c,"witness");
+strcpy(c,"yes");Accelerate: Finding pointer address for vDSP_maxviDI am working on a machine learning project in objective-c. Which is using the following code:
+unsigned cStride = multiArray.strides[2].intValue;
+unsigned hStride = multiArray.strides[3].intValue;
+unsigned wStride = multiArray.strides[4].intValue;
+
+for (unsigned h = 0; h < height; h++) {
+    for (unsigned w = 0; w < width; w++) {
+        unsigned highestClass = 0;
+        double highest = -DBL_MAX;
+        for (unsigned c = 0; c < channels; c++) {
+            unsigned offset = c * cStride + h * hStride + w * wStride;
+            double score = pointer[offset];
+            if (score > highest) {
+                highestClass = c;
+                highest = score;
+            }
+        }
+        // futher code
+    }
+}
+
+So far so good, it is working well. However I came across Accelerate which I want to implement for this class, since it could be faster then the current implementation.
+I decided to implement vDSP_maxviD. https://developer.apple.com/documentation/accelerate/1449682-vdsp_maxvid?language=objc
+Their implementation is written as follows:
+
+__A Single-precision real input vector.
+__I Stride for A
+__C Output scalar
+__IC Output scalar index
+__N The number of elements to process
+
+And their under the hood Accelerate code:
+*C = -INFINITY;
+for (n = 0; n < N; ++n)
+{
+    if (*C < A[n * I])
+    {
+        *C = A[n * I];
+        *IC = n * I;
+    }
+}
+
+Now I started to think what the parameters in this case need to become:
+__A will become pointer
+__C will become highest
+__IC will become highestClass
+__N will become channels
+However, I left __I blank. This is because I don't know how to find the right pointer address. I my previous code I use:
+unsigned offset = c * cStride + h * hStride + w * wStride;
+However, we miss c now, and it's replaced by n inside the Accelerate framework. 
+What will be the correct calculation for my pointer index?problem is caused by using pointer as the first parameter of vDSP_maxviD ignoring h and w dependent offset. 
+try : 
+double *channels_pointer = &pointer[h * hStride + w * wStride];
+
+vDSP_maxviD(channels_pointer, cStride, &highest, &highestClass, channels);Edit: Removed unnecessary loop
+I would try something like this (not tested):
+uint32_t cStride = multiArray.strides[2].intValue;
+uint16_t hStride = multiArray.strides[3].intValue;
+uint8_t wStride = multiArray.strides[4].intValue;
+
+for (uint16_t h = 0; h < height; h++) {
+    for (uint16_t w = 0; w < width; w++) {
+        uint8_t highestClass = 0;
+        double highest = -DBL_MAX;
+        //not sure about the type
+        double * tempPointer = &pointer[h * hStride + w * wStride];
+        vDSP_maxviD(tempPointer, cStride, &highest, &highestClass, channels);
+        // further code
+    }
+}Thanks to Grzegorz Owsiany the final solution was:
+double *channels_pointer = &pointer[h * hStride + w * wStride];
+vDSP_maxviD(channels_pointer, cStride, &highest, &highestClass, channels);
+
+However, I also needed to do:
+highestClass /= cStride;How to test a C program with multiple inputs? [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I have Linux Ubuntu, and I want to test my program, for which someone gave me .txt file of multiple inputs. Now I want to run this program with inputs written in the .txt file. Theres a lot of inputs so I dont want to input them by hand. Is there some command in Linux Terminal to run a C with inputs written in a file?
+thank you for your answersI think you are suffering from the all too common misunderstanding that "standard input" == "a keyboard".  Stop thinking that.  If you've already written a program that reads from stdin, all you need to do is associate your text file with stdin.  In the shell, you do that with a redirection operator:
+./a.out < input.txt
+
+If you have multiple inputs, you can easily invoke your program on each individually:
+for file in *.txt; do
+    echo "Running on input: $file"
+    ./a.out < "$file"
+done
+
+or you can run your program once on all the inputs:
+cat *.txt | ./a.out
+
+There are many, many ways to do what you want, and a lot of flexibility to do different things.  You'll probably want to compare the output of your program with the expected output and then you're on your way to writing a full-fledged test suite.   For example:
+if ! ./a.out < input.txt | cmp expected-output -; then
+    echo "TEST FAILED" >&2
+    exit 1
+fiGtk and gtk builder show different versionsI'm trying to build an helloworld window with Gtk and glade. The code compiles fine but on runtime it fails on gtk_builder_add_from_file. The strange thing is that the error reports a current gtk version different to the one I get with gtk_get_major_version/gtk_get_minor_version.
+GtkBuilder *builder; 
+GtkWidget *window;
+GError *err = NULL;
+gtk_init(NULL,NULL);
+
+printf("maj %d, min %d\n",gtk_get_major_version (),gtk_get_minor_version ());
+builder = gtk_builder_new();
+
+gtk_builder_add_from_file (builder, "/path/to/ui.glade", &err);
+if (err != NULL)
+{
+    printf ("%s\n", err->message);
+    g_error_free (err);
+}
+
+window = GTK_WIDGET(gtk_builder_get_object(builder, "mywin"));
+
+gtk_widget_show(window);
+g_object_unref(builder);
+gtk_main();
+...
+
+Stdout:
+maj 3, min 2
+/path/to/ui.glade: required gtk+ version 3.2, current version is 2.24There is no doubt that the glade file was created using Glade 3.x while your application was compiled against Gtk version 2.x. 
+If you've created the glade file on your computer then chances are that your have both runtime and developer files for Gtk 2 and Gtk 3.
+If so, then you must change your compile instructions to link against Gtk 3. For that check you pkg-config instruction and check if it says gtk+-2.0 or gtk+-3.0. It will most probably say gtk+-2.0, change to gtk+-3.0.
+It also may be possible that you don't have gtk3 dev packages installed, if so, install them.
+Glade XML files keep a reference to the minimum gtk version required, changing that may "solve" the issue but it won't work if you use widgets that are only available on gtk 3.
+Another option is to install Glade 2 but is preferable to use the latest Gtk release as others are old.
+Also check your glade menu, File > Properties and check the required Toolkit version.how to specify a directoy as including header files directoryI don't want to use -I flags each time for including a header file I made before. I want to specify a directory and save header files there and make GNU gcc search there by default.
+PS: I use windows and GNU 5.1.0.because of my low reputation I couldn't add comment,
+I think you can use your own make file
+learning from this link:
+http://www.cs.colby.edu/maxwell/courses/tutorials/maketutor/
+or this:
+https://www.cs.oberlin.edu/~kuperman/help/make.html
+or write your own script.If all your header files are stored in the same directory, you need not include each .h file using -I option.
+You can do something like 
+$(GCC) $(CFLAGS) -I$(HDR_INC_PATH) -c <source files>
+
+where HDR_INC_PATH contains the path where your headers are stored.
+If you have headers located in multiple locations, you can do something like
+HDR_INC_PATH := -I<path1> \
+                 -I<path2> \
+                 -I<path3> \
+                  and so on
+
+where path1, path2 and path3 are the locations where the headers are located and use
+$(GCC) $(CFLAGS) $(HDR_INC_PATH) -c <source files>
+
+You can also make use of $(wildcard pattern) to search for all the header files in a directory. In this case you have to mention the top directory path so that headers in child directories are also taken.
+Something like 
+HDR_FILES = $(wildcard <dir>/*.h)
+
+where dir is the path of your parent directory. You can then make use $(HDR_FILES) with -I in your compiler recipe.What does scanf_s return when the input does not match the format?I was wondering what happens in an instance such as:
+printf("How many sides do the polygon has: ");
+scanf_s("%d",&n); 
+
+That is, when scanf expects the input to be an integer, but instead the user enters a float value, a double, or anything else.......Is the value then assigned to the variable, or is it just present at the background? Can it's presence somehow act detrimentally on how the programme works later on?but instead the user enters a float value, a double, or anything else
+
+The user always enters a string of characters. This is how I/O works.
+Using the format string, scanf() attempts to extract from the input string the first substring that looks like the text representation of data that uses the format specifier then it recovers the data that would produce the aforementioned text representation when formatted using printf() with the same format specifier.
+In your example, because of %d, scanf() uses from the input string as many digits it finds at the beginning of the string. It skips the leading spaces, reads an optional sign if it is present, reads the digits and stops reading when it reaches a non-digit character. It uses the sign and the read digits to re-create the number and puts it at the address it receives as argument.
+It uses the rest of the string to fulfill the next format specifier, if any or ignores it completely (but it doesn't consume it) if there are no more specifiers in the format string.This is specified in the scanf documentation:
+
+Whitespace character: the function will read and ignore any whitespace characters encountered before the next non-whitespace character
+
+Under the d specifier, the characters extracted are:
+
+Any number of decimal digits (0-9), optionally preceded by a sign (+
+  or -). d is for a signed argument, and u for an unsigned.
+
+Thus, it consumes from the stream all the leading whitespace characters and the first number (the +/- sign and an integer) and stops if there is a character that does not match.
+Furthermore,
+
+at least one character shall be consumed by any specifier. Otherwise the match fails, and the scan ends there.Efficient recent set-membership tests in C for deduplication?I have an unlimited number of 12 byte messages arriving.  The content can be treated as random and structureless.  (The length is only important because it is shorter than most hashes.)
+I want to deduplicate them.
+One method is to store the last 1,000 messages in a circular buffer and check all 1,000 message for a match before accepting a message (and inserting it into the circular buffer for future checks).
+What other methods are there, which could be more CPU and memory efficient?12 Bytes seem quite small length. You can cast your byte array to string and then use a tree structure based on strings, via exploiting strcmp().
+
+Way to cast byte array to string
+Tree structure based on strings
+
+Unless you form a skewed tree, O(logn) would be your worst case for deduplication. In such case, it is not hard to change to a self-balancing tree too.
+Here my BST implementation using string type keys:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+struct Node
+{
+  char *key;
+  char *value;
+  struct Node *left;
+  struct Node *right;
+};
+
+struct Node* newNode(char *strKey,char *strValue)
+{
+  struct Node *tmp = (struct Node*) malloc(sizeof(struct Node));
+  tmp->key = strdup(strKey);
+  tmp->value = strdup(strValue);
+  tmp->left = NULL;
+  tmp->right = NULL;
+  return tmp;
+}
+
+struct Node* insert(struct Node* node, char *newKey, char *newValue)
+{
+  if (node == NULL)
+    return newNode(newKey,newValue);
+
+  int comparison = strcmp(newKey,node->key); 
+  if (comparison < 0)
+    node->left  = insert(node->left, newKey, newValue);
+  else if (comparison > 0)
+    node->right = insert(node->right, newKey, newValue);  
+  else
+  {
+    printf("Error occured while insert to BST\n");
+    return NULL;
+  }
+
+  return node;
+}
+
+struct Node* deleteNode(struct Node* node, char *key2del)
+{
+  if (node == NULL)
+    return node;
+
+  int comparison = strcmp(key2del,node->key);
+  if (comparison < 0)
+    node->left = deleteNode(node->left, key2del);
+  else if (comparison > 0)
+    node->right = deleteNode(node->right, key2del);
+  else // where deletion occurs
+  {
+    if (node->left == NULL)
+    {
+      struct Node *tmp = node->right;
+      free(node);
+      return tmp;
+    }
+    else if (node->right == NULL)
+    {
+      struct Node *tmp = node->left;
+      free(node);
+      return tmp;
+    }
+
+    struct Node *tmp = node->right;
+    while(tmp->left != NULL)
+      tmp = tmp->left;
+
+    node->key = tmp->key;
+    node->right = deleteNode(node->right, tmp->key);
+  }
+
+  return node;
+}OSX - Compile to WebAssembly with llc "llc: : error: unable to get target for 'wasm32', see --version and --triple."I'm running on OSX and trying to compile following c code to webAssembly:
+void test(){
+    //do stuff
+}
+
+I've looked at this example and tried running the following commands:
+clang -emit-llvm --target=wasm32 -Oz test.c -c -o test.bc
+llc -asm-verbose=false -o test.s test.bc 
+
+First command works fine and clang generates the .bc file, but when I try to run the second command I get:llc: : error: unable to get target for 'wasm32', see --version and --triple.
+Any help would be appreciated.It looks like your version of llvm was not compiled with support for the WebAssembly backend.  This backend is still experimental so you need to enable it at cmake time with: 
+-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=WebAssemblyWhat endianess is used to store information in call to recvfrom()Here is a simple code in socket API:
+sock_raw = socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL));
+//...
+data_size = recvfrom(sock_raw , buffer , bufsize , 0 , (struct sockaddr*)&saddr , (socklen_t*)&saddr_size);
+//...
+void print_ethernet_header(unsigned char* buffer)
+{
+        struct ethhdr *eth = (struct ethhdr *)buffer;
+        fprintf(logfile , "   |-Protocol            : %x    \n",ntohs(eth->h_proto));
+}
+In this question I was explained that h_proto member of struct ethhdr is stored in big-endian format.
+Is it valid to say that the other members of this structure(h_source and h_dest are as well stored in big-endian format? And in such case is it valid to say that recvfrom() function stores data to buffer in big-endian format (I failed to find any info about this in man page to this function)? I think that this should be true because of rfc1042, but I am not sure.recvfrom reads data from a socket and stores it in a buffer, but it doesn’t process the data: it stores it as it’s received. The order of values in the data depends on the network protocol. Most network protocols use big-endian (“network order”), so the data provided by recvfrom is typically big-endian — but that’s not a result of recvfrom.
+In most cases you should use ntohs and ntohl to translate values as appropriate, and process arrays in the documented order. For h_source and h_dest, the documented order is indeed big-endian. If you’re writing kernel code, there are usually macros or helper functions available to do this for you; even printk has %pM format specifiers to handle MAC addresses.Will a C union of uint32_t and uint8_t[4] will always map the same way on little endian architectures?Will a C union of uint32_t and uint8_t[4] will always map the same way on little endian architectures?
+e.g. with
+union {
+    uint32_t double_word;
+    uint8_t octets[4];
+} u;
+
+will
+u.double_word = 0x12345678;
+
+always result in:
+u.octets[0] == 0x78
+u.octets[1] == 0x56
+u.octets[2] == 0x34
+u.octets[3] == 0x12
+
+or is this undefined behaviour?TL;DR: Yes, the code is fine. 
+As noted, it contains implementation-defined behavior depending on endianess, but other than that, the behavior is well-defined and the code is portable (between little endian machines).
+
+Detailed answer:
+One thing that's important is that the order of allocation of an array is guaranteed, C11 6.2.5/20:
+
+An array type describes a contiguously allocated nonempty set of objects with a particular member object type, called the element type.
+
+This means that the array of 4 uint8_t is guaranteed to follow the allocation order of the uint32_t, which on a little endian system means least significant byte first.
+In theory, the compiler is however free to toss in any padding at the end of a union (C11 6.7.2.1/17), but that shouldn't affect the data representation. If you want to pedantically protect against this - or more relevantly, you wish to protect against an issue in case more members are added later - you can add a compile-time assert:
+typedef union {
+    uint32_t double_word;
+    uint8_t octets[4];
+} u;
+
+_Static_assert(sizeof(u) == sizeof(uint32_t), "union u: Padding detected");
+
+As for the representation of the uintn_t types, it is guaranteed to be 2's complement (in case of signed types) with no padding bits (C11 7.20.1.1).
+And finally, the issue about whether "type punning" through a union is allowed or undefined behavior, this is specified a bit vaguely in C11 6.5.2.3:
+
+A postfix expression followed by the . operator and an identifier designates a member of a structure or union object. The value is that of the named member,95) and is an lvalue if the first expression is an lvalue.
+
+Where the (non-normative) note 95 provides clarification:
+
+If the member used to read the contents of a union object is not the same as the member last used to
+  store a value in the object, the appropriate part of the object representation of the value is reinterpreted
+  as an object representation in the new type as described in 6.2.6 (a process sometimes called ‘‘type
+  punning’’). This might be a trap representation.
+
+And since we already ruled out padding bits, trap representations is not an issue.On a platform that actually has both of these types, C11 §7.20.1.1 p2 gives you all the needed guarantees (given you know endianness):
+
+The typedef name uintN_t designates an unsigned integer type with width N and no
+  padding bits. Thus, uint24_t denotes such an unsigned integer type with a width of
+  exactly 24 bits.
+
+This is enough because there are no bytes with fewer than 8 bits, so having uint8_t available automatically means that a byte has exactly 8 bits.Static assert in CWhat's the best way to achieve compile time static asserts in C (not C++), with particular emphasis on GCC?C11 standard adds the _Static_assert keyword.
+This is implemented since gcc-4.6:
+_Static_assert (0, "assert1"); /* { dg-error "static assertion failed: \"assert1\"" } */
+
+The first slot needs to be an integral constant expression.  The second slot is a constant string literal which can be long (_Static_assert(0, L"assertion of doom!")).
+I should note that this is also implemented in recent versions of clang.This works in function and non-function scope (but not inside structs,unions). 
+#define STATIC_ASSERT(COND,MSG) typedef char static_assertion_##MSG[(COND)?1:-1]
+
+STATIC_ASSERT(1,this_should_be_true); 
+
+int main()
+{
+ STATIC_ASSERT(1,this_should_be_true); 
+}
+
+
+If the compile time assertion could not be matched, then an almost intelligible message is generated by GCC sas.c:4: error: size of array ‘static_assertion_this_should_be_true’ is negative
+The macro could or should be changed to generate a unique name for the typedef (i.e. concatenate __LINE__ at the end of the static_assert_... name)
+Instead of a ternary, this could be used as well #define STATIC_ASSERT(COND,MSG) typedef char static_assertion_##MSG[2*(!!(COND))-1] which happens to work even on the rusty olde cc65 (for the 6502 cpu) compiler.
+
+UPDATE:
+For completeness sake, here's the version with __LINE__ 
+#define STATIC_ASSERT(COND,MSG) typedef char static_assertion_##MSG[(!!(COND))*2-1]
+// token pasting madness:
+#define COMPILE_TIME_ASSERT3(X,L) STATIC_ASSERT(X,static_assertion_at_line_##L)
+#define COMPILE_TIME_ASSERT2(X,L) COMPILE_TIME_ASSERT3(X,L)
+#define COMPILE_TIME_ASSERT(X)    COMPILE_TIME_ASSERT2(X,__LINE__)
+
+COMPILE_TIME_ASSERT(sizeof(long)==8); 
+int main()
+{
+    COMPILE_TIME_ASSERT(sizeof(int)==4); 
+}
+
+UPDATE2: GCC specific code
+GCC 4.3 (I guess) introduced the "error" and "warning" function attributes. If a call to a function with that attribute could not be eliminated through dead code elimination (or other measures) then an error or warning is generated. This can be used to make compile time asserts with user defined failure descriptions. It remains to determine how they can be used in namespace scope without resorting to a dummy function:
+#define CTC(X) ({ extern int __attribute__((error("assertion failure: '" #X "' not true"))) compile_time_check(); ((X)?0:compile_time_check()),0; })
+
+// never to be called.    
+static void my_constraints()
+{
+CTC(sizeof(long)==8); 
+CTC(sizeof(int)==4); 
+}
+
+int main()
+{
+}
+
+And this is how it looks like: 
+$ gcc-mp-4.5 -m32 sas.c 
+sas.c: In function 'myc':
+sas.c:7:1: error: call to 'compile_time_check' declared with attribute error: assertion failure: `sizeof(int)==4` not truecl
+I know the question explicitly mentions gcc, but just for completeness here is a tweak for Microsoft compilers.
+Using the negatively sized array typedef does not persuade cl to spit out a decent error. It just says error C2118: negative subscript. A zero-width bitfield fares better in this respect. Since this involves typedeffing a struct, we really need to use unique type names. __LINE__ does not cut the mustard — it is possible to have a COMPILE_TIME_ASSERT() on the same line in a header and a source file, and your compile will break. __COUNTER__ comes to the rescue (and it has been in gcc since 4.3).
+#define CTASTR2(pre,post) pre ## post
+#define CTASTR(pre,post) CTASTR2(pre,post)
+#define STATIC_ASSERT(cond,msg) \
+    typedef struct { int CTASTR(static_assertion_failed_,msg) : !!(cond); } \
+        CTASTR(static_assertion_failed_,__COUNTER__)
+
+Now
+STATIC_ASSERT(sizeof(long)==7, use_another_compiler_luke)
+
+under cl gives:
+
+error C2149: 'static_assertion_failed_use_another_compiler_luke' : named bit field cannot have zero width
+
+Gcc also gives an intelligible message:
+
+error: zero width for bit-field ‘static_assertion_failed_use_another_compiler_luke’From Wikipedia:
+#define COMPILE_TIME_ASSERT(pred) switch(0){case 0:case pred:;}
+
+COMPILE_TIME_ASSERT( BOOLEAN CONDITION );I would NOT recommend using the solution using a typedef:
+#define STATIC_ASSERT(COND,MSG) typedef char static_assertion_##MSG[(COND)?1:-1]
+
+The array declaration with typedef keyword is NOT guaranteed to be evaluated at compile time. For example, the following code in block scope will compile:
+int invalid_value = 0;
+STATIC_ASSERT(invalid_value, this_should_fail_at_compile_time_but_will_not);
+
+I would recommend this instead (on C99):
+#define STATIC_ASSERT(COND,MSG) static int static_assertion_##MSG[(COND)?1:-1]
+
+Because of the static keyword, the array will be defined at compile time. Note that this assert will only work with COND which are evaluated at compile time. It will not work with (i.e. the compile will fail) with conditions that are based on values in memory, such as values assigned to variables.Because:
+
+_Static_assert() is now defined in gcc for all versions of C, and
+static_assert() is defined in C++11 and later (and in C11 too, as a convenience macro to _Static_assert(); see here and here)
+
+The following simple macro for STATIC_ASSERT() therefore works in:
+
+C++:
+C++11 (g++ -std=c++11) or later
+C:
+gcc -std=c90
+gcc -std=c99
+gcc -std=c11
+gcc (no std specified)
+
+Define STATIC_ASSERT as follows:
+/* For C++: */
+#ifdef __cplusplus
+    #ifndef _Static_assert
+        #define _Static_assert static_assert /* `static_assert` is part of C++11 or later */
+    #endif
+#endif
+/* Now for gcc (C) (and C++, given the define above): */
+#define STATIC_ASSERT(test_for_true) _Static_assert((test_for_true), "(" #test_for_true ") failed")
+
+Now use it:
+STATIC_ASSERT(1 > 2); // Output will look like: error: static assertion failed: "(1 > 2) failed" 
+
+Examples:
+Tested in Ubuntu using gcc 4.8.4:
+Example 1: good gcc output (ie: the STATIC_ASSERT() codes works, but the condition was false, causing a compile-time assert):
+
+$ gcc -Wall -o static_assert static_assert.c && ./static_assert
+static_assert.c: In function ‘main’
+static_assert.c:78:38: error: static assertion failed: "(1 > 2) failed"
+#define STATIC_ASSERT(test_for_true) _Static_assert((test_for_true), "(" #test_for_true ") failed")
+^
+static_assert.c:88:5: note: in expansion of macro ‘STATIC_ASSERT’
+STATIC_ASSERT(1 > 2);
+^
+
+Example 2: good g++ -std=c++11 output (ie: the STATIC_ASSERT() codes works, but the condition was false, causing a compile-time assert):
+
+$ g++ -Wall -std=c++11 -o static_assert static_assert.c && ./static_assert
+static_assert.c: In function ‘int main()’
+static_assert.c:74:32: error: static assertion failed: (1 > 2) failed
+#define _Static_assert static_assert /* static_assert is part of C++11 or later */
+^
+static_assert.c:78:38: note: in expansion of macro ‘_Static_assert’
+#define STATIC_ASSERT(test_for_true) _Static_assert((test_for_true), "(" #test_for_true ") failed")
+^
+static_assert.c:88:5: note: in expansion of macro ‘STATIC_ASSERT’
+STATIC_ASSERT(1 > 2);
+^
+
+Example 3: failed C++ output (ie: the assert code doesn't work properly at all, since this is using a version of C++ before C++11):
+
+$ g++ -Wall -o static_assert static_assert.c && ./static_assert
+static_assert.c:88:5: warning: identifier ‘static_assert’ is a keyword in C++11 [-Wc++0x-compat]
+STATIC_ASSERT(1 > 2);
+^
+static_assert.c: In function ‘int main()’
+static_assert.c:78:99: error: ‘static_assert’ was not declared in this scope
+#define STATIC_ASSERT(test_for_true) _Static_assert((test_for_true), "(" #test_for_true ") failed")
+^
+static_assert.c:88:5: note: in expansion of macro ‘STATIC_ASSERT’
+STATIC_ASSERT(1 > 2);
+^
+
+Full test results here:
+/*
+static_assert.c
+- test static asserts in C and C++ using gcc compiler
+
+Gabriel Staples
+4 Mar. 2019 
+
+To be posted in:
+1. https://stackoverflow.com/questions/987684/does-gcc-have-a-built-in-compile-time-assert/987756#987756
+2. https://stackoverflow.com/questions/3385515/static-assert-in-c/7287341#7287341
+
+To compile & run:
+  C:
+    gcc -Wall -o static_assert static_assert.c && ./static_assert
+    gcc -Wall -std=c90 -o static_assert static_assert.c && ./static_assert
+    gcc -Wall -std=c99 -o static_assert static_assert.c && ./static_assert
+    gcc -Wall -std=c11 -o static_assert static_assert.c && ./static_assert
+  C++:
+    g++ -Wall -o static_assert static_assert.c && ./static_assert
+    g++ -Wall -std=c++98 -o static_assert static_assert.c && ./static_assert
+    g++ -Wall -std=c++03 -o static_assert static_assert.c && ./static_assert
+    g++ -Wall -std=c++11 -o static_assert static_assert.c && ./static_assert
+    
+-------------
+TEST RESULTS:
+-------------
+
+1. `_Static_assert(false, "1. that was false");` works in:
+  C:
+    gcc -Wall -o static_assert static_assert.c && ./static_assert             YES
+    gcc -Wall -std=c90 -o static_assert static_assert.c && ./static_assert    YES
+    gcc -Wall -std=c99 -o static_assert static_assert.c && ./static_assert    YES
+    gcc -Wall -std=c11 -o static_assert static_assert.c && ./static_assert    YES
+  C++:
+    g++ -Wall -o static_assert static_assert.c && ./static_assert             NO
+    g++ -Wall -std=c++98 -o static_assert static_assert.c && ./static_assert  NO
+    g++ -Wall -std=c++03 -o static_assert static_assert.c && ./static_assert  NO
+    g++ -Wall -std=c++11 -o static_assert static_assert.c && ./static_assert  NO
+
+2. `static_assert(false, "2. that was false");` works in:
+  C:
+    gcc -Wall -o static_assert static_assert.c && ./static_assert             NO
+    gcc -Wall -std=c90 -o static_assert static_assert.c && ./static_assert    NO
+    gcc -Wall -std=c99 -o static_assert static_assert.c && ./static_assert    NO
+    gcc -Wall -std=c11 -o static_assert static_assert.c && ./static_assert    NO
+  C++:
+    g++ -Wall -o static_assert static_assert.c && ./static_assert             NO
+    g++ -Wall -std=c++98 -o static_assert static_assert.c && ./static_assert  NO
+    g++ -Wall -std=c++03 -o static_assert static_assert.c && ./static_assert  NO
+    g++ -Wall -std=c++11 -o static_assert static_assert.c && ./static_assert  YES
+
+3. `STATIC_ASSERT(1 > 2);` works in:
+  C:
+    gcc -Wall -o static_assert static_assert.c && ./static_assert             YES
+    gcc -Wall -std=c90 -o static_assert static_assert.c && ./static_assert    YES
+    gcc -Wall -std=c99 -o static_assert static_assert.c && ./static_assert    YES
+    gcc -Wall -std=c11 -o static_assert static_assert.c && ./static_assert    YES
+  C++:
+    g++ -Wall -o static_assert static_assert.c && ./static_assert             NO
+    g++ -Wall -std=c++98 -o static_assert static_assert.c && ./static_assert  NO
+    g++ -Wall -std=c++03 -o static_assert static_assert.c && ./static_assert  NO
+    g++ -Wall -std=c++11 -o static_assert static_assert.c && ./static_assert  YES
+
+*/
+
+#include <stdio.h>
+#include <stdbool.h>
+
+/* For C++: */
+#ifdef __cplusplus
+    #ifndef _Static_assert
+        #define _Static_assert static_assert /* `static_assert` is part of C++11 or later */
+    #endif
+#endif
+/* Now for gcc (C) (and C++, given the define above): */
+#define STATIC_ASSERT(test_for_true) _Static_assert((test_for_true), "(" #test_for_true ") failed")
+
+
+int main(void)
+{
+    printf("Hello World\n");
+
+    /*_Static_assert(false, "1. that was false");*/
+    /*static_assert(false, "2. that was false");*/
+    
+    STATIC_ASSERT(1 > 2);
+
+    return 0;
+}
+
+Related:
+
+Use static_assert to check types passed to macro [my own answer]
+https://en.cppreference.com/w/cpp/types/is_same
+https://en.cppreference.com/w/cpp/language/decltype
+Use static_assert to check types passed to macro
+How to use static assert in C to check the types of parameters passed to a macroThe classic way is using an array:
+char int_is_4_bytes_assertion[sizeof(int) == 4 ? 1 : -1];
+
+It works because if the assertion is true the array has size 1 and it is valid, but if it is false the size of -1 gives a compilation error.
+Most compilers will show the name of the variable and point to the right part of the code where you can leave eventual comments about the assertion.If using the STATIC_ASSERT() macro with __LINE__, it is possible to avoid line number clashes between an entry in a .c file and a different entry in a header file by including __INCLUDE_LEVEL__.
+For example :
+/* Trickery to create a unique variable name */
+#define BOOST_JOIN( X, Y )      BOOST_DO_JOIN( X, Y )
+#define BOOST_DO_JOIN( X, Y )   BOOST_DO_JOIN2( X, Y )
+#define BOOST_DO_JOIN2( X, Y )  X##Y
+#define STATIC_ASSERT(x)        typedef char \
+        BOOST_JOIN( BOOST_JOIN(level_,__INCLUDE_LEVEL__), \
+                    BOOST_JOIN(_assert_on_line_,__LINE__) ) [(x) ? 1 : -1]From Perl, specifically perl.h line 3455 (<assert.h> is included beforehand):
+/* STATIC_ASSERT_DECL/STATIC_ASSERT_STMT are like assert(), but for compile
+   time invariants. That is, their argument must be a constant expression that
+   can be verified by the compiler. This expression can contain anything that's
+   known to the compiler, e.g. #define constants, enums, or sizeof (...). If
+   the expression evaluates to 0, compilation fails.
+   Because they generate no runtime code (i.e.  their use is "free"), they're
+   always active, even under non-DEBUGGING builds.
+   STATIC_ASSERT_DECL expands to a declaration and is suitable for use at
+   file scope (outside of any function).
+   STATIC_ASSERT_STMT expands to a statement and is suitable for use inside a
+   function.
+*/
+#if (defined(static_assert) || (defined(__cplusplus) && __cplusplus >= 201103L)) && (!defined(__IBMC__) || __IBMC__ >= 1210)
+/* static_assert is a macro defined in <assert.h> in C11 or a compiler
+   builtin in C++11.  But IBM XL C V11 does not support _Static_assert, no
+   matter what <assert.h> says.
+*/
+#  define STATIC_ASSERT_DECL(COND) static_assert(COND, #COND)
+#else
+/* We use a bit-field instead of an array because gcc accepts
+   'typedef char x[n]' where n is not a compile-time constant.
+   We want to enforce constantness.
+*/
+#  define STATIC_ASSERT_2(COND, SUFFIX) \
+    typedef struct { \
+        unsigned int _static_assertion_failed_##SUFFIX : (COND) ? 1 : -1; \
+    } _static_assertion_failed_##SUFFIX PERL_UNUSED_DECL
+#  define STATIC_ASSERT_1(COND, SUFFIX) STATIC_ASSERT_2(COND, SUFFIX)
+#  define STATIC_ASSERT_DECL(COND)    STATIC_ASSERT_1(COND, __LINE__)
+#endif
+/* We need this wrapper even in C11 because 'case X: static_assert(...);' is an
+   error (static_assert is a declaration, and only statements can have labels).
+*/
+#define STATIC_ASSERT_STMT(COND)      STMT_START { STATIC_ASSERT_DECL(COND); } STMT_END
+
+If static_assert is available (from <assert.h>), it is used. Otherwise, if the condition is false, a bit-field with a negative size is declared, which causes compilation to fail.
+STMT_START / STMT_END are macros expanding to do / while (0), respectively.For those of you wanting something really basic and portable but don't have access to C++11 features, I've written just the thing.
+Use STATIC_ASSERT normally (you can write it twice in the same function if you want) and use GLOBAL_STATIC_ASSERT outside of functions with a unique phrase as the first parameter.
+#if defined(static_assert)
+#   define STATIC_ASSERT static_assert
+#   define GLOBAL_STATIC_ASSERT(a, b, c) static_assert(b, c)
+#else
+#   define STATIC_ASSERT(pred, explanation); {char assert[1/(pred)];(void)assert;}
+#   define GLOBAL_STATIC_ASSERT(unique, pred, explanation); namespace ASSERTATION {char unique[1/(pred)];}
+#endif
+
+GLOBAL_STATIC_ASSERT(first, 1, "Hi");
+GLOBAL_STATIC_ASSERT(second, 1, "Hi");
+
+int main(int c, char** v) {
+    (void)c; (void)v;
+    STATIC_ASSERT(1 > 0, "yo");
+    STATIC_ASSERT(1 > 0, "yo");
+//    STATIC_ASSERT(1 > 2, "yo"); //would compile until you uncomment this one
+    return 0;
+}
+
+
+Explanation:
+
+First it checks if you have the real assert, which you would definitely want to be using if it's available.
+If you don't it asserts by getting your predicate, and dividing it by itself. This does two things.
+If it's zero, id est, the assertion has failed, it will cause a divide by zero error (the arithmetic is forced because it is trying to declare an array).
+If it is not zero, it normalises the array size to 1. So if the assertion passed, you wouldn't want it to fail anyway because your predicate evaluated to -1 (invalid), or be 232442 (massive waste of space, IDK if it would be optimised out).
+For STATIC_ASSERT it is wrapped in braces, this makes it a block, which scopes the variable assert, meaning you can write it many times.
+It also casts it to void, which is a known way to get rid of unused variable warnings.
+For GLOBAL_STATIC_ASSERT, instead of being in a code block, it generates a namespace. Namespaces are allowed outside of functions. A unique identifier is required to stop any conflicting definitions if you use this one more than once.
+
+
+Worked for me on GCC and VS'12 C++This works, with "remove unused" option set. I may use one global function to check global parameters.
+//
+#ifndef __sassert_h__
+#define __sassert_h__
+
+#define _cat(x, y) x##y
+
+#define _sassert(exp, ln) \
+extern void _cat(ASSERT_WARNING_, ln)(void); \
+if(!(exp)) \
+{ \
+    _cat(ASSERT_WARNING_, ln)(); \
+}
+
+#define sassert(exp) _sassert(exp, __LINE__)
+
+#endif //__sassert_h__
+
+//-----------------------------------------
+static bool tab_req_set_relay(char *p_packet)
+{
+    sassert(TXB_TX_PKT_SIZE < 3000000);
+    sassert(TXB_TX_PKT_SIZE >= 3000000);
+    ...
+}
+
+//-----------------------------------------
+Building target: ntank_app.elf
+Invoking: Cross ARM C Linker
+arm-none-eabi-gcc ...
+../Sources/host_if/tab_if.c:637: undefined reference to `ASSERT_WARNING_637'
+collect2: error: ld returned 1 exit status
+make: *** [ntank_app.elf] Error 1
+//This worked for some old gcc. Sorry that I forgot what version it was:
+#define _cat(x, y) x##y
+
+#define _sassert(exp, ln)\
+extern char _cat(SASSERT_, ln)[1]; \
+extern char _cat(SASSERT_, ln)[exp ? 1 : 2]
+
+#define sassert(exp) _sassert((exp), __LINE__)
+
+//
+sassert(1 == 2);
+
+//
+#148 declaration is incompatible with "char SASSERT_134[1]" (declared at line 134)  main.c  /test/source/controller line 134    C/C++ Problem_lua_close undefined symbols on my macI have source file
+#include <lua.h>
+#include <lauxlib.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+#define BUFSIZE 1024
+
+int main() {
+  char line[BUFSIZE];
+
+  lua_State *L = lua_open();
+  while (fgets(line, sizeof(line), stdin) != 0) {
+    lua_dostring(L, line);
+  }
+  lua_close(L);
+  exit(0);
+}
+
+Then I run gcc luac.c, got an error.
+Undefined symbols for architecture x86_64:
+  "_lua_close", referenced from:
+      _main in luac-9bbdf6.o
+  "_lua_dostring", referenced from:
+      _main in luac-9bbdf6.o
+  "_lua_open", referenced from:
+      _main in luac-9bbdf6.o
+ld: symbol(s) not found for architecture x86_64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+
+It seems like that I have no lua.h in my /usr/local/include folder. But it have.
+ls -al /usr/local/include/lua.h 
+-rw-r--r--@ 1 root  admin    11K Apr  3 16:23 /usr/local/include/lua.h
+
+And I have
+ls -al /usr/local/lib/liblua.a
+-rw-r--r--  1 root  admin  150448 Apr  3 16:23 /usr/local/lib/liblua.a
+
+The gcc search path
+gcc -Xlinker -v 
+(#)PROGRAM:ld  PROJECT:ld64-305
+configured to support archs: armv6 armv7 armv7s arm64 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em (tvOS)
+Library search paths:
+    /usr/lib
+    /usr/local/lib
+Framework search paths:
+    /Library/Frameworks/
+    /System/Library/Frameworks/
+...
+
+Why gcc says error, can you tell me.
+
+Updated:
+The problem is gcc default doesn't add lua lib?
+I use gcc luac.c -llua -llualib, works.Using strcmp() on STDIN_FILENO [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Why I'm getting trash on this pipe?
+
+                                (3 answers)
+                            
+
+
+Why is my simple C program displaying garbage to stdout?
+
+                                (5 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+        char buf[BUF_SIZE + 1];
+        printf("[Enter Command]: \n");
+        num_read = read(STDIN_FILENO, buf, BUF_SIZE);
+        if (num_read == 5) {
+            exit(0);
+        }
+
+I want to check if the user input is the string "exit" and exit the program if it is. The snippet above works but it will exit on all 4 letter strings. I only want it to exit on the string "exit".
+I don't understand why the code below doesn't work:
+if (strcmp("exit", buf) == 0) {
+    exit(0);
+}The strcmp() isn't working since read() is not 0-terminating the input, it's not doing string input.
+Use e.g. fgets() to read a full line, then check if it starts with exit (remember that it will contain the linefeed).No GCC warning for function with declaration different from definitionC file definition:
+#include <stdint.h>
+void foo(int i)
+{
+    if(i>0) bar();
+}
+
+H file declaration:
+#ifndef FILE_H
+#define FILE_H
+
+void foo(void);
+
+#endif FILE_H
+
+main:
+#include "file.h"
+
+int main(void)
+{ 
+    foo();
+}
+
+The file.h is not included in file.c for some abstraction reasons.
+Why isn't GCC generating any warning in this particular case?As noted in comments…
+In general terms, you must include the header that declares a function both where the function is defined and where it is used. You didn't, so the compiler couldn't warn. Headers are the glue that allow the compiler to do the cross-checking necessary to ensure basic sanity in your code.
+The question claims:
+
+The file.h is not included in file.c for some abstraction reasons.
+
+It isn't clear what those abstraction reasons are, but whatever the reasoning, it is faulty.  Since the question does not (yet) specify in any more detail what the problem is, we can't help you fix the issues.  However, they're spurious — you are doing something wrong.
+Specifically, you must include file.h in file.c as well as inmain.c.  Otherwise, you don't get the cross-checking you need — or the warning you desire.  You also need a prototype for bar() in file.c — you shouldn't be calling a function without a prototype (strictly, a non-prototype declaration is sufficient, but you really want a prototype) in scope, and there's no prototype for bar() in either <stdint.h> or file.h.
+I compile using GCC and options:
+gcc -O3 -g -std=c11 -Wall -Wextra -Werror -Wmissing-prototypes -Wstrict-prototypes …
+
+I don't bother to run the code until that's clean — indeed, the -Werror means I can't run the code until that's clean because the compilation fails if there is any warning or error.  You can afford to go more stringent if you prefer; you shouldn't risk going much less stringent than that.
+Note that both C99 and C11 require that a function is declared or defined before it is used.  Only the ancient C90 standard permits calling functions that have not been pre-declared or pre-defined.How to print a word with specific character in C?Sample Input: Stack Overflow is Awesome
+Character to Search: e
+Output: Overflow Awesome 
+I wrote a code to split a string by space and store as words but i don't know how to check and print the result
+#include <stdio.h>
+#include <string.h>
+int main()
+{
+char str1[100];
+char newString[10][10]; 
+int i,j,ctr;
+   printf("\n\n Split string by space into words :\n");
+   printf("---------------------------------------\n");    
+
+printf(" Input  a string : ");
+fgets(str1, sizeof str1, stdin);    
+
+j=0; ctr=0;
+for(i=0;i<=(strlen(str1));i++)
+{
+    // if space or NULL found, assign NULL into newString[ctr]
+    if(str1[i]==' '||str1[i]=='\0')
+    {
+        newString[ctr][j]='\0';
+        ctr++;  //for next word
+        j=0;    //for next word, init index to 0
+    }
+    else
+    {
+        newString[ctr][j]=str1[i];
+        j++;
+    }
+}
+printf("\n Strings or words after split by space are :\n");
+for(i=0;i < ctr;i++)
+    printf(" %s\n",newString[i]);
+return 0;
+}You can use strchr() to easily check a string for a specific chararacter
+for (i = 0; i < ctr; i++) {
+    if (strchr(newString[i], 'e') != NULL) {
+        printf(" %s\n", newString[i]);
+    }
+
+}Add the following lines at end to your code to print the filtered strings/words by character e
+printf("\n Strings or words Containing character 'e' :\n");
+for(i=0;i < ctr;i++)
+   if(strchr(newString[i], 'e') != NULL) 
+      printf(" %s\n",newString[i]);Since you are parsing str1 in order to find the beginning and the end of each word, why not using the for loop to detect if the current word contain the letter that you search ?
+There are many little "error" too : do not use "strlen" in the for loop, it will be call each time ! Instead, detect '\0' !
+Your result array newString is unsafe ! It should be [50][100] because you can input a string of one word with 100 char ( so [1][100] ) or 50 letter and 50 blank (so [50][2] ). So the result array must be [50][100] in order to take any possibility.I would suggest to split the string using the strtok and using the strchr to check if the substring contains the letter e. In this way you can loop a single time over the original string and perform both the splitting and the checking.
+Something like this:
+#include <stdio.h>
+#include <string.h>
+
+int main ()
+{
+    char str[] ="Stack Overflow is Awesome";
+    char* pch;
+    char* pch2;
+    //split string by spaces
+    pch = strtok (str," ");
+    while (pch != NULL)
+    {
+        //check if the substring contains the letter 'e'
+        pch2 = strchr(pch,'e');
+        if (pch2 != NULL) {
+            printf ("%s\n",pch);
+        }
+        pch = strtok (NULL, " ");
+    }
+    return 0;
+}Converting hex to decimal in CFor example, when
+val = 0x505050
+val1 = 0x005000
+
+The result should be the addtion of the two hexadecimals, which is:
+0x50a050
+
+What I did is:
+int hex;
+int channel;
+int result;
+
+printf("first hex number: ");
+scanf("%x", &hex);
+
+printf("second hex number: ");
+scanf("%x", &channel);
+
+result = hex + channel;
+printf("Your new hex value is: ");
+printf("0x%x\n", result);
+
+And this brought me the right result. However, the problem here is that, when the second (channel) value is like,
+50 00 00
+
+it is base 10, not 16 so the addition of 0x505050 and 50 00 00 should be 0x825050 but I get 0x5050a0.
+How can I manage this problem?
+Also, when the second input is not hex and it is negative, for example,
+-50 -40 -30
+
+I get 0x505000, but it should be 0x1e2832
+How can handle with negative numbers?
+Can someone please help me out with this problem?You will have to gather your input as text, and then go through logic of your own creation to figure out if the text should be interpreted as base16, base10, or something else:
+char input[1024];
+fgets(input, 1024, stdin);
+// Examine input to figure out if base16, or base10.
+
+
+You also wrote that 500000(base10) + 0x505050(base16) should be 0x825050(base16).  But when I add those together, I get 0x57F170(base16).
+Please clarify your math?How to use struct pointer to set char name?struct player {
+    char name[20];
+    struct player *next;
+};
+
+int main() {
+  struct player *p;
+  p.name = "bob";
+}
+
+error: request for member 'name' in something not a structure or union
+How would I set a char name with a struct?In that little piece of code you have multiple problems.
+The first, about the error you get, you should have been told by just about any book or tutorial, good or bad. You need to use the "arrow" operator ->, as in p->name.
+But then you would get another error, because you can't assign to an array, only copy to it.
+And when that's done, you still have one more error, and that is your use of an uninitialized pointer. Uninitialized local variables (which is what p) is are really uninitialized. Their values will be indeterminate and seemingly random. Attempting to dereference (what you do with ->) such a pointer will lead to undefined behavior.
+In short, I recommend you to go back to your text book, and start over from the beginning.The simplest fix is to not declare p as a pointer to a struct, but rather an actual struct....and then use strcpy() to set name.  C doesn't use = for string assignment like some other programming languages.
+struct player {
+    char name[20];
+    struct player *next;
+};
+
+int main() {
+  struct player p;
+  strcpy(p.name, "bob");
+}how to know if the Linux os i am using has the specific system calls?I am building a firmware application for a busy box. My application uses all the socket related system calls, but when i run the program, the client is not able to connect to the server even though the server port is open (checked with netstat -nl) .
+Is it possible to check on the busy box that, if the system calls i am using are enabled on the operating system?
+Update: The program to connect to a server socket was working on  device1 and the same program was not working on device2. The device2 has the update on the kernel, this is the reason i was thinking if some system calls are not supported.
+The error given was errno - 97 after connect system call. which is the protocol family not supported.
+i have observed that the problem is caused in the below is the part of code.
+ADDRINFOA   hints;
+  PADDRINFOA  result;
+hints.ai_family = AF_INET;
+if (getaddrinfo (hostname, NULL, &hints, &result) == 0)
+
+{
+memcpy (sockaddr, result->ai_addr, result->ai_addrlen);
+
+freeaddrinfo (result);
+
+}
+after the Getaddrinfo the sockaddr.ss_family is 0. Which i expect to be 2
+What am i doing wrong here? any help?If you have not compiled your kernel in an uncommon configuration, you should have all network functionality included (this means your network related system calls should be included)
+Posting your failing code could be an idea, already signalled in the comments (follow @SomeProgrammerDude's comment)
+EDIT
+System calls use fixed, registered identifiers (internal integer ids) to select the proper system call and this must work with different kernels and different standard libraries that bound the identifier names by which we know the syscall.  If you modify any of these, you break the stdlib interface (or the kernel) So they are fixed.  Even when functionality is not implemented, the syscall entry point must work.  Normally, on system calls not actually implemented, there's a stub function that limits to give an error on call.CRC-16 (Modbus) calculation---- Not able to pass hexa values to the funtionNot able to pass hexa values to the funtion
+I am trying to  send the hexa decimal values to crc16_2(). it is not showing any errors, but i am not getting the output.
+Please got to the last line in the code for output for the data in hexa values in abc[] array.
+#include<stdio.h>
+#include<conio.h>
+unsigned int CRC16_2(unsigned int *buf, int len)
+{
+    unsigned int crc = 0xFFFF;
+    for (int pos = 0; pos < len; pos++)
+    {
+        crc ^= (unsigned int)buf[pos];  // XOR byte into least sig. byte of crc
+        for (int i = 8; i != 0; i--)
+        {    // Loop over each bit
+            if ((crc & 0x0001) != 0)
+            {      // If the LSB is set
+            crc >>= 1;                  // Shift right and XOR 0xA001
+            crc ^= 0xA001;
+            }
+            else                        // Else LSB is not set
+            crc >>= 1;                  // Just shift right
+        }
+    }
+    return crc;
+}
+int main()
+{
+    unsigned int abc[5]={0x020300000001,0x020300010001,0x020300020001,0x020300030001,0x020300040001};
+    unsigned int final;
+    for(int i=0;i<5;i++)
+    {
+        final=CRC16_2(abc[i],12);
+        printf("%.4x\n",final);
+    }
+}
+//outputs are : 3984, F9D5, F925, 3974, F8C5As Pras said:
+
+Use long long instead of int, 0x020300000001 wont fit in 4 byte int,
+  first confirm int size with sizeof int
+
+Also you pass 1 Element of your array to the function so it is just an integer. (that is cut to the last 4 byte).
+The function accepts a pointer to an integer but you give it an integer. As far as we know the memory is not allocated for your program so this is undefined behaviour, as soon as you dereference it.
+Also you access the integer pionter but you just work on 2 bytes. This seems strange.
+So either you dont show us the complete code or you could change your code to something similar like:
+
+pass the variable
+split it into 2 byte parts and save it into an array. Then you can use
+  your double for loop to process it.
+
+or 
+
+if you already want to pass the array you have to split it correctly
+  (2 byte chunks) before hand and then pass it correctly
+
+and generally use the data type that can contain the variable you want to save.read() end line not being found causing code to output weird symbol#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    char buf[10];
+    int ret;
+    while(1) {
+        ret = read(0, buf, sizeof buf);
+        printf("%s\n", buf);
+    }
+
+    return(0);
+}
+
+Basically, this is what happens:
+$ gcc -Wall above.c
+$ ./a.out
+h
+h
+@
+
+a
+a
+&
+^C
+$
+
+How do I make it so that this special character is not printed? I'm unsure how to fix this. I tried making buf[10] = '\0' but I still get the same error.read() does not zero terminate anything. It is a function that is used to read any bytes from a file descriptor, including zero bytes. As such, zero terminating the result would be kind of pointless. Instead, read() returns the amount of bytes that were successfully read. You must interpret that return value if you want to do correct reading.You have several errors, why don't use the return value of read?
+Simply you can use it in a "%.*s" format specifier, like in
+         printf("%.*s\n", ret, buf);
+
+but.... 
+
+you have to check that ret < 0  for errors.
+you have to check that ret == 0 for End of file condition.
+read(2) never terminates the sequence of characters read with a \0 char, so you cannot use any str* function on it (I used the trick of printing only the first ret chars  because the ret variable tells me there are not more, so I don't get behind the last character read)  but this approach will eat all the characters read after an actual \0 in the input file (or in the buffer), up to the ret-esim char.  That is because the %*s format stops before the specified ret value if it finds the string terminator null char.
+
+It is better to use write(2) or fwrite(2) with read(2), as in:
+         write(1, buffer, ret);
+
+As read(2), write(2) doesn't treat \0 as a string terminator, and case you have some \0 chars in the buffer, it will print them, as if they were normal characters.  This is important if you do want verbatim output from input (as in cat(1) command)You have to initialize the 'buf' with null. As 'buf' is declares local array and you didn't initialize it with null, 'read' call is reading up to sizeof(buf) which is 10 bytes. If you giving input string less than sizeof(buf) size, then it will read the remaining junk characters from the 'buf'. So initialize the 'buf' with null.
+int main(int argc, char **argv) {
+    char buf[10] = {'\0'};
+    int ret;
+    while(1) {
+        ret = read(0, buf, sizeof buf);
+        printf("\n%s\n", buf);
+    }
+
+    return(0);
+}buf[10] = ... is undefined behavior. The buffer goes from 0..9, so the naive approach should be  buf[9] = 0;.
+This still doesn't work because it is not linked to how much you actually read. You do know this because of the ret variable - so add buf[ret] = 0; before trying to output buf.
+edit: as pointed out in the comments, if the full amount of chars has been read (in this case 10) then buf[ret] is the same as buf[10] and so it is still undefined behavior. Easiest solution is to ensure the buffer is bigger than the max size you are trying to read.you should set buf[ret] to '\0' not buf[10].
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    char buf[10];
+    int ret;
+    while(1) {
+        ret = read(0, buf, sizeof(buf));
+        buf[ret] = '\0';
+        printf("%s\n", buf);
+    }
+
+    return(0);
+}
+
+well, as commented there are some mistakes in my answer. I just want to point out the single point, so I haven't consider too much.
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+
+int main(int argc, char **argv) {
+    char buf[10];
+    int ret;
+    while(1) {
+        ret = read(0, buf, sizeof(buf) - 1); // keep last byte for termination charactor
+        if (ret == -1) {
+            printf("error:%s\n", strerror(errno));
+            break;
+        } else if (ret == 0) {
+            // end of file. such as ctrl + D
+            break;
+        } else {
+            // ret certainly less than sizeof(buf)
+            buf[ret] = '\0';
+            printf("%s\n", buf);
+        }
+    }
+    return(0);
+}C - Using angle brackets in command linesAt the moment I have this code:
+int main(int argc,char* argv[]) {
+    FILE * fp;
+    char * line = NULL;
+    size_t len = 0;
+    ssize_t read;
+
+    char * txtfile = argv[1];
+
+    fp = fopen(txtfile, "r");
+    if (fp == NULL)
+        exit(EXIT_FAILURE);
+
+    while ((read = getline(&line, &len, fp)) != -1) {
+        printf("Retrieved line of length %zu :\n", read);
+        printf("%s", line);
+    }
+
+    fclose(fp);
+    if (line)
+    free(line);
+    exit(EXIT_SUCCESS);
+
+    return 0;
+}
+
+It's function is to read a file line by line and print its contents along with the number of the number of characters on that line but however when I try to pass angle brackets such as '>' or '<', it terminates and it doesn't give me any output. I have a task where I'm required to take it as a command line argument namely in the form of: 
+./hello < output.txt 
+
+to read a file.
+Note, the spec I was given says that my code will be tested in that specific manner, I'm just wondering how I could use the "<" without the quotations.
+(added OPs comment for clarity on the unchangeable requirment.)
+Is there any way I can work around this problem? Any tips would be greatly appreciated!You do not have a problem to work around.
+Your code will be tested by feeding it the content of output.txt as input. That will be exactly as if a user types in the input, to become standard input to all ways of reading input. This is called "input redirection".
+So all your ways to read in input (e.g. scanf()) will receive text from that file.  
+Presumeably your program will have the goal to read something from user and react to that input in a specified way. If that is not true, then please give an example of one of your programming assignments and explain why using scanf() (or something else) is not applicable to access the test input.
+To put it differently, if your problem is that you cannot access the "command line parameters" (which actually are not command line parameters, so you cannot access them as such), then try this:
+Make a simple input forwarder (read input and just print if) with a file of that name existing and having some "hello input redirection world" input. Build and run it from commandline as specified.
+Does it show the content of the file "output.txt"? I expected so.
+Wouldn't that be the workaround for not having the expected command line parameters?
+Picking up the recommendation by Jonathan Leffler, check whether there is a non-NULL argv[1] argument. If there is none, then study the concept of input-redirection to find out where the input might be which you need for your program.Try:
+./hello "<" > output.txt
+It will pass < as commad line arg and output wll be redirected to output.txt.Try single quotes, like this:
+./hello '<' output.txt 
+
+Single quote inhibits all interpretation of a sequence of characters.the following proposed code:
+
+cleanly compiles
+performs the desired functionality
+outputs the results from each call to getline()
+
+And now the proposed code:
+#include <stdio.h>
+#include <stdlib.h>
+
+
+int main( void )
+{
+    char * line = NULL;
+    size_t len = 0;
+    ssize_t getlineStatus;
+
+
+    while ((getlineStatus = getline(&line, &len, stdin) != -1) )
+    {
+        printf("Returned value from getline(): %ld :\n", getlineStatus);
+        printf( "number of bytes allocated for line: %lu\n", len );
+        printf("%s\n\n", line);
+        free( line );
+        line = NULL;
+        len = 0;
+    }
+
+    free( line );
+    return 0;
+}
+
+I'm running ubuntu linux 16.04. using the source file for the input:
+untitled2 < untitled2.c
+
+results in:
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+#include <stdio.h>
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+#include <stdlib.h>
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+int main( void )
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+{
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //FILE * fp;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    char * line = NULL;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    size_t len = 0;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    ssize_t getlineStatus;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //char * txtfile = argv[1];
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //fp = fopen(txtfile, "r");
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //if (fp == NULL)
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //    exit(EXIT_FAILURE);
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    while ((getlineStatus = getline(&line, &len, stdin) != -1) )
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    {
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+        printf("Returned value from getline(): %ld :\n", getlineStatus);
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+        printf( "number of bytes allocated for line: %lu\n", len );
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+        printf("%s\n\n", line);
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+        free( line );
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+        line = NULL;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+        len = 0;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    }
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //fclose(fp);
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //if (line)
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    //    free( line );
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+    return 0;
+
+
+Returned value from getline(): 1 :
+number of bytes allocated for line: 120
+}

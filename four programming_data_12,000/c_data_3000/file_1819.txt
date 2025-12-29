@@ -1,0 +1,3659 @@
+How Get arguments value using inline assembly in C without Glibc?How Get arguments value using inline assembly in C without Glibc?
+i require this code for Linux archecture x86_64 and i386.
+if you know about MAC OS X or Windows , also submit and please guide.
+void exit(int code)
+{
+    //This function not important!
+    //...
+}
+void _start()
+{
+    //How Get arguments value using inline assembly
+    //in C without Glibc?
+    //argc
+    //argv
+    exit(0);
+}
+
+
+New Update
+https://gist.github.com/apsun/deccca33244471c1849d29cc6bb5c78e
+and 
+#define ReadRdi(To) asm("movq %%rdi,%0" : "=r"(To));
+#define ReadRsi(To) asm("movq %%rsi,%0" : "=r"(To));
+long argcL;
+long argvL;
+ReadRdi(argcL);
+ReadRsi(argvL);
+int argc = (int) argcL;
+//char **argv = (char **) argvL;
+exit(argc);
+
+But it still returns 0.
+So this code is wrong!
+please help.As specified in the comment, argc and argv are provided on the stack, so you cannot use a regular C function to get them, even with inline assembly, as the compiler will touch the stack pointer to allocate the local variables, setup the stack frame & co.; hence, _start must be written in assembly, as it's done in glibc (x86; x86_64). A small stub can be written to just grab the stuff and forward it to your "real" C entrypoint according to the regular calling convention.
+Here a minimal example of a program (both for x86 and x86_64) that reads argc and argv, prints all the values in argv on stdout (separated by newline) and exits using argc as status code; it can be compiled with the usual gcc -nostdlib (and -static to make sure ld.so isn't involved; not that it does any harm here).
+#ifdef __x86_64__
+asm(
+        ".global _start\n"
+        "_start:\n"
+        "   xorl %ebp,%ebp\n"       // mark outermost stack frame
+        "   movq 0(%rsp),%rdi\n"    // get argc
+        "   lea 8(%rsp),%rsi\n"     // the arguments are pushed just below, so argv = %rbp + 8
+        "   call bare_main\n"       // call our bare_main
+        "   movq %rax,%rdi\n"       // take the main return code and use it as first argument for...
+        "   movl $60,%eax\n"        // ... the exit syscall
+        "   syscall\n"
+        "   int3\n");               // just in case
+
+asm(
+        "bare_write:\n"             // write syscall wrapper; the calling convention is pretty much ok as is
+        "   movq $1,%rax\n"         // 1 = write syscall on x86_64
+        "   syscall\n"
+        "   ret\n");
+#endif
+#ifdef __i386__
+asm(
+        ".global _start\n"
+        "_start:\n"
+        "   xorl %ebp,%ebp\n"       // mark outermost stack frame
+        "   movl 0(%esp),%edi\n"    // argc is on the top of the stack
+        "   lea 4(%esp),%esi\n"     // as above, but with 4-byte pointers
+        "   sub $8,%esp\n"          // the start starts 16-byte aligned, we have to push 2*4 bytes; "waste" 8 bytes
+        "   pushl %esi\n"           // to keep it aligned after pushing our arguments
+        "   pushl %edi\n"
+        "   call bare_main\n"       // call our bare_main
+        "   add $8,%esp\n"          // fix the stack after call (actually useless here)
+        "   movl %eax,%ebx\n"       // take the main return code and use it as first argument for...
+        "   movl $1,%eax\n"         // ... the exit syscall
+        "   int $0x80\n"
+        "   int3\n");               // just in case
+
+asm(
+        "bare_write:\n"             // write syscall wrapper; convert the user-mode calling convention to the syscall convention
+        "   pushl %ebx\n"           // ebx is callee-preserved
+        "   movl 8(%esp),%ebx\n"    // just move stuff from the stack to the correct registers
+        "   movl 12(%esp),%ecx\n"
+        "   movl 16(%esp),%edx\n"
+        "   mov $4,%eax\n"          // 4 = write syscall on i386
+        "   int $0x80\n"
+        "   popl %ebx\n"            // restore ebx
+        "   ret\n");                // notice: the return value is already ok in %eax
+#endif
+
+int bare_write(int fd, const void *buf, unsigned count);
+
+unsigned my_strlen(const char *ch) {
+    const char *ptr;
+    for(ptr = ch; *ptr; ++ptr);
+    return ptr-ch;
+}
+
+int bare_main(int argc, char *argv[]) {
+    for(int i = 0; i < argc; ++i) {
+        int len = my_strlen(argv[i]);
+        bare_write(1, argv[i], len);
+        bare_write(1, "\n", 1);
+    }
+    return argc;
+}
+
+Notice that here several subtleties are ignored - in particular, the atexit bit. All the documentation about the machine-specific startup state has been extracted from the comments in the two glibc files linked above.This answer is for x86-64, 64-bit Linux ABI, only.  All the other OSes and ABIs mentioned will be broadly similar, but different enough in the fine details that you will need to write your custom _start once for each.
+You are looking for the specification of the initial process state in the "x86-64 psABI", or, to give it its full title, "System V Application Binary Interface, AMD64 Architecture Processor Supplement (With LP64 and ILP32 Programming Models)".  I will reproduce figure 3.9, "Initial Process Stack", here:
+
+Purpose                            Start Address                  Length
+------------------------------------------------------------------------
+Information block, including                                      varies
+argument strings, environment
+strings, auxiliary information
+...
+------------------------------------------------------------------------
+Null auxiliary vector entry                                  1 eightbyte
+Auxiliary vector entries...                            2 eightbytes each
+0                                                              eightbyte
+Environment pointers...                                 1 eightbyte each
+0                                  8+8*argc+%rsp               eightbyte
+Argument pointers...               8+%rsp                argc eightbytes
+Argument count                     %rsp                        eightbyte
+
+
+It goes on to say that the initial registers are unspecified except
+for %rsp, which is of course the stack pointer, and %rdx, which may contain "a function pointer to register with atexit".
+So all the information you are looking for is already present in memory, but it hasn't been laid out according to the normal calling convention, which means you must write _start in assembly language.  It is _start's responsibility to set everything up to call main with, based on the above.  A minimal _start would look something like this:
+_start:
+        xorl   %ebp, %ebp       #  mark the deepest stack frame
+
+  # Current Linux doesn't pass an atexit function,
+  # so you could leave out this part of what the ABI doc says you should do
+  # You can't just keep the function pointer in a call-preserved register
+  # and call it manually, even if you know the program won't call exit
+  # directly, because atexit functions must be called in reverse order
+  # of registration; this one, if it exists, is meant to be called last.
+        testq  %rdx, %rdx       #  is there "a function pointer to
+        je     skip_atexit      #  register with atexit"?
+
+        movq   %rdx, %rdi       #  if so, do it
+        call   atexit
+
+skip_atexit:
+        movq   (%rsp), %rdi           #  load argc
+        leaq   8(%rsp), %rsi          #  calc argv (pointer to the array on the stack)
+        leaq   8(%rsp,%rdi,8), %rdx   #  calc envp (starts after the NULL terminator for argv[])
+        call   main
+
+        movl   %eax, %edi   # pass return value of main to exit
+        call   exit
+
+        hlt                 # should never get here
+
+(Completely untested.)
+(In case you're wondering why there's no adjustment to maintain stack pointer alignment, this is because upon a normal procedure call, 8(%rsp) is 16-byte aligned, but when _start is called, %rsp itself is 16-byte aligned.  Each call instruction displaces %rsp down by eight, producing the alignment situation expected by normal compiled functions.)
+A more thorough _start would do more things, such as clearing all the other registers, arranging for greater stack pointer alignment than the default if desired, calling into the C library's own initialization functions, setting up environ, initializing the state used by thread-local storage, doing something constructive with the auxiliary vector, etc.
+You should also be aware that if there is a dynamic linker (PT_INTERP section in the executable), it receives control before _start does.  Glibc's ld.so cannot be used with any C library other than glibc itself; if you are writing your own C library, and you want to support dynamic linkage, you will also need to write your own ld.so.  (Yes, this is unfortunate; ideally, the dynamic linker would be a separate development project and its complete interface would be specified.)As a quick and dirty hack, you can make an executable with a compiled C function as the ELF entry point.  Just make sure you use exit or _exit instead of returning.
+(Link with gcc -nostartfiles to omit CRT but still link other libraries, and write a _start() in C.  Beware of ABI violations like stack alignment, e.g. use -mincoming-stack-boundary=2 or an __attribte__ on _start, as in Compiling without libc)
+If it's dynamically linked, you can still use glibc functions on Linux (because the dynamic linker runs glibc's init functions).  Not all systems are like this, e.g. on cygwin you definitely can't call libc functions if you (or the CRT start code) hasn't called the libc init functions in the correct order.  I'm not sure it's even guaranteed that this works on Linux, so don't depend on it except for experimentation on your own system.
+I have used a C _start(void){ ... } + calling _exit() for making a static executable to microbenchmark some compiler-generated code with less startup overhead for perf stat ./a.out.
+Glibc's  _exit() works even if glibc wasn't initialized (gcc -O3 -static), or use inline asm to run xor %edi,%edi / mov $60, %eax / syscall (sys_exit(0) on Linux) so you don't have to even statically link libc. (gcc -O3 -nostdlib)
+
+With even more dirty hacking and UB, you can access argc and argv by knowing the x86-64 System V ABI that you're compiling for (see @zwol's answer for a quote from ABI doc), and how the process startup state differers from the function calling convention:
+
+argc is where the return address would be for a normal function (pointed to by RSP).  GNU C has a builtin for accessing the return address of the current function (or for walking up the stack.)
+argv[0] is where the 7th integer/pointer arg should be (the first stack arg, just above the return address).  It happens to / seems to work to take its address and use that as an array!
+
+// Works only for the x86-64 SystemV ABI; only tested on Linux.
+// DO NOT USE THIS EXCEPT FOR EXPERIMENTS ON YOUR OWN COMPUTER.
+
+#include <stdio.h>
+#include <stdlib.h>
+
+// tell gcc *this* function is called with a misaligned RSP
+__attribute__((force_align_arg_pointer))
+void _start(int dummy1, int dummy2, int dummy3, int dummy4, int dummy5, int dummy6, // register args
+        char *argv0) {
+
+    int argc = (int)(long)__builtin_return_address(0);  // load (%rsp), casts to silence gcc warnings.
+    char **argv = &argv0;
+
+    printf("argc = %d, argv[argc-1] = %s\n", argc, argv[argc-1]);
+
+    printf("%f\n", 1.234);  // segfaults if RSP is misaligned
+    exit(0);
+    //_exit(0);  // without flushing stdio buffers!
+}
+
+   # with a version without the FP printf
+peter@volta:~/src/SO$ gcc -nostartfiles _start.c -o bare_start 
+peter@volta:~/src/SO$ ./bare_start 
+argc = 1, argv[argc-1] = ./bare_start
+peter@volta:~/src/SO$ ./bare_start abc def hij
+argc = 4, argv[argc-1] = hij
+peter@volta:~/src/SO$ file bare_start
+bare_start: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=af27c8416b31bb74628ef9eec51a8fc84e49550c, not stripped
+ # I could have used  -fno-pie -no-pie to make a non-PIE executable
+
+This works with or without optimization, with gcc7.3.  I was worried that without optimization, the address of argv0 would be below rbp where it copies the arg, rather than its original location.  But apparently it works.
+gcc -nostartfiles links glibc but not the CRT start files.
+gcc -nostdlib omits both libraries and CRT startup files.
+Very little of this is guaranteed to work, but it does in practice work with current gcc on current x86-64 Linux, and has worked in the past for years.  If it breaks, you get to keep both pieces.  IDK what C features are broken by omitting the CRT startup code and just relying on the dynamic linker to run glibc init functions.  Also, taking the address of an arg and accessing pointers above it is UB, so you could maybe get broken code-gen.  gcc7.3 happens to do what you'd expect in this case.
+Things that definitely break
+
+atexit() cleanup, e.g. flushing stdio buffers.
+static destructors for static objects in dynamically-linked libraries.  (On entry to _start, RDX is a function pointer you should register with atexit for this reason.  In a dynamically linked executable, the dynamic linker runs before your _start and sets RDX before jumping to your _start.  Statically linked executables have RDX=0 under Linux.)
+
+
+gcc -mincoming-stack-boundary=3 (i.e. 2^3 = 8 bytes) is another way to get gcc to realign the stack, because the -mpreferred-stack-boundary=4 default of 2^4 = 16 is still in place.  But that makes gcc assume under-aligned RSP for all functions, not just for _start, which is why I looked in the docs and found an attribute that was intended for 32-bit when the ABI transitioned from only requiring 4-byte stack alignment to the current requirement of 16-byte alignment for ESP in 32-bit mode.
+The SysV ABI requirement for 64-bit mode has always been 16-byte alignment, but gcc options let you make code that doesn't follow the ABI.
+// test call to a function the compiler can't inline
+// to see if gcc emits extra code to re-align the stack
+
+// like it would if we'd used -mincoming-stack-boundary=3 to assume *all* functions
+// have only 8-byte (2^3) aligned RSP on entry, with the default -mpreferred-stack-boundary=4
+void foo() {
+    int i = 0;
+    atoi(NULL);
+}
+
+With -mincoming-stack-boundary=3, we get stack-realignment code there, where we don't need it.  gcc's stack-realignment code is pretty clunky, so we'd like to avoid that.  (Not that you'd really ever use this to compile a significant program where you care about efficiency, please only use this stupid computer trick as a learning experiment.)
+But anyway, see the code on the Godbolt compiler explorer with and without -mpreferred-stack-boundary=3.Invalid renderer SDL2I am looking through the code and i cant find solution for the problem of invalid renderer. I am beginner with SDL2 and i have to write code in pure C.
+I think that in my code there is more errors but because of this one i cant go further. Code is half in polish language so if u cant get what is where i can rewrite this a bit . Problem occure when in main i try to load function"Odczyt_z_Pliku". Probably somewhere there is a problem.
+SDL_GetError() says" invalid renderer.
+            #include<SDL.h>
+        #include<stdio.h>
+        #include<SDL_image.h>
+        #pragma warning(disable : 4996)
+        #define WYSOKOSC_EKRANU 768
+        #define SZEROKOSC_EKRANU 1024
+
+        typedef enum bool{
+            false,true
+        }bool;
+
+        typedef struct sTekstura {
+            int wysokosc;
+            int szerokosc;
+            SDL_Texture *Tekstura;
+
+        }sTekstura;
+
+        void IniTekstury(sTekstura T)
+        {
+            T.wysokosc = 0;
+            T.szerokosc = 0;
+            T.Tekstura = NULL;
+        }
+
+        void free(sTekstura T)
+        {
+            //Free texture if it exists
+            if (T.Tekstura != NULL)
+            {
+                SDL_DestroyTexture(T.Tekstura);
+                T.Tekstura = NULL;
+                T.szerokosc = 0;
+                T.wysokosc = 0;
+            }
+        }
+
+        int Odczyt_z_Pliku(char nazwa[50],sTekstura T,SDL_Renderer* Renderer)
+        {
+            free(T);
+
+            SDL_Texture* nTekstura = NULL;
+
+            //Load image at specified path
+            SDL_Surface* Powierzchnia = IMG_Load(nazwa);
+            if (Powierzchnia == NULL)
+            {
+                printf("Unable to load image %s! SDL_image Error: %s\n", nazwa, IMG_GetError());
+            }
+            else
+            {
+                SDL_SetColorKey(Powierzchnia, SDL_TRUE, SDL_MapRGB(Powierzchnia->format, 0xFF, 0xFF, 0xFF));
+
+                //Create texture from surface pixels
+                nTekstura = SDL_CreateTextureFromSurface(Renderer, Powierzchnia);
+                if (nTekstura == NULL)
+                {
+                    printf("Unable to create texture from %s! SDL Error: %s\n", nazwa, SDL_GetError());
+                }
+                else
+                {
+                    //Get image dimensions
+                    T.szerokosc = Powierzchnia->w;
+                    T.wysokosc = Powierzchnia->h;
+                }
+
+                //Get rid of old loaded surface
+                SDL_FreeSurface(Powierzchnia);
+            }
+
+            //Return success
+            T.Tekstura = nTekstura;
+            if (T.Tekstura != NULL)
+            {
+                return 1;
+            }
+            else
+            {
+                return 0;
+            }
+
+
+        }
+        bool Inicjalizacja(SDL_Window *Okno,SDL_Renderer *Renderer)
+        {
+            //Initialization flag
+            bool success = true;
+
+            //Initialize SDL
+            if (SDL_Init(SDL_INIT_VIDEO) < 0)
+            {
+                printf("SDL could not initialize! SDL Error: %s\n", SDL_GetError());
+                success = false;
+            }
+            else
+            {
+                //Set texture filtering to linear
+                if (!SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1"))
+                {
+                    printf("Warning: Linear texture filtering not enabled!");
+                }
+
+                //Create window
+                Okno = SDL_CreateWindow("SDL Tutorial", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SZEROKOSC_EKRANU, WYSOKOSC_EKRANU, SDL_WINDOW_SHOWN);
+                if (Okno == NULL)
+                {
+                    printf("Window could not be created! SDL Error: %s\n", SDL_GetError());
+                    success = false;
+                }
+                else
+                {
+                    //Create renderer for window
+                    Renderer = SDL_CreateRenderer(Okno, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+                    if (Renderer == NULL)
+                    {
+                        printf("Renderer could not be created! SDL Error: %s\n", SDL_GetError());
+                        success = false;
+                    }
+                    else
+                    {
+                        //Initialize renderer color
+                        SDL_SetRenderDrawColor(Renderer, 0xFF, 0xFF, 0xFF, 0xFF);
+
+
+                        //Initialize PNG loading
+                        int imgFlags = IMG_INIT_PNG;
+                        if (!(IMG_Init(imgFlags) & imgFlags))
+                        {
+                            printf("SDL_image could not initialize! SDL_image Error: %s\n", IMG_GetError());
+                            success = false;
+                        }
+                    }
+                }
+            }
+
+            return success;
+        }
+        void setBlendMode(sTekstura T, SDL_BlendMode blending) //MK: Funkcja ustawiająca przezroczystosc
+        {
+            //Set blending function
+            SDL_SetTextureBlendMode(T.Tekstura, blending);
+        }
+
+        void setAlpha(sTekstura T,Uint8 alpha)  //MK: Funkcja ustawiająca przezroczystość
+        {
+            //Modulate texture alpha
+            SDL_SetTextureAlphaMod(T.Tekstura, alpha);
+        }
+        void render(int x, int y,sTekstura T,SDL_Renderer *Renderer)
+        {
+            //Set rendering space and render to screen
+            SDL_Rect renderQuad = { x, y, T.szerokosc, T.wysokosc };
+            SDL_RenderCopy(Renderer, T.Tekstura, NULL, &renderQuad);
+        }
+
+
+        int main(int argc, char *argv[])
+        {
+            SDL_Window * Okno = NULL;
+            SDL_Renderer* Renderer = NULL;
+            sTekstura TloMenu;
+            TloMenu.szerokosc = 0;
+            TloMenu.wysokosc = 0;
+            TloMenu.Tekstura = NULL;
+            sTekstura TloGra;
+            TloGra.szerokosc = 0;
+            TloGra.wysokosc = 0;
+            TloGra.Tekstura = NULL;
+            sTekstura Pudlo;
+            Pudlo.szerokosc = 0;
+            Pudlo.wysokosc = 0;
+            Pudlo.Tekstura = NULL;
+            sTekstura Sciana;
+            Sciana.szerokosc = 0;
+            Sciana.wysokosc = 0;
+            Sciana.Tekstura = NULL;
+            sTekstura StartGry;
+            StartGry.szerokosc = 0;
+            StartGry.wysokosc = 0;
+            StartGry.Tekstura = NULL;
+            sTekstura KoniecGry;
+            KoniecGry.szerokosc = 0;
+            KoniecGry.wysokosc = 0;
+            KoniecGry.Tekstura = NULL;
+            SDL_Event e;
+
+            //Start up SDL and create window
+            if (!Inicjalizacja(Okno,Renderer))
+            {
+
+                printf("Failed to initialize!\n");
+            }
+            else
+            {
+
+                if(!Odczyt_z_Pliku("MENU BOMBERMAN.png", Sciana, Renderer))
+                {
+                    puts("Nie wczytano kostki");
+                    return 0;
+                }
+                if (!Odczyt_z_Pliku("pudlo3.bmp", Pudlo, Renderer))
+                {
+                    puts("Nie wczytano pudla");
+                    return 0;
+                }
+                if (!Odczyt_z_Pliku("MenuBomberman.bmp", TloMenu, Renderer))
+                {
+                    puts("Nie wczytano menu");
+                    return 0;
+                }
+                if (!Odczyt_z_Pliku("Mapa.bmp", TloGra, Renderer))
+                {
+                    puts("Nie wczytano mapy");
+                    return 0;
+                }
+                if (!Odczyt_z_Pliku("NEW GAME.bmp", StartGry, Renderer))
+                {
+                    puts("Nie wczytano napisu nowej gry");
+                    return 0;
+                }
+                else
+                {
+                    //Set standard alpha blending
+                    setBlendMode(StartGry, SDL_BLENDMODE_BLEND);
+                }
+                if (!Odczyt_z_Pliku("exitgimp.bmp", KoniecGry, Renderer))
+                {
+                    puts("Nie wczytano napisu koniec gry");
+                    return 0;
+                }
+                else
+                {
+                    //Set standard alpha blending
+                    setBlendMode(StartGry, SDL_BLENDMODE_BLEND);
+                }
+
+
+                    //Main loop flag
+                    bool quit = false;
+
+                    //Modulation component
+                    Uint8 AlphaStartu = 255;
+                    Uint8 AlphaKonca = 127;
+
+                    //While application is running
+                    while (!quit)
+                    {
+                        //Handle events on queue
+                        while (SDL_PollEvent(&e) != 0)
+                        {
+                            //User requests quit
+                            if (e.type == SDL_QUIT)
+                            {
+                                quit = true;
+                            }
+                            //Handle key presses
+                            else if (e.type == SDL_KEYDOWN)
+                            {
+                                //Increase alpha on w
+                                if (e.key.keysym.sym == SDLK_w)
+                                {
+                                    AlphaKonca = 127;
+                                    AlphaStartu = 255;
+                                }
+                                //Decrease alpha on s
+                                else if (e.key.keysym.sym == SDLK_s)
+                                {
+                                    AlphaKonca = 256;
+                                    AlphaStartu = 127;
+                                }
+                            }
+                        }
+
+                        //Clear screen
+                        SDL_SetRenderDrawColor(Renderer, 0xFF, 0xFF, 0xFF, 0xFF);
+                        SDL_RenderClear(Renderer);
+
+                        //Render background
+                        render(0, 0, TloMenu, Renderer);
+
+                        //Render front blended
+                        setAlpha(KoniecGry,AlphaKonca);
+                        setAlpha(StartGry, AlphaStartu);
+                        render(0, 0,StartGry,Renderer);
+                        render(0, 0,KoniecGry,Renderer);
+
+                        //Update screen
+                        SDL_RenderPresent(Renderer);
+                    }
+
+            }
+
+            //Free resources and close SDL
+            close();
+
+            return 0;
+        }When you get to Odczyt_z_Pliku, Renderer is still a NULL pointer.
+As it stands, in your main() function you have a variable Renderer of type SDL_Renderer* (initialized to NULL).  You then pass that value NULL into SDL_Renderer* which also takes an argument of type SDL_Renderer*.
+However, in C this is just a pass by copy of the value of the pointer itself (not the value pointed to by the pointer).  In other words, the argument Renderer to your function just creates a local variable in that function.  So in Odczyt_z_Pliku when you do Renderer = SDL_CreateRenderer(...); that may return a new pointer but it's only assigning it to the local variable Renderer, but this has no effect on the Renderer variable in your main() function.
+In C, the way to write a function that sets the value of a pointer that is a local variable in the calling function is to use a double pointer.  That is, change the signature of Inicjalizacja to
+bool Inicjalizacja(SDL_Window **Okno, SDL_Renderer **Renderer)
+
+then in main() (or wherever else) call it like:
+SDL_Window * Okno = NULL;
+SDL_Renderer* Renderer = NULL;
+...
+if (!Inicjalizacja(&Okno, &Renderer)) {
+...
+}
+
+and so on.  (Note: You made the same mistake with the SDL_Window Okno as well, and possibly elsewhere--I haven't read the full code).
+The syntax &Okno means pass the address of (i.e. a pointer to) the variable Okno.  Since Okno is itself a pointer, the address of the pointer is a double pointer.
+Then in Inicjalizacja write:
+*Renderer = SDL_CreateRenderer(...);
+
+and similarly with Okno.  The *Renderer syntax (which I find somewhat confusing) means the value pointed to by a pointer.  Since Renderer here is a double pointer, this means assign the single pointer (of type Renderer*) into the pointer pointed to by Renderer.  Now the Renderer* pointer in your main() function will be properly initialized.
+Note, similarly you should change the following check to:
+if (*Renderer == NULL) {...}
+
+and so on.  We know Renderer != NULL since it's a pointer to a local variable allocated in our main() function.  The interesting question is what value SDL_CreateRenderer returned, so we want to look at *Renderer.error: array subscript has type 'char' in a function (C) [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Warning: array subscript has type char
+
+                                (3 answers)
+                            
+
+Closed 3 years ago.
+
+
+
+I wrote the following function in C:
+void count(int arr[N]) {
+    char current;
+    while(scanf(" %c", &current) > 0 && (current != '#'))
+    {
+        if(current >= 'A' && current <= 'Z') {
+            current += 32;
+        } else if(current < 'a' || current > 'z') {
+            continue;
+        }
+        current -= 97;
+        arr[current]++;
+    }
+}
+
+Although I get a warning when compiling: error: array subscript has type 'char'. Cant I user current as int value?The char type can be signed or unsigned depending on the compiler configuration. The warning tells you that is current happens to be negative, the code would have undefined behavior as you would probably access and attempt to modify a byte outside the array boundaries. Given your code and assuming the target system uses ASCII, it is not going to happen.
+You can prevent the warning by computing the offset from 'a' directly as an int expression instead of updating the char variable.
+Here is a modified version, that still assumes ASCII but uses more explicit character values:
+void count(int arr[N]) {
+    char current;
+    while (scanf(" %c", &current) > 0 && current != '#') {
+        if (current >= 'A' && current <= 'Z') {
+            arr[current - 'A']++;
+        } else if (current >= 'a' && current <= 'z') {
+            arr[current - 'a']++;
+        }
+    }
+}Deadlock in malloc_atforkOur multi-threaded process is deadlocked in several threads, each showing the 3 frames below at the top of the stack.  GDB shows that another thread is stuck in fork (called via popen), which is presumably why malloc_atfork, instead of malloc, is being called to allocate memory.
+#0  0x00007f4f02c4aeec in __lll_lock_wait_private () from 
+/usr/lib64/libc.so.6
+#1  0x00007f4f02bc807c in _L_lock_14817 () from /usr/lib64/libc.so.6
+#2  0x00007f4f02bc51df in malloc_atfork () from /usr/lib64/libc.so.6
+
+There is a RedHat bug (https://bugzilla.redhat.com/show_bug.cgi?id=906468) about a deadlock in glibc between fork and malloc and other reports about deadlocks in malloc_atfork.  
+And this link, https://sourceware.org/ml/libc-alpha/2016-02/msg00269.html, from Feb, 2016, contains a patch for removing malloc_atfork.
+Does anyone know a solution to this problem?While this is a bug in glibc, it should not be able to happen except when you are calling fork from an async-signal context, where it has interrupted code that's already holding the malloc lock and the interrupted code cannot make forward progress. Otherwise, it's another thread holding the lock, and that thread should eventually make forward progress and allow the fork to continue.
+Are you possibly calling popen from a signal handler? If so, that's not valid usage, and you should expect it to be able to fail in many other ways, not just this one.Time Limit Exceeded error in C code . How do I overcome it?I was trying to convert this piece of code to a code that uses just gotos,but I keep getting the Time limit error when I try to run it on the online IDEs,and when I try to run on my console it doesn't even react or print errors.
+here is the original code:
+void sort (int skip, int ∗A, int length) {
+    for (int n = length ; n > 1 ; n−−) {
+        int i = 0 ;
+        while (true) {
+            if (skip == 0 && i < n−1) {
+                if (A[i] > A[i +1]) {
+                    A[i] = A[i] ^ A[i+1];
+                    A[i +1] = A[i +1] ^ A[i] ;
+                    A[i] = A[i] ^ A[i+1] ;
+                }
+            }else
+                break ;
+            i++;
+       }
+   }
+}
+
+and this is the transformed code :
+#include <stdio.h>
+
+void sort(int skip,int *A,int length){
+    int n=length;
+    int i,temp,temp2;
+Lcond:
+    if(n<=1) goto Lend;
+Lbody:
+    i=0;
+Lcond_:
+    if(skip!=0) goto Lelse;
+    temp=n-1;
+    if(i>=temp) goto Lelse;
+Lbody_:
+    temp2=i+1;
+    if(A[i]>A[temp2]) goto Lbody__;
+    i++;
+    goto Lcond_;
+Lbody__:
+    A[i]=A[i]^A[temp2];
+    A[temp2]=A[temp2]^A[i];
+    A[i]=A[i]^A[temp2];
+    i++;
+    goto Lcond_;
+Lelse:
+    goto Lcond;
+Lend:
+    return;
+}
+int main(){
+    int skip=0;
+    int A[5]={3,5,1,4,2};
+    int length=5;
+    sort(skip,A,length);
+    for (int i=0;i<5;i++){
+            printf("%d\t",A[i]);
+    }
+}The program never ends because the only goto Lend is in Lcond: if(n<=1) goto Lend;, and n never changes, so the program keeps looping endlessly. You need an end condition.C snprintf to append struct member char*When I print out result->value I get garbage (text from other memory areas), and a free(): invalid pointer
+I am trying to safely append a string to an existing char* (the value member of the struct of which result is an instance)
+unsigned const NAME_BUFFER=100;
+unsigned const VALUE_BUFFER=1000;
+
+typedef struct {
+    char *name;
+    int  ID;
+    char *value;
+} props;
+
+…
+static Bool
+myfunc(props *result) 
+{
+    unsigned char *pointer;
+
+    result->name=malloc(NAME_BUFFER);
+    result->value=malloc(VALUE_BUFFER);
+
+// not sure I need to do this, previous instances of the code produced
+// output such as the quick...(null)someoutput
+// which I thought might be because the member is empty the first time?
+    sprintf(result->name,"%s","\0");
+    sprintf(result->value,"%s","\0");
+
+    …
+
+    // in a loop which sets pointer, we want to safely append the value of pointer to the
+    // value of the member called value
+
+    snprintf(result->value,VALUE_BUFFER,"the quick...%s%s",result->value,pointer);
+
+    …
+
+    return False;
+}
+
+static void 
+my_print_func() 
+{
+    props *result=malloc(sizeof(props));
+
+    if(my_func(result))
+        printf("%d\t%s",result->ID,result->value);
+}
+
+Changing the above to use sprintf doesn't cause these problems:
+sprintf(result->value,"the quick...%s%s",result->value,pointer);
+
+... other than the fact that it would happily try to insert more characters than allocated.
+So what is the correct way of appending with sprintf (or variant) whilst also making sure we don't go out of bounds?
+Ideally, it wouldn't involve temporary variables other constructs that need more than one line as I need to repeat this append in several places.This is undefined behaviour because the input arguments cannot be part of the output buffer (both in the case of snprintf and sprintf):
+snprintf(result->value,VALUE_BUFFER,"the quick...%s%s",result->value,pointer);
+
+This is specified telegraphically in the C standard:
+
+§7.21.6.5/para 2: …If copying takes place between objects that overlap, the behavior is undefined. (the same sentence appears in §7.21.6.6/2 with respect to sprintf)
+
+and also in man sprintf:
+
+…the results are undefined if a call to sprintf(), snprintf(), vsprintf(), or vsnprintf() would cause copying to take place between objects that overlap (e.g., if the target string array and one of the supplied input arguments refer to the same buffer). (Linux version)
+
+If it happens to produce the expected result in some circumstances, you were lucky (or unlucky, since the fluke could lead you to an invalid conclusion).
+Although it is not incorrect, this line is ridiculously complicated for what it does:
+sprintf(result->name,"%s","\0");
+
+"\0" is treated as a zero-length string because strings are terminated by the first NUL character, so it only differs from "" by the fact that it uses up two bytes instead of one. But in any case, you could simply write:
+result->name[0] = 0; /* Or ... `\0` if you like typing */
+
+The standard library includes strcat and strncat for concatenating strings, but the "safe" version strncat only lets you specify a limit to the number of characters to append, not a limit to the total length of the string. So you need to keep track of the number of characters available yourself, and if you're going to do that, you might as well instead keep track of the position of the end of the string, which is where you want to copy the appended string, rather than searching for the end every time you do a concatenation. For this reason, str(n)cat are hardly ever the correct solution for string concatenation.
+Here's a simple outline for concatenating multiple chunks to an output buffer:
+size_t used = 0;
+result->value = malloc(MAX_VALUE_LEN + 1);
+for (...) { /* loop which produces the strings to append */
+  ...
+  /* append a chunk */
+  size_t chunk_len = strlen(chunk);
+  if (MAX_VALUE_LEN - used >= chunk_len) {
+    memcpy(result->value + used, chunk, chunk_len);
+    used += chunk_len;
+  }
+  else {
+    /* Value is too long; return an error */
+  }
+}
+result->value[used] = 0;
+
+Not everyone will agree with my use of memcpy rather than strcpy; I did it because I already knew the length of the string to copy (which I had to figure out in order to check whether there was enough space), and it is usually more efficient to copy a known number of bytes than to copy bytes until you hit a NUL.
+The use of memcpy forces me to explicitly NUL-terminate the result, but I would otherwise have had to insert a NUL at the beginning in case the loop didn't manage to append anything. In order to leave room for the NUL, I initially allocated MAX_VALUE_LEN + 1 bytes. However, in practice I would probably start with a small allocation and exponentially realloc if necessary, rather than imposing an artificial limit and wasting memory in the common case that the artificial limit was much greater than the memory actually needed.
+If the size limit is not artificial -- that is, if there is some externality which constrains the length of the appended string, such as the size of an output display box -- then one might choose to simply truncate the string rather than throwing an error for over-size results:
+size_t used = 0;
+result->value = malloc(MAX_VALUE_LEN + 1);
+for (...) { /* loop which produces the strings to append */
+  ...
+  /* append a chunk */
+  size_t chunk_len = strlen(chunk);
+  if (MAX_VALUE_LEN - used < chunk_len) {
+    chunk_len = MAX_VALUE_LEN - used;
+  }
+  memcpy(result->value + used, chunk, chunk_len);
+  used += chunk_len;
+}
+result->value[used] = 0;Here are some issues with your code. Type Bool should be defined, and False as well. Data pointed to by pointer is not initialized. In your call to sprintf you read and write to result->value which is an undefined behavior.
+Here is a full working implementation, without undefined behavior, where the value of result->name is read and result of snprintf is written to result->value:
+https://taas.trust-in-soft.com/tsnippet/t/de28e2a6Cannot change number in array into one I want [closed]Closed. This question is not reproducible or was caused by typos. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I have little problem here. Ever since I used srand command I no longer get output I want.
+I have to create program that will create array not matter how long.. I chose 5. Then it has to create random numbers into it and 5th number in it has to be 0 and then it has to count all five numbers together. I was sucessful and I did even use some printfs to check if arr[5] is zero. It is. In output I receieve this: 5random numbers (that ones that were created into array) 0 (to check if command where i set arr[5] really set it to zero and result which only count all 5random numbers together but without changing 5th arr into 0. Any ideas why? Thanks!
+Code looks like this:
+ #include <stdio.h>
+#include <time.h>
+        main()
+        {
+            srand(time(NULL));
+            int result,i;
+            int arr[5];
+            for (i=0;i<5;i++)
+
+            {
+                arr[i] = rand() % 10+1;
+                printf("%d ",arr[i]);
+            }
+
+        arr[5]=0;
+        printf("\n");
+        printf("%d\n",arr[5]);
+        i=0;
+
+        for(;i<5;i++)
+        {
+            result +=arr[i];
+        }
+
+        printf("%d\n",result);
+        printf("%d\n",arr[5]);
+
+        }The declaration int arr[5] gives an array with five elements numbered from 0 to 4 inclusive. Accessing the 6th element, arr[5], is undefined.
+If you want five elements and a "sentinel" (the zero marker), you could define arr as
+int arr[6];
+
+You should probably also initialize result to 0 otherwise its value is undefined since it's a local variable (in fact, the meaning of the whole program is, strictly speaking, undefined in this case).Code formatting tool with netbeans integration and continuous integrationI am working with MPLAB X wich for those who don't know an IDE based on Netbeans. We are also using Git with continuous integration. I have now started to work in several different tests for our projects.
+For example, MPLAB lets you choose which encoding you want to use in your projects and UTF-8 is not the default option so from time to time we would find problems opening the projects in different platforms. Now I test that every source code file is properly encoded.
+We would also like to check code formatting and style. From what I've seen Netbeans comes with a tool to format code for you, but I don't see how to run this tool to print formatting mistakes as a test in our server. I have also seen that there are many tools like uncrustify that should be able to run in our server but they are not integrated with our IDE.
+I would prefer not to maintain two different configuration files for this task, for this reason I am asking if anybody knows if there is a tool that can be run both in a Linux based server and that can be integrated with Netbeans for this task.C - Printing Variables within StringsIs it possible to include variables through using %c and such when you have strings saved into the array?
+char *MainMenuNames[] = { "%c - Move Left", "%c - Move Right","%c - Move Up","%c - Move Down","%c - Back","%c - Confirm","%c - Show Stats","%c - Show Inventory","%c - Show Legend","%c - Show Controls"};
+
+When I have something like this, is it possible to put something into the %c?You can use the array element as a parameter to formatting functions like printf()
+char *commands = "lrudbcsiln";
+for (int i; i < strlen(commands); i++) {
+    printf(MainMenuNames[i], commands[i]);
+    putchar('\n');
+}Comparing two strings with strcmp() give EXC_BAD_ACCESSI have this function to insert a node in a red-black tree. The order key of this red-black tree is the string id_prod value, compared by the function strcmp. When I try to insert a node in this structure Xcode give to me this alert EXC_BAD_ACCESS
+this is the function:
+void insert_id(node *sent, node *new_node)
+{
+    if (sent->parent == NULL)
+    {
+        new_node->left = new_node->right = sent;
+        sent->parent = new_node;
+        new_node->color_node = black;
+    }
+    else
+    {
+        node *temp = malloc(sizeof(struct node));
+
+        temp = sent->left;
+
+        while (temp != sent)
+        {
+            if(strcmp(temp->id_prod, new_node->id_prod) < 0)
+            {
+                temp = temp->left;
+            }
+            else
+            {
+                temp = temp->right;
+            }
+        }
+        if (strcmp(new_node->id_prod, temp->id_prod) < 0)
+        {
+            temp->left = new_node;
+            new_node->parent = temp;
+        }
+        else
+        {
+            temp->right = new_node;
+            new_node->parent = temp;
+        }
+        new_node->left = new_node->right = sent;
+        new_node->color_node = black;
+        setup_tree(sent, new_node);
+    }
+    return;
+}
+
+The strings are in a file. This is the function that read and assign data from file to struct node:
+struct:
+typedef struct node
+{
+color   color_node;
+char    id_prod[5],         
+        name[20],           
+        id_piece[5];        
+struct  node    *left,
+                *right,
+                *parent;
+} node;
+
+Function:
+node* get_node_file(FILE *in)
+{
+node *new_node = (node*) malloc(sizeof(node));
+
+fscanf(in, FORMAT_IN,   new_node->id_prod,
+                        new_node->name,
+                        new_node->id_piece);
+
+
+new_node->left = NULL;
+new_node->right = NULL;
+new_node->parent = NULL;
+new_node->color_node = black;
+return new_node;
+}
+
+and this is the Main:
+#define STORE "Magazzino.txt"
+
+int main()
+{
+
+FILE    *input;
+node *sent = malloc(sizeof(struct node));
+sent->color_node = black;
+sent->left = sent->right = sent->parent = NULL;
+
+
+input = fopen(STORE, "r");
+
+insert_id(sent, get_node_file(input));
+insert_id(sent, get_node_file(input));
+insert_id(sent, get_node_file(input));
+
+
+
+return 0;
+}Cleaning pipe after second inputI'm new here and I'm beginner in C programming. I have a problem with using pipes to copy a one file to another. My buffer size is 10. When i copy from my file in.txt to out.txt there's always a "p" left on the end of char table. It's just because my last input contains only 9 characters, and the tenth char is from earlier input.
+"reader: msg88=as nulla p
+reader: msg89=ariatur? p
+"
+What should I do to clean my char table? I don't want the last "p" on the msg89. I need it to be the same files, but the in.txt doesn't contain the "p" on the end and the out.txt contains. When I use md5sum it's not the same:
+197ee73779d545f0d3dc7981131736c0  in.txt
+ed36f720a1ffc7e82983545d6305edc3  out.txt
+
+Code:
+filefd = open(argv[1], O_RDONLY, 0);
+for(int i = 0; read(filefd, message, 10) > 0; i++)
+{
+    printf("writer: msg%d=%s\n", i+1, message);
+    fflush(stdout);
+    write(fd[1], message, 10);
+    usleep(100000);
+}
+
+
+filefd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0666);
+for(int i = 0; read(fd[0], message, 10) > 0; i++)
+{
+    printf("reader: msg%d=%s\n", i+1, message);
+    fflush(stdout);
+    write(filefd, message, 10);
+    usleep(120000);
+}read returns the number of bytes read, so you should be able to do something like:
+ssize_t bytesread;
+for (int i = 0; (bytesread = read(fd[0], message, 10)) > 0; i++)
+{
+  ...
+  write(filefd, message, bytesread);
+  ...
+}
+
+The idea is to check the number of bytes read by the call to read (I'm storing it in a variable named bytesread) and pass that number to the write call instead of always passing 10.
+I assume you would make a similar change in both pieces of code you posted.AVR C hex and dec multiplication not as expectedI just discovered a bug in my code when multiplying hex integers (ex. 0xFFFF) with dec integers (ex. 2). This is the code where the problem occurs:
+print_int_new_line(0xFFFF*2);
+print_int_new_line(65535*2);
+
+Executing this code gives me the following result:
+65534
+131070
+
+This is relevant UART code:
+void print_int_new_line(uint64_t data) {
+    print_int(data);
+
+    print_new_line();
+}
+
+void print_int(uint64_t data) {
+    char data_buffer[(int)(log(data)+2)]; // size of the number (log(number)+1) + 1 for the /0
+
+    ultoa(data, data_buffer, 10); // convert the int to string, base 10
+
+    // print the newly created string
+    print_string(data_buffer);
+}
+
+void print_string(char * data) {
+
+    // transmit the data char by char
+    for(; *data != '\0'; data++){
+        USART_transmit(data);
+    }
+}
+
+void USART_transmit(const char * data){
+    /* Wait for empty transmit buffer */
+    while ( !( UCSR0A & (1<<UDRE0)) )
+    ;
+
+    /* Put data into buffer, sends the data */
+    UDR0 = *data;
+}
+
+Some info about my setup:
+MCU: ATmega2560
+Board: Arduino Mega2560
+UART baudrate: 38400
+IDE: Atmel Studio 7.0.4.1417
+Using the AVR toolchain.
+I read on this stackoverflow page that multiplication is possible between hex and dec ints. Also, testing this in an online c compiler gives the correct output.
+Can anyone give me an explanation?This behavior is due to differences in handling decimal and hexadecimal integer constants.
+For both 0xFFFF and 65535, the compiler will first try to convert the value to an int. But since the platform has a 16-bit int type where INT_MAX is 32767, that conversion cannot be performed.
+The key difference is the next step. For the hexadecimal constant 0xFFFF, the compiler will try to convert it to an unsigned int, which it does to the equivalent of (unsigned int)65535. But, for the decimal constants, conversions to unsigned types are not attempted. The next conversion attempt is to long int. This succeeds and is equivalent to (long int)65535.
+So the calls to print_int_new_line are equivalent to:
+print_int_new_line((unsigned int)65535*2);
+print_int_new_line((long int)65535*2);
+
+And when 2 is promoted to do the multiplication:
+print_int_new_line((unsigned int)65535*(unsigned int)2);
+print_int_new_line((long int)65535*(long int)2);
+
+The unsigned int result of the first multiplication is too small to hold the full result, so it is truncated to 65534. The long int can hold the result, so it produces the correct answer of 131070.
+You can force the hexadecimal constant to use a long int by appending an L (i.e. 0xFFFFL).strcmp not working in iterative server CWe are working on an iterative server in C, which can be used with the telnet client on UNIX. Our Code works fine, except when it comes to performing stringcompares using strcmp(). We have tried the fix using "\n" as suggested in this forum. The Code below works fine. We even enter the method checkInput(in,out)
+while(read(fileDescriptor,in,2000)>0)
+{
+    in[strlen(in)-1]=0;
+    checkInput(in,out);
+    write(fileDescriptor,out,strlen(out));
+}
+
+When we enter checkInput(in,out) we want to campare the string the user enters via telnet with another predefined string. But we always end in the else statement even though the twor strings are exactly the same.
+void checkInput(char in[],char out[])
+{
+    char tempString[]="GET TEMPERATURE\n";
+    char buzzer[]="GET BUZZER";
+
+    if(strcmp(in,tempString)==0)
+    {
+        strcpy(out,"Get Temp!");
+        //sprintf(out,"%d",temp);
+    }
+
+    else if(strcmp(in,"GET HUMIDITY")==0)
+    {
+        strcpy(out,"Get Hum!");
+        //sprintf(out,"%d",hum);
+    }
+
+    else if(strcmp(in,"GET LIGHT")==0)
+    {
+        strcpy(out,"Get Light!");
+        //sprintf(out,"%d",light);
+    }
+
+    else if(strcmp(in,"GET LED")==0)
+    {
+        strcpy(out,"Get LED!");
+        //sprintf(out,"%d",led);
+    }
+
+    else if(strcmp(in,"GET SOUND")==0)
+    {
+        strcpy(out,"Get Sound!");
+        //sprintf(out,"%d",sound);
+    }
+
+    else if(strncmp(in,buzzer, 11)==0)
+    {
+        strcpy(out,"Get Buzzer!");
+        //sprintf(out,"%d",buzzer);
+    }
+
+    else if(strcmp(in,"exit")==0)
+    {
+        strcpy(out,"Exiting... Get Out!");
+        exit(2);
+    }
+    else
+    {
+        strcpy(out,"\nDAAAAAMN YOU SERVER!!!!!!!!!\n");
+        sprintf(out,"%d",strcmp(in,buzzer));
+    }
+}
+
+Any help would be greatly appreciated! Thank You!Let's try a little experiment.
+In one session, we start up a netcat (nc process) which listens for a connection and dumps what it receives through hexdump (hd) so that we can see what telnet actually sends:
+$ nc -l 8888|hd
+
+In another session, we use telnet to send a little string:
+$ telnet localhost 8888 <<<"Hello, world!"
+
+Now, what do we see in the first terminal?
+$ nc -l 8888|hd
+00000000  48 65 6c 6c 6f 2c 20 77  6f 72 6c 64 21 0d 0a     |Hello, world!..|
+0000000f
+$
+Telnet sends CRLF at the end of each line (assuming the line was originally terminated with a LF). So when you're splitting the received input into lines on the server side, you need to remove both the \r and the \n. (If, for whatever reason, the original line was terminated by a \r instead of a \n, what you will receive on the other end will normally be a line terminated by \r\0, although telnet has an option to send \r\n in this case as well.
+Note that you should not assume that a single read call will return an entire line nor that it will return only a single line. The amount of data which is produced by a single read call is subject to so many environmental variations that no assumptions whatsoever should be made. At a minimum, you should find the end of the line by scanning for a \r and then dropping both the \r and the following \n or \0. If no line terminator is found, more data will have to be read. If the line terminator is followed by more data, then it will need to be processed in a subsequent step, instead of (or before) reading more input from the socket.
+For a bit more information on this subject, see RFC-1123 "Requirements for Internet Hosts" (which defines the telnet protocol in Chapter 3), and in particular section 3.3.1 "Telnet End-of-line Convention".the following proposed code snippet should fix your problem
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+// prototypes
+void checkInput(char in[],char out[]);
+void readWriteLoop( void );
+
+void readWriteLoop();
+{
+    char in[2000];
+    char out[2000];
+
+    FILE * fp = NULL;
+
+    fp = fopen( ..., "a+" ); // replace .... with the actual I/O device name
+    if( !fp )
+    {
+        perror( "fopen failed" );
+        exit( EXIT_FAILURE );
+    }
+
+    // implied else, fopen successful
+
+    while( fgets( in, sizeof( in ), fp) )  
+    { 
+        in[ strspn( in, "\n" ) ] = '\0'; 
+        checkInput( in, out );
+        fprintf( fp, "%s\n", out );
+    }
+
+    fclose( fp );
+}Environment Variables and localizationThere does not seem to be any documentation about this in MSDN but apparently SetEnvironmentVariableA and GetEnvironmentVariableA seem to work differently with special characters depending on the localization and I was wondering if this was expected.
+I put together this simple C console program:
+#include <windows.h>
+#include <stdio.h>
+int main()
+{
+    PUCHAR binIn = "\x06\xC7\x86\xC1\x99\x93\xCF";
+    UCHAR binUt[16] = {0};
+    SetEnvironmentVariable("MYVAR", binIn);
+    GetEnvironmentVariable("MYVAR", binUt, 16);
+    printf("%X %X %X %X %X %X %X\n", binUt[0], binUt[0], binUt[1], binUt[2], binUt[3], binUt[4], binUt[5], binUt[6]);
+}
+
+When run with System Locale as English, it displays the same bytes coming out as going in, i.e.:
+06 C7 86 C1 99 93 CF
+
+However, when run with System Locale as Japanese it displays slightly different output:
+06 C7 81 45 99 93 CF
+
+Is this expected? Is there a way to get it to return the same value regardless of the Locale?Evidently some characters are not supported in this string. You can duplicate the problem by converting the string to UTF16 and back:
+wchar_t* get_unicode(const char* ansi, UINT codepage)
+{
+    if(!ansi) return 0;
+    int size = MultiByteToWideChar(codepage, 0, ansi, -1, 0, 0);
+    wchar_t* unicode = malloc(size * sizeof(wchar_t));
+    MultiByteToWideChar(codepage, 0, ansi, -1, unicode, size);
+    return unicode;
+}
+
+char* get_char(const wchar_t* unicode, UINT codepage)
+{
+    if(!unicode) return 0;
+    int size = WideCharToMultiByte(codepage, 0, unicode, -1, 0, 0, 0, 0);
+    char* ansi = malloc(size);
+    WideCharToMultiByte(codepage, 0, unicode, -1, ansi, size, 0, 0);
+    return ansi;
+}
+
+int main()
+{
+    //932 for Japanese code page
+    wchar_t* unicode = get_unicode("\x06\xC7\x86\xC1\x99\x93\xCF", 932);
+    char* ansi = get_char(unicode, 932);
+    for(int i = 0, len = strlen(ansi); i < len; i++)
+        printf("%02X ", ansi[i]&0xFF);
+    printf("\n");
+    return 0;
+}
+
+It's the same wrong result:
+06 C7 81 45 99 93 CF
+
+There might not be much you can do here. Maybe the original Japanese string was not converted properly, or maybe some characters are not supported.
+Use Unicode to easily solve the problem:
+int main()
+{
+    SetEnvironmentVariableW(L"MYVAR", L"日本語 ελληνικά");
+    wchar_t buf[100];
+    GetEnvironmentVariableW(L"MYVAR", buf, _countof(buf));
+    MessageBoxW(0, buf, 0, 0);
+    return 0;
+}
+
+If the rest of your program is not Unicode or cannot be converted, you can store the wide char string in UTF8 format instead of UTF16, like the example below: 
+int main()
+{
+    char* utf8 = get_char(L"日本語", CP_UTF8);
+
+    wchar_t* unicode = get_unicode(utf8, CP_UTF8);
+    SetEnvironmentVariableW(L"MYVAR", unicode);
+    wchar_t buf[100];
+    GetEnvironmentVariableW(L"MYVAR", buf, _countof(buf));
+
+    MessageBoxW(0, buf, 0, 0);
+
+    free(utf8);
+    free(unicode);
+
+    return 0;
+}C - Best inter-thread communication practice supporting both put and getsIm trying to do an experiment where data and work is partitioned over the CPU cores on a specific machine. This is done by settings the CPU affinity and pinning one thread to each core. The data the thread stores is generated within the thread in an attempt to keep the data as close to the thread as possible (within the core cache). The data is of different types and each thread stores a different type of data. Now the main thread should be able to put and get data to each data container within each thread, but right here im not sure what to aim for. 
+The experiment is implemented in C.
+Assuming concurrent put and get requests to the different threads, which inter-thread communication technique would be best suited? The idea is that i want as little data movement between cores as possible, therefore im trying to avoid using shared communication buffers/mutexes. I initially aimed for using sockets at each thread, but it is a bit too much work as this is not really the purpose of the experiment. Right now im considering using some type of queues, and i guess i would need to implement some input and output queues in order to handle both puts and gets. Therefore i came here to hopefully get some directions and tips.
+Thanks in advance!How can we see the list of files in dynamic library (.so)Is there a way to view the list of object files in dynamic library (.so) like static library below.
+ar -t llibexample.alvalue required as left operand of assignment.....?I'm doing my c homework..... :( using a trinomial operator(?) _oo? oo : oo  
+#include <stdio.h>
+
+int main()
+{
+    int time1, time2, gap;
+    int hour, minute;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("Enter first time: \n");
+    scanf("%d", &time1);
+
+    printf("Enter second time: \n");
+    scanf("%d", &time2);
+
+    gap = time2 - time1;
+
+    gap > 0 ? hour = gap/100 : hour = (2400 - gap)/100;
+    gap > 0 ? minute = gap%100 : minute = (2400 - gap)%100;
+
+    print("The gap of these times: %d hours, %d minutes", hour, minute);
+
+}
+
+gap > 0 ? gap/100 = hour : (2400 - gap)/100 = hour;
+gap > 0 ? minute = gap%100 : minute = (2400 - gap)%100;
+These two sentences are error(lvalue required as left operand of assignment)
+The result I want
+Enter first time:
+1925
+Enter second time:
+2358
+The gap of these times: 4 hours, 33 minutes
+OR
+Enter first time:
+1540
+Enter second time:
+1630
+The gap of these times: 0 hours, 50 minutes
+OR
+Enter first time:
+0730
+Enter second time:
+0720
+The gap of these times: 23 hours, 50 minutesTry instead:
+ hour   = (gap > 0) ? gap/100 : (2400 - gap)/100;
+ minute = (gap > 0) ? gap%100 : (2400 - gap)%100;Since both conditional expressions evaluate the same condition, it would be cleaner to combine assignments in an if statement:
+if (gap > 0) {
+    hour = gap/100;
+    minute = gap%100;
+} else {
+    hour = (2400 - gap)/100;
+    minute = (2400 - gap)%100;
+}
+
+You could further simplify this by adding a new variable:
+int numerator = gap > 0 ? gap : 2400-gap;
+hour = numerator/100;
+minute = numerator%100;How to send large data on network using udp protocol?User space can call send and only send MTU size packets.
+This will force multiple calls to send but will avoid IP fragmentation.
+But multiple calls to send will force multiple user/kernel context switch.
+The other way is that user space can send big packets (may be N*MTU size) and that will cause N IP fragments, but will decrease user/kernel context switch.
+On the other hand, IP fragments can slow down the network path too, as all the routers need to accumulate the packet before routing forward.
+After my googling research, I came to conclusion that using iovec with readv/writev and sending MTU size is possibly a way to go as it will address both the concerns about context switch and IP fragmentation. 
+I will appreciate any deep insight and opinion on this.C Read file content into string just with stdio libary [closed]Closed. This question needs details or clarity. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Add details and clarify the problem by editing this post.
+                
+Closed 3 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+Im struggleing by trying to read the files content into a string (char*).
+I just have to use the stdio.h libary, so I cant allocate memory with malloc.
+How can I read all the content of a file and return it into a string?I will attempt to answer your question. Keep in mind though - I am still fairly new to C, so there could be a better solution out there in which case please let me know about it too! :) 
+EDIT: And there was... 
+Here is how I see it... 
+You need to know the size of the file you want to store in a string. 
+More precisely - in the example solution that I'm providing, you need to know how many chars are in your input file.
+All you are doing with malloc is dynamically allocating memory on the 'heap'. I presume you already know that...
+So regardless of where your string lives in memory (stack or heap) you need to know how big that string has to be, so all of the contents of your input file would fit in to it.
+Here is a quick pseudo-code and some code with a solution to your problem... I hope this is helpful and I am open to learn a better approach if there is one, peace! 
+Pseudo-code:
+
+open input file for reading
+find out the size of the file
+
+
+forward seek file position indicator to the end of the file
+get the total number of bytes (chars) in infile
+rewind file position indicator back to the start
+  (because we will be reading from it again)
+
+
+declare a char array, size of - all counted chars in infile + 1 for '\0' 
+at the end of the string.  
+read all chars of infile in to the array
+Terminate your string with '\0' 
+Close input file  
+
+Here is a simple program that does just that and prints your string:
+#include <stdio.h>
+
+int main(void)
+{
+    // Open input file
+    FILE *infile = fopen("hello.py", "r");
+    if (!infile)
+    {
+        printf("Failed to open input file\n");
+        return 1;
+    }
+
+    ////////////////////////////////
+    // Getting file size
+
+    // seek file position indicator to the end of the file
+    fseek(infile, 0L, SEEK_END);
+
+    // get the total number of bytes (chars) in infile
+    int size = ftell(infile); // ask for the position
+
+    // Rewind file position indicator back to the start of the file
+    rewind(infile);
+
+    //////////////////////////////////
+
+    // Declaring a char array, size of - all the chars from input file + 1 for the '\0'
+    char str[size + 1];
+
+    // Read all chars of infile in to the array
+    fread(&str, sizeof(char), size, infile);
+
+    // Terminate the string
+    str[size] = '\0'; // since we are zero indexed 'size' happens to be the last element of our array[size + 1]
+
+    printf("%s\n", str);
+
+    // Close the input file
+    fclose(infile);
+
+    // The end
+    return 0;
+
+}GCC outputs empty assembly fileI'm trying to make some optimizations on a C program. I want GCC to autovectorize if possible. To check what's doing I generate the assembly file of the program with the "-S" option, but whenever the optimization level is greater than 0, GCC outputs an almost empty .s file. I'm using gcc-7, but I tried with older versions and it does the same thing.
+C code:
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define HEIGHT 2000
+#define WIDTH 1000
+
+static unsigned int idx(unsigned int x, unsigned int y, unsigned int stride){
+  return y * stride + x;
+}
+
+static void integral_image(const unsigned char * restrict in, unsigned int * restrict out){
+  unsigned int row_sum = 0;
+  unsigned char *newin = __builtin_assume_aligned(in, 16);
+  unsigned char *newout = __builtin_assume_aligned(out, 16);
+
+  for(unsigned int x = 0; x < WIDTH; ++x){
+    row_sum += newin[x];
+    newout[x] = row_sum;
+  }
+
+  for(unsigned int y = 1; y < HEIGHT; ++y){
+    row_sum = 0;
+
+    for(unsigned w = 0; w < WIDTH; w += 4){
+      const unsigned int i1 = idx(w, y, WIDTH);
+      const unsigned int old1 = idx(w, y - 1, WIDTH);
+      const unsigned int i2 = idx(w + 1, y, WIDTH);
+      const unsigned int old2 = idx(w, y - 1, WIDTH);
+      const unsigned int i3 = idx(w + 2, y, WIDTH);
+      const unsigned int old3 = idx(w + 2, y - 1, WIDTH);
+      const unsigned int i4 = idx(w + 3, y, WIDTH);
+      const unsigned int old4 = idx(w + 3, y - 1, WIDTH);
+
+      row_sum += newin[i1];
+      newout[i1] = row_sum + newout[old1];
+
+      row_sum += newin[i2];
+      newout[i2] = row_sum + newout[old2];
+
+      row_sum += newin[i3];
+      newout[i3] = row_sum + newout[old3];
+
+      row_sum += newin[i4];
+      newout[i4] = row_sum + newout[old4];
+    }
+  }
+}
+
+Now the GCC generated .s file:
+.file   "thrash.c"
+.ident  "GCC: (Ubuntu 7.1.0-10ubuntu1~16.04.york0) 7.1.0"
+.section    .note.GNU-stack,"",@progbits
+
+Thank you!Both your functions are declared static, which means that neither one is visible to other compilation units (i.e. other .o files) during linking.
+When you enable optimization, GCC notices that, since the functions are not externally visible nor are they called from any externally visible function, their presence is meaningless and so it omits them entirely to save space.
+To fix this, remove the static keyword from your function signatures.read() from file return what?in all reference below:
+http://pubs.opengroup.org/onlinepubs/9699919799/
+https://linux.die.net/man/3/read
+it says:
+
+When attempting to read a file (other than a pipe or FIFO) that
+  supports non-blocking reads and has no data currently available:
+If O_NONBLOCK is set, read() shall return -1 and set errno to
+  [EAGAIN].
+If O_NONBLOCK is clear, read() shall block the calling thread until
+  some data becomes available.
+The use of the O_NONBLOCK flag has no effect if there is some data
+  available.
+
+But who really try it? As I tested, all above cases would let read() return 0.
+It seems O_NONBLOCK is not working no matter I set it this way:
+int flags = O_RDONLY;
+int mode = S_IRGRP|S_IROTH|S_IRUSR;
+int _pbfd = (::open)("123",flags,mode);
+
+Or this way:
+int _pbfd = (::open)("123",flags,mode);
+int saved_flags = fcntl(_pbfd, F_GETFL);
+fcntl(_pbfd, F_SETFL, saved_flags & ~O_NONBLOCK);The key part of the POSIX read() specification that applies is bolded:
+
+When attempting to read a file (other than a pipe or FIFO) that
+  supports non-blocking reads and has no data currently available:
+
+If O_NONBLOCK is set, read() shall return -1 and set errno to [EAGAIN].
+If O_NONBLOCK is clear, read() shall block the calling thread until some data becomes available.
+The use of the O_NONBLOCK flag has no effect if there is some data available.
+
+
+The underlying file system has to be designed and written to support non-blocking reads, and most file systems do not do that for files.
+It's impossible to know why filesystem developers have not written many filesystems that support O_NONBLOCK (if any...), but it's likely because it's not useful for a file.  File objects have a state - the filesystem knows if there's data available or not, and there is no outside dependency were some data might suddenly appear in a way that won't effect the state of the file.  
+While, "You've read the whole file" is different from, "There's nothing in the pipe (yet)", there's not so much difference in the information returned to the caller.aclocal error: ' is already registered with AC_CONFIG_FILES; and/or $'\r': command not foundI was building a C automake project. Running "aclocal" is showing the following error.
+ $ aclocal
+ ' is already registered with AC_CONFIG_FILES./usr/src/ports/autoconf2.5/autoconf2.5-2.69-3.noarch/src/autoconf-2.69/lib/autoconf/status.m4:288: AC_CONFIG_FILES is 
+ expanded from...
+ configure.ac:890: the top level
+ autom4te-2.69: /usr/bin/m4 failed with exit status: 1
+ aclocal-1.15: error: echo failed with exit status: 1
+
+I am using Cygwin on windows 10. 
+The configure.ac has the following from the line 886 to the end.
+# ----------------------------------------------------------------------
+# Create output files
+#
+echo $SLIM_VERSION > VERSION
+AC_OUTPUT(Makefile \
+      src/Makefile \
+      src/genconfig \
+      src/verifier/Makefile \
+      src/utility/Makefile \
+      src/test/Makefile \
+      lib/Makefile \
+      ext/Makefile \
+      test/Makefile \
+      test/system_check/Makefile \
+      third_party/Makefile \
+      third_party/zdelta-2.1/Makefile \
+      third_party/google-perftools-1.8.3/Makefile \
+      third_party/google-perftools-1.8.3/src/google/tcmalloc.h \
+      third_party/google-perftools-1.8.3/src/windows/google/tcmalloc.h \
+      doc/Makefile \
+      doc/slim.1)
+
+As suggested, I used "dos2unix" on every "*.am" files and "configure.ac", but running "make" is showing the following error.
+configure.ac:596: the top level
+cd ../.. && /bin/sh ./config.status third_party/zdelta-2.1/Makefile depfiles
+config.status: creating third_party/zdelta-2.1/Makefile
+config.status: executing depfiles commands
+source='deflate.c' object='deflate.o' libtool=no \
+DEPDIR=.deps depmode=none /bin/sh ../../depcomp \
+gcc -DHAVE_CONFIG_H -I. -I../../src     -Wall -export-dynamic -O3  -fopenmp -c -o deflate.o deflate.c
+../../depcomp:行2: $'\r': 未找到命令
+../../depcomp:行5: $'\r': 未找到命令
+../../depcomp:行10: $'\r': 未找到命令
+../../depcomp:行15: $'\r': 未找到命令
+../../depcomp:行20: $'\r': 未找到命令
+../../depcomp:行25: $'\r': 未找到命令
+../../depcomp:行27: $'\r': 未找到命令
+../../depcomp:行64: 未预期的符号 `$'in\r'' 附近有语法错误
+'./../depcomp:行64: `case "$depmode" in
+make[2]: *** [Makefile:419：deflate.o] 错误 2
+make[2]: 离开目录“/cygdrive/c/LaViT2_8_9/lmntal/slim-lightweight- 
+hlground/third_party/zdelta-2.1”
+make[1]: *** [Makefile:386：all-recursive] 错误 1
+make[1]: 离开目录“/cygdrive/c/LaViT2_8_9/lmntal/slim-lightweight- 
+hlground/third_party”
+make: *** [Makefile:425：all-recursive] 错误 1
+
+Here,
+行2: $'\r': 未找到命令
+
+means
+    line 2: $'\r': cannot find the command
+Could anyone help me fix this issue?It's effectively certain that your issue is caused by DOS newlines.
+The giveaway is this error:
+
+' is already registered with AC_CONFIG_FILES./usr/src/ports/autoconf2.5/autoconf2.5-2.69-3.noarch/src/autoconf-2.69/lib/autoconf/status.m4:288: AC_CONFIG_FILES is 
+
+The line beginning with ' is already registered with implies that the cursor was sent back to the beginning of the line partway through writing the line to the console -- the exact behavior of printing a string read from a DOS-format text file while it expecting it to be in UNIX format.
+
+Configuring git to check out text files in UNIX format
+git config --global core.autocrlf false
+git config --global core.eol lfC prorgramming, send wav file over udpI created a UDP client/server communication in order to test sending wav files, the client send each time a buffer of 2048 samples of the file to the server. The problem is, for each buffer, only the first half (1024 samples) of the buffer is sent correctly, I couldn't figure out the reason behind this error.
+Here is the client code:
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#define SERVER "127.0.0.1"
+#define BUFLEN1 512
+#define BUFLEN2 2048
+#define PORT 8888
+void die(char *s)
+{
+    perror(s);
+    exit(1);
+}
+
+int main(void)
+{
+    struct sockaddr_in si_other;
+    int s, i, slen=sizeof(si_other);
+    char fileaddress[BUFLEN1];
+    short buf[BUFLEN2];
+    FILE *file;
+    int k;
+
+    if ( (s=socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
+    {
+        die("socket");
+    }
+
+    memset((char *) &si_other, 0, sizeof(si_other));
+    si_other.sin_family = AF_INET;
+    si_other.sin_port = htons(PORT);
+
+    if (inet_aton(SERVER , &si_other.sin_addr) == 0)
+    {
+        fprintf(stderr, "inet_aton() failed\n");
+        exit(1);
+    }
+
+    printf("Enter file address: ");
+    gets(fileaddress);
+    file=fopen(fileaddress,"rb");
+    while ((k = fread(buf, sizeof(short), BUFLEN2, file)) > 0) {
+        if (sendto(s, buf, BUFLEN2 , 0 , (struct sockaddr *) &si_other, slen)==-1)
+        {
+            die("sendto()");
+        }
+    }
+
+    close(s);
+    return 0;
+}
+
+Server code:
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#define SERVER "127.0.0.1"
+#define BUFLEN2 2048
+#define PORT 8888
+
+void die(char *s)
+{
+    perror(s);
+    exit(1);
+}
+int main(void)
+{
+    struct sockaddr_in si_me, si_other;
+
+    int s, i, slen = sizeof(si_other) , recv_len;
+    short buf[BUFLEN2];
+
+    //create a UDP socket
+    if ((s=socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
+    {
+        die("socket");
+    }
+
+    // zero out the structure
+    memset((char *) &si_me, 0, sizeof(si_me));
+
+    si_me.sin_family = AF_INET;
+    si_me.sin_port = htons(PORT);
+    si_me.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    //bind socket to port
+    if( bind(s , (struct sockaddr*)&si_me, sizeof(si_me) ) == -1)
+    {
+        die("bind");
+    }
+    printf("Waiting for data...\n");
+    fflush(stdout);
+    while(1)
+    {
+        recv_len = recvfrom(s, buf, BUFLEN2, 0, (struct sockaddr *) &si_other, &slen);
+        if (recv_len == -1)
+        {
+            die("recvfrom()");
+        }
+    }
+    close(s);
+    return 0;
+}Its most probably either because of the window size(amount of data that can be sent in a packet) or the light-weight IP stack size(I believe this is more probable) which is related to the total maximum amount of bytes you can send at one function call.
+If the problem is the window size, you can divide your data and re-assemble in the client as it arrives.
+If it is stack size you can simply look for where it is defined and change it
+I see your libraries doesn't contain lwip, but whatever you are using it must have something conceptually similar.
+Hope it helps.Here, you are reading in (possibly as many as) (BUFLEN2*sizeof(short)) bytes into your buffer:
+while ((k = fread(buf, sizeof(short), BUFLEN2, file)) > 0) {
+
+... and here you are sending BUFLEN2 bytes to the UDP socket:
+ if (sendto(s, buf, BUFLEN2, 0 , (struct sockaddr *) &si_other, slen)==-1)
+
+... and here you are receiving (possibly as many as) BUFLEN2 bytes from the UDP socket:
+recv_len = recvfrom(s, buf, BUFLEN2, 0, (struct sockaddr *) &si_other, &slen);
+
+I think what you need to do is replace BUFLEN2 with k*sizeof(short) in your sendto() call, and replace BUFLEN2 with sizeof(buf) in your recvfrom() call, so that you will send and receive all of the data and not just the first half of it.Are the wrapper functions for system calls also called system calls?The documentation for the open() function says the following:
+
+The open() system call opens the file specified by pathname.
+
+I thought that open() is a wrapper function for a system call, and is not itself a system call.
+Or are the wrapper functions for system calls also called system calls?Short answer - Yes.
+Long answer - it depends. A system call is the programmatic way in which a computer program requests a service from the kernel of the operating system it is executed on. This may include hardware-related services (for example, accessing a hard disk drive), creation and execution of new processes, and communication with integral kernel services such as process scheduling. System calls provide an essential interface between a process and the operating system.  
+System calls are not defined as specific functions. Rather they are request for services or in other words the OS API. They are almost always hidden from the user by the standard functions which are provided by the language standard.
+And the standard is implemented in the compilers which differ from OS to OS.I think that the other answer by Petar is what is correct but I'd also like to add that for me the simplest way to explain why open is considered a system call is because syscalls are not guaranteed to be the same across all OS's. For example if we imagine an OS where syscall 1 is open, another OS's might use syscall 1 for write (as linux x64 does), so for the sake of compatibility functions such open() were added, where the OS would provide the implementation of open() as a call to the appropriate syscall value, and the programmer wouldn't have to worry about calling the right syscall number between different OS'sDifferent result when hitting breakpoints, using DLL and C/C++I´m trying to develop a small game for school using C/C++ and a DLL that I made and linked implicitly. So far so good. 
+Now I'm testing some functions and I'm getting different results when I run all code at once or if I put a breakpoint to stop the code.
+I'll show some code and I'll try to explain the best I can.
+struct powerup get_powerup() {
+struct powerup aux {};
+
+srand(time(nullptr));
+int r = rand() % 100 + 1; // random number between 1 and 100
+
+if (r <= 60) //common
+    aux.occurrence = common;
+else if (r > 60 && r < 90) //rare
+    aux.occurrence = uncommon;
+else if (r >= 90) //very rare
+    aux.occurrence = rare;
+
+switch (aux.occurrence)
+{
+case common:
+    r = rand() % 2 + 1;
+
+    if (r == 1)
+        aux = set_powerup(shield);
+    if (r == 2)
+        aux = set_powerup(enemy_boost);
+    break;
+case uncommon:
+    r = rand() % 3 + 1;
+
+    if (r == 1)
+        aux = set_powerup(ice);
+    if (r == 2)
+        aux = set_powerup(battery);
+    else if (r == 3)
+        aux = set_powerup(alchool);
+    break;
+case rare:
+    r = rand() % 2 + 1;
+
+    if (r == 1)
+        aux = set_powerup(life);
+    if (r == 2)
+        aux = set_powerup(noclip);
+    break;
+}
+
+return aux;
+}
+
+This is the function I'm testing, very simple and works fine.
+int _tmain(int argc, TCHAR *argv[]) {
+#ifdef UNICODE
+_setmode(_fileno(stdin), _O_WTEXT);
+_setmode(_fileno(stdout), _O_WTEXT);
+_setmode(_fileno(stderr), _O_WTEXT);
+#endif
+for (int i = 0; i < 10; i++)
+{
+    const struct powerup ajux = get_powerup();
+
+    _tprintf(TEXT("power up: %hs\n"), powerup_type_string[ajux.type]);
+}
+
+system("Pause");
+
+return 0;
+}
+
+This is my main code.
+Now the odd part, at least for me. And before you say "its because it's a random generator", hold on for a moment.
+When running the code all at once, I get the same result every time:
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+power up: Enemy Boost
+
+But if put a breakpoint someone in the for loop, I get the expected result:
+power up: Shield
+power up: Battery
+power up: Ice
+power up: Alchool
+power up: Alchool
+power up: Battery
+power up: No Clip
+power up: Life
+power up: Enemy Boost
+power up: Enemy Boost
+
+Any suggestion for this?Yes it's because of the random generator.
+You are calling srand(time(nullptr)) inside get_powerup.
+That means the random number generator is seeded from the current time on every call, and because time is on a second granularity, will appear to return the same value when you run the code.
+The idea of srand is to be called only once during application startup to seed the PRNG. Move it to the beginning of the main function.GDB not running program (Mac OS)I use gdb to run my program but it doesn't work with it. It returns warning:
+Cannot insert breakpoint -1.
+Cannot access memory at address 0xf726 
+I didn't set any breakpoint. I am not sure is it the problem of gdb and how could I fix it?
+Here is the result I got:
+rihiroshibitekiMacBook-Pro:desktop Richard$ gdb test
+GNU gdb (GDB) 8.1
+Copyright (C) 2018 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-apple-darwin17.3.0".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from test...Reading symbols from 
+/Users/Richard/Desktop/test.dSYM/
+Contents/Resources/DWARF/test...done.
+done.
+(gdb) r
+Starting program: /Users/Richard/Desktop/test 
+[New Thread 0x1903 of process 776]
+[New Thread 0x1c03 of process 776]
+Warning:
+Cannot insert breakpoint -1.
+Cannot access memory at address 0xf726
+Command aborted.Does fclose release the file immediately?I have 2 functions. The first function is opening a file in write mode and writing some contents to it and then closing it. 
+FILE *fp = fopen("file.txt", "w");
+//writing itnot file using fwrite
+fclose(fp);
+
+The second function opens the file in read mode, parses the content and then closes the file. 
+FILE *fp = fopen("file.txt", "r");
+//parsing logic
+fclose(fp);
+
+In main, I am calling function1 and function2 sequentially. 
+int main()
+{
+    function1();
+    function2();
+    return 1;
+}
+
+Sometimes, function1 fopen fails with error number 13 i.e. Permission Denied. I am observing this only sometimes. I introduced a sleep in function1 after fclose for 2 seconds and it started working fine without any issues. 
+So I am suspecting file is not immediately released after fclose. Sleep is not the right solution. Can anyone suggest how to resolve this problem? The example I have given here is a use case and the actual code is running in a thread environment.Draft N1570 for C11 says as 7.21.5.1 The fclose function
+
+A successful call to the fclose function causes the stream pointed to by stream to be
+  flushed and the associated file to be closed. Any unwritten buffered data for the stream
+  are delivered to the host environment to be written to the file; any unread buffered data
+  are discarded. Whether or not the call succeeds, the stream is disassociated from the file
+  and any buffer set by the setbuf or setvbuf function is disassociated from the stream
+  (and deallocated if it was automatically allocated).
+
+It makes no assumption on what happens at the host environment level, that is does the function returns only when the whole operation is finished, or does it returns as soon as a request has been queued.
+As race conditions can happen in your environment, you should retry a failed open a number of times, eventually with a delay between them. If portability is not a problem and if your system supports the POSIX sync function, you can also force a disk synchronisation of the file after closing it:
+
+Close part:
+...
+fclose(fp)
+sync();         // forces synchronization of io buffers to disk 
+
+Re-open part
+ntries = ...;   // number of open tries
+while (ntries-- > 0) {
+    fp = fopen(...);
+    if (fp != NULL) break;   // open was successful
+    // optionaly add a delay
+}In an environment and with a C implementation where you must accommodate such behavior, the best approach is probably to implement some fault tolerance around the fopen()s.  Although an unconditional sleep() is not the right answer, short, conditional delays via sleep() or a similar function may indeed be part of such an strategy.  For example, you might do something along these lines:
+#include <stdio.h>
+#include <errno.h>
+#define MAX_ATTEMPTS 3
+
+FILE *tolerant_fopen(const char *path, const char *mode) {
+    FILE *result;
+    int attempts = 0;
+
+    while (!(result = fopen(path, mode))) {
+        if (errno != EACCES || attempts >= MAX_ATTEMPTS) {
+            break;
+        }
+        if (sleep(1) == 0) {
+            attempts += 1;
+        }
+    }
+
+    return result;
+}
+
+That attempts to open the file immediately, and in the event that that fails on account of access permissions, it waits a short time and then makes another attempt.  Overall it may make three or more attempts to open the file, spaced up to a second apart or perhaps slightly more.  (Note that sleep() can be interrupted early; in that case it returns the number of seconds left to sleep.)
+You can of course implement a different strategy for the timing and duration of the retries if you prefer, retry more error conditions, etc..error:invalid type argument of '->'(have 'Queue {aka struct Queue}I'm trying read a file with this format instance|instruction...
+like this 1 01 01 12 12 33, where the first number is the instance and after that is the numbers of the instruction.
+Each line has it own id. so in that example that line if was the first one the id was 1, and the next line 2, and so on.
+What I'm trying to do is group that information by a struct like the PCB struct I have. Each line has an id, and a queue where I store each number of the instruction part.
+I have a struct where i have some variables and a queue inside it. The problem is the queue is not working.
+typedef struct Queue
+{
+  int sizeQueue;
+  int limit;
+  Node *head;
+
+
+}Queue;
+
+typedef struct PCB
+{
+ int id;
+ int program_counter;
+ int size;
+ Queue pointer_instrucoes;
+ int instante;
+
+}PCB;
+
+typedef struct Node
+{
+ PCB *element;
+ Node *next;
+
+}Node;
+
+And in the main I'm calling the struct with the queue to store some values.
+PCB *p=new_pcb(contador);
+....
+p->pointer_instrucoes->head=atoi(s2); //s2 is the some number of the //instruction
+
+but I'm getting this error:invalid type argument of '->'(have 'Queue {aka struct Queue}
+MVCE:
+main file
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h> //para o output
+#include "queue2.h"
+
+int le_ficheiro(char* filename) {
+FILE *ficheiro=fopen(filename,"r");
+size_t len=0;
+char *line=NULL;
+ssize_t read;
+char *s1;//string antes do primeiro espaço
+char *s2;//string depois do primeiro espaço
+char *sp; //linha toda
+if(ficheiro==NULL) {
+    exit(EXIT_FAILURE);
+}
+int contador=1; //onde comeca o id
+
+while((read = getline (&line, &len,ficheiro))!=-1)   //le de linha a linha
+{
+    PCB *p=new_pcb(contador);
+    sp=strchr(line,' ');
+    if(!sp)
+    {
+        exit(EXIT_FAILURE);
+    }
+    s1=strndup(line,sp-line);
+    s2=sp+1;
+    p->instante=atoi(s1); //converte char to int
+
+    printf("Instante: %d\n",p->instante);
+    printf("Id: %d\n",p->id);
+
+    p.pointer_instrucoes.head=atoi(s2);
+
+    printf("%d\n",p->pointer_instrucoes->head);
+
+
+
+    printf("Retrieved line of length %zu:\n",read);
+    printf("%s\n",s2);
+    printf("Aqui : %c\n",line[0]);
+    contador++;
+}
+ fclose(ficheiro);
+ if(line)
+    free(line);
+    free(s1);
+ exit(EXIT_SUCCESS);
+
+ }
+
+
+int main()
+{
+  char name[50];
+  printf("Name of the file: ");
+  scanf("%s",name);
+  le_ficheiro(name);
+  return 0;
+
+}
+queue2.h file
+#include <stdbool.h>
+
+typedef struct PCB PCB;
+typedef struct Node Node;
+typedef struct Queue Queue;
+typedef struct Queue
+{
+  int sizeQueue;
+  int limit;
+  Node *head;
+
+
+ }Queue;
+typedef struct PCB
+{
+  int id;
+  int program_counter;
+  int size;
+  Queue pointer_instrucoes;
+  int instante;
+
+ }PCB;
+
+ typedef struct Node
+ {
+  PCB *element;
+  Node *next;
+
+  }Node;
+
+ PCB * new_pcb(int id); 
+ Node * new_node(PCB * e);
+ Queue * new_queue(int limit);
+
+Queue2.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include "queue2.h"
+
+
+Node * new_node(PCB * e)
+ {
+  Node *n=malloc(sizeof(Node));
+  n->element=e;
+  n->next=NULL;
+  return n;
+  }
+
+
+
+
+Queue * new_queue(int limit)
+{
+   Queue *q=malloc(sizeof(Queue));
+   q->limit=limit;
+   q->head=NULL;
+   q->sizeQueue=0;
+
+   return q;
+
+     }
+
+   PCB * new_pcb(int id)
+{
+   PCB *p = malloc(sizeof(PCB));
+   p->id=id;
+   p->pointer_instrucoes=0;
+   p->program_counter=0;
+   p->size=0;
+   return p;
+   }
+
+Example of input: 
+1 01 02 03 04 05
+2 01 02 03 02 11Your problems are rudimentary, and you need to spend time competing le_ficheiro. For starters, you cannot assign the result of atoi(s2) to p.pointer_instrucoes.head. head is not an int, it is a pointer to Node*. You violate the Strict Aliasing Rule C11 Standard - §6.5 Expressions (p6,7) and probably a dozen others in attempting to access and modify Node* by assigning an int as its value.
+You invoke Undefined Behavior attempting to access p->id when it is indeterminate (uninitialized).
+You make life much more difficult than it needs to be by attempting to manually separate values from line using strchr(line, ' '). You already have all values contained in line, you can use sscanf to parse all six values to int in a single call and validate the line, e.g.
+    while ((read = getline (&line, &len,ficheiro)) != -1) //le de linha a linha
+    {
+        int a, b, c, d, e, f;
+        if (sscanf (line, "%d %d %d %d %d %d", 
+                    &a, &b, &c, &d, &e, &f) != 6) {
+            fprintf (stderr, "error: failed to parse line '%d'.\n",
+                    contador);
+            continue;
+        }
+        PCB *p = new_pcb (contador);
+        if (!p)  /* Validate EVERY Allocation */
+            exit (EXIT_FAILURE);
+
+However, before you can validate every allocation and avoid potentially invoking Undefined Behavior, you must provide meaningful return values from new_node, new_queue & new_pcb, to indicate success/failure, e.g.
+Node *new_node (PCB *e)
+{
+    Node *n = malloc (sizeof *n);
+    if (!n) {   /* Validate EVERY Allocation */
+        perror ("malloc-new_node");
+        return NULL;  /* return NULL on failure */
+    }
+    n->element = e;
+    n->next = NULL;
+
+    return n;
+}
+
+Queue *new_queue (int limit)
+{
+    Queue *q = malloc (sizeof *q);   /* typo in declaration */
+    if (!q) {
+        perror ("malloc-new_queue");
+        return NULL;
+    }
+    q->limit = limit;
+    q->head = NULL;
+    q->sizeQueue = 0;
+
+    return q;
+}
+
+PCB *new_pcb (int id)
+{
+    PCB *p = malloc (sizeof *p);
+    if (!p) {
+        perror ("malloc-new_pcb");
+        return NULL;
+    }
+    p->id = id;
+    p->pointer_instrucoes = 0;
+    p->program_counter = 0;
+    p->size = 0;
+
+    return p;
+}
+
+It is clear you got part way through le_ficheiro and just gave up. It isn't anywhere near complete, only 1 of the data values from each line of input was even used in your code (the rest you attempted to print as text just to see where your s2 pointer was pointing -- but not make any further or meaningful use of the values)
+You don't even call new_node in order to create a Node* value that conceivably could be assigned to p.pointer_instrucoes.head. Take it step-by-step. You need to call new_node somewhere in le_ficheiro so that you have a pointer you can assign to p.pointer_instrucoes.head. There isn't any magic to it, but you must be methodical about insuring each value and each member of each structure is created and properly initialized with a value before you attempt to use them.
+Basically you had a shell for le_ficheiro which you need to continue to complete, working from a somewhat better starting position of:
+int le_ficheiro (char* filename) 
+{
+    FILE *ficheiro = fopen (filename,"r");
+    size_t len = 0;
+    ssize_t read = 0;
+    int contador = 1;   //onde comeca o id
+
+    if (ficheiro == NULL) {
+        perror ("fopen-filename");
+        exit (EXIT_FAILURE);
+    }
+
+    while ((read = getline (&line, &len,ficheiro)) != -1) //le de linha a linha
+    {
+        int a, b, c, d, e, f;
+        if (sscanf (line, "%d %d %d %d %d %d", 
+                    &a, &b, &c, &d, &e, &f) != 6) {
+            fprintf (stderr, "error: failed to parse line '%d'.\n",
+                    contador);
+            continue;
+        }
+        PCB *p = new_pcb (contador);
+        if (!p)
+            exit (EXIT_FAILURE);
+
+        p->instante = a;
+        printf ("Instante: %d\n", p->instante);
+
+        /* you must assign and allocate as necessary to use remaining
+         * values read from file HERE. Nowhere do you assign p->id
+         * before attempting to print, etc...
+         */
+        printf ("Id: %d\n", p->id);
+
+        /* you cannot assign atoi(s2) to p.pointer_instrucoes.head.
+         * it expects type 'Node *', not int.
+         */
+        // p.pointer_instrucoes.head = FIXME;
+        // printf ("%d\n", p->pointer_instrucoes->head);
+        contador++;
+    }
+    fclose(ficheiro);
+
+    free (line);
+    free(s1);
+
+    exit(EXIT_SUCCESS);
+}
+
+When you are stuck in writing a function, don't give up. Instead see How to debug small programs and talk to the duck... Really, it helps :)Fast C random boolean generatorI'm interested in generating fast random booleans (or equivalently a Bernoulli(0.5) random variable) in C. Of course if one has a fast random generator with a decent statistical behaviour the problem "sample a random Bernoulli(0.5)" is easily solved: sample x uniformly in (0,1) and return 1 if x<0.5, 0 otherwise. 
+Suppose speed is the most important thing, now I have two questions/considerations:
+
+Many random doubles generators first generate an integer m uniformly in a certain range [0,M] and then simply return the division m/M. Wouldn't it be faster just to check whether m < M/2 (here M/2 is fixed, so we are saving one division)
+
+Is there any faster way to do it? At the end, we're asking for way less statistical properties here: we're maybe still interested in a long period but, for example, we don't care about the uniformity of the distribution (as long as roughly 50% of the values are in the first half of the range).Extracting say the last bit of a random number can wreak havoc as linear congruential generators can alternate between odd and even numbers1. A scheme like clock() & 1 would also have ghastly correlation plains.
+
+Consider a solution based on the quick and dirty generator of Donald Kunth: for uint32_t I, sequence
+I = 1664525 * I + 1013904223;
+
+and 2 * I < I is the conditional yielding the Boolean drawing. Here I'm relying on the wrap-around behaviour of I which should occur half the time, and a potentially expensive division is avoided.
+Testing I <= 0x7FFFFFFF is less flashy and might be faster still, but the hardcoding of the midpoint is not entirely satisfactory.
+
+1 The generator I present here does.I'm interested in generating fast random booleans
+
+Using a LCG can be fast, yet since OP's needs only a bool result, consider extracting only 1 bit at a time from a reasonable generator and save the rest for later. @Akshay L Aradhya
+Example based on @R.. and @R.. code.
+extern uint32_t lcg64_temper(uint64_t *seed); // see R.. code
+
+static uint64_t gseed; //  Initialize this in some fashion.
+static unsigned gcount = 0;
+
+bool rand_bool(void) {
+  static uint32_t rbits;
+  if (gcount == 0) {
+    gcount = 32;  // I'd consider using 31 here, just to cope with some LCG weaknesses.
+    rbits = lcg64_temper(&gseed);  
+  }
+  gcount--;
+  bool b = rbits & 1;
+  rbits >>= 1;
+  return b;
+}How to initialize structure in flash at compile time?I'm working on an embedded C project and would like to initialize, at compile-time, a structure that is stored in flash (0x1200u), but I keep getting weird compile errors.
+typedef struct {
+    float foo[2];
+    ...other stuff...
+} MY_STRUCT_DATA_TYPE
+
+#define MY_FLASH_STRUCT    ((MY_STRUCT_DATA_TYPE *)(0x1200u)) // <-- error here
+
+MY_FLASH_STRUCT MY_InitdStruct = {
+        .foo[0] =  0.12345f;
+        .foo[1] =  0.54321f;
+        ...other stuff...
+};
+
+The error I'm getting is "expected '{' before '(' token."  Anyone know how to make this work?
+Update
+Added to linker file...
+MEMORY
+{
+  ... other stuff ...
+  m_my_data_section    (RW)  : ORIGIN = 0x00001200, LENGTH = 0x00000400
+  ... other stuff ...
+}
+
+SECTIONS
+{
+  ... other stuff ..
+  .my_data_section :
+  {
+    . = ALIGN(4);
+    KEEP(*(.my_data_section))
+    . = ALIGN(4);
+  } > m_my_data_section
+  ... other stuff ...
+}
+
+C code...
+static volatile const MY_STRUCT_DATA_TYPE __attribute__ ((section (".my_data_section"))) MY_InitdStruct = {
+        .foo[0] =  0.12345f;
+        .foo[1] =  0.54321f;
+        ...other stuff...
+};
+
+I'm not sure the static or const keywords are necessary, since it's intended only for one-time use to initialize that section of flash memory at compile-time, but it doesn't hurt to restrict the label's usage.That makes no sense at all, syntactically that is.
+What you need to do is figure out how your compiler supports this, since it's not something you can do with just standard C.
+With GCC, you use __attribute() to put the symbol in a particular segment, then use the linker script to put that segment in a particular piece of actual memory.
+Or, just give your compiler the benefit of the doubt and try a static const structure, that should end up in flash.In the example you gave, a ";" is missing after the declaration of MY_STRUCT_DATA_TYPE
+typedef struct {
+    float foo[2];
+    ...other stuff...
+} MY_STRUCT_DATA_TYPE;
+
+If it's not a copie/paste mistake, it's the kind of error which could lead to the type of error message you haveI'm working on an embedded C project and would like to initialize, at
+  compile-time, a structure that is stored in flash (0x1200u), but I
+  keep getting weird compile errors.
+
+That's unsurprising, as C does not support what you're trying to do.  You can provide initializers for objects that C allocates, including pointers, but the C language has no concept of objects that exist independently.  Indeed, C makes no guarantees whatever about what happens when you do anything with (MY_STRUCT_DATA_TYPE *)(0x1200u) other than convert it back to an integer.
+
+The error I'm getting is "expected '{' before '(' token." 
+
+The compiler is complaining because in
+MY_FLASH_STRUCT MY_InitdStruct = {
+
+, the expansion of MY_FLASH_STRUCT is not a type, therefore the construct is not a valid declaration.  Nor is it a valid assignment, but even if it were, assignment statements are executable, and therefore may appear only inside functions.
+Assigning an object to a specific address would be a function of the linker.  Whether you can assign an object to the particular address you want is system-dependent, and the mechanism, if any, for doing so depends on your toolchain.Strange error in C with a malloc of pointer in a pointerHere my example code which works fine:
+//define struct
+struct myStruct {
+   char     *arrChar1;
+   char     *arrChar2;
+}
+// code in Main
+struct myStruct *structDeep1 = malloc( sizeof( struct myStruct *) );
+structDeep1->arrChar1 = NULL;
+structDeep1->arrChar2 = NULL;
+structDeep1->arrChar1 = malloc( sizeof(char ) * 2); //2 char
+
+if( structDeep1->arrChar1 == NULL)  puts("trace error");
+else                                    puts("trace ok")
+//stdout -> trace OK
+
+No problem.
+Now here my example with strange error:
+// define a second struct
+struct myStructDeep2{
+    struct myStruct     *structDeep1;
+}
+// next code in Main
+struct myStructDeep2 structDeep2 = malloc( sizeof( struct myStructDeep2*) );
+structDeep2->structDeep1 = malloc( sizeof( struct myStruct *) );
+structDeep2->structDeep1->arrChar1 = NULL;
+structDeep2->structDeep1->arrChar2 = NULL;
+structDeep2->structDeep1->arrChar1 = malloc( sizeof(char ) * 2); //2 char
+
+if( structDeep2->structDeep1->arrChar1 == NULL)     puts("trace error");
+else                                            puts("trace ok")
+//stdout -> trace error
+
+It's seem the malloc function write/crush in the second pointer.
+I don't understand where is the problem in my code, it's very strange.When you do:
+structDeep2->structDeep1 = malloc( sizeof( struct myStruct *) );
+
+you allocate the size of a pointer, but you want to allocate a structure, so you must do:
+structDeep2->structDeep1 = malloc( sizeof( struct myStruct) );
+
+Now (assuming malloc succeeds), you can safely do:
+structDeep2->structDeep1->arrChar1 = malloc( sizeof(char ) * 2);Getting "Bad file descriptor" error when trying to mmap BAR-0 of deviceI am trying to mmap BAR-0 of a PCI device to the virtual address space in order to read (and later modify) its contents. However when I mmap it, I get the following error:
+Path to BAR-0: /sys/bus/pci/devices/0000:00:16.0/resource0
+Error at line 42, file src/main.c (9) [Bad file descriptor]
+
+I am using Debian 9.1 32-Bit. The code I use is the following:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h> 
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include "../include/eeprom.h"
+#include "../include/pci.h"
+#include "../include/i2c.h"
+#include "../include/types.h"
+
+#define PRINT_ERROR \
+    do { \
+        fprintf(stderr, "Error at line %d, file %s (%d) [%s]\n", \
+        __LINE__, __FILE__, errno, strerror(errno)); exit(1);\
+    } while(0)
+
+#define MAP_SIZE 4096
+#define MAP_MASK (MAP_SIZE - 1)
+
+int main (int argc, char* argv[]) {
+    uint32_t pci_dev;
+    void *mmap_base;
+    char *file = {"/sys/bus/pci/devices/0000:00:16.0/resource0"};
+    int i;
+
+    printf ("Path to BAR-0: %s\n", file);
+
+    //Open Bar-0 of PCI device
+    pci_dev = open (file, O_RDWR | O_SYNC);
+    if (pci_dev < 0)
+    {
+        PRINT_ERROR;
+    }
+
+    //Map BAR-0 from physical memory to virtual address space
+    mmap_base = mmap (NULL, MAP_SIZE, PROT_WRITE, MAP_SHARED, pci_dev, 0);
+    if (mmap_base == (void *)-1 || mmap_base == NULL)  //error here
+    {
+        PRINT_ERROR;
+    }
+    printf ("Mapped on address %p of size %d Byte\n", mmap_base, MAP_SIZE);
+
+    return 0;
+}
+
+I can already say, that I removed the Kernel Module used by the device, so this isn't the problem.
+Can somebody help me? Thanks in advance.I faced a similar issue while I was learning Linux Kernal programming. Running the program with superuser permission worked for me.C - Encrypt and decrypt a string with AESI'm trying to understand how to use this c library (tiny-AES-c). As a web developer, I'm looking to get an equivalent C code for this JS fiddle.
+The JS code is straightforward:
+// Encrypt
+var ciphertext = CryptoJS.AES.encrypt('my message', 'secret key 123');
+
+
+console.log("Encrypted: " + ciphertext.toString());
+
+// Decrypt
+var bytes  = CryptoJS.AES.decrypt(ciphertext.toString(), 'secret key 123');
+var plaintext = bytes.toString(CryptoJS.enc.Utf8);
+
+console.log("Decrypted: " + plaintext);
+
+Given a message to encrypt and a secret, the code generates the encrypted data and transform the results to a string.
+
+My C code:
+int main()
+{
+    uint8_t in[]  = "my message";
+    uint8_t key[] =  "secret key 123";
+
+    struct AES_ctx ctx;
+
+    AES_init_ctx(&ctx, key);
+    printf("ORIG: %s",(char*) in);
+
+    // Encrypt
+    AES_ECB_encrypt(&ctx, in);
+    printf("\nENC: %s",(char*) in);
+
+    // Decrypt
+    AES_ECB_decrypt(&ctx, in);
+    printf("\nDEC: %s",(char*) in);
+
+    return 0;
+}
+
+The output:
+ORIG: my message
+ENC: ̤�+��5<n]EYK�ظ/����
+DEC: my message%  
+
+I understand that I shouldn't try to print the result as a string, but couldn't figure out how to get similar (to the JS) results, using the tiny-AES-c API, plus when I tried using longer messages I got strange results, leading me to think I'm using this library the wrong way.
+Q: What would be the C code equivalent to the above JS?I am the original author of the AES library you reference.
+When using ECB and CBC modes of operation, you need to make sure your key, iv and the input/output blocks are all 16 bytes long. You also need to decide on which padding scheme you want to use.
+You can use CTR-mode to avoid padding and stop worrying about block-sizes. This generally makes the AES algorithm much easier to use as there are fewer edge-cases to handle.
+BTW this is also stated in the project README:
+
+No padding is provided so for CBC and ECB all buffers should be mutiples of 16 bytes. For padding PKCS7 is recommendable.
+ECB mode is considered unsafe for most uses and is not implemented in streaming mode. If you need this mode, call the function for every block of 16 bytes you need encrypted. See wikipedia's article on ECB for more details.
+
+EDIT:
+If you extend your arrays so that they are 16 bytes long and zero-pad them (or alternatively, declare them static so they will be zero-initialized automatically), I think it should work for you :)As @Morten Jensen suggested, you can use the CTR-mode IE:AES_CTR_xcrypt_buffer 
+int main()
+{
+    uint8_t key[] = "secret key 123";
+    uint8_t in[]  = "my message";
+    uint8_t iv[16] = { 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff };
+
+    printf("Length: %lu",strlen((char*)in));
+
+    struct AES_ctx ctx;
+    AES_init_ctx_iv(&ctx, key, iv);
+    AES_CTR_xcrypt_buffer(&ctx, in, strlen((char*)in));
+    printf("\nENC: %s",(char*) in); // don't use this string as an input
+
+    AES_init_ctx_iv(&ctx, key, iv);
+    AES_CTR_xcrypt_buffer(&ctx, in, strlen((char*)in));
+    printf("\nDEC: %s",(char*) in);
+    return 0;
+}
+
+Remember, printing the encrypted data is wrong, you should go over the output and convert it to base64 if you want to match your JS example.uint8_t in[16]  = "my message";
+
+your buffer needs to be a multiple of 16.Delay-loading a C libary in C++ codeI'm currently trying to load the ffmpeg library (in C) into my C++ project. The library consists of headers, .lib files and .dll files, all of which I loaded and used successfully.
+However, it is strongly desirable for our project to have these dll files loaded in delayed, and this is where I'm failing.
+What it boils down to is this:
+
+When I build the project without referring to any of the library's dll functions, it runs correctly and I see (by my logs) that all dlls are correctly loaded where I'm explicitly getting their DLL handle.
+When I build the project and include function calls to the dll, the executable simple fails to load because it's missing 'xx.dll'. This is before the function call is done. IE: Simply by having a dll function call in my code, it seems the program tries to load it when starting.
+
+
+When I manually add the dlls next to my program's executable, it runs fine in both scenarios, but it is not desirable to have them next to my executable.
+
+
+Is there something obvious that I'm missing or doing wrong?
+Thanks!Looping won't stop when reading user inputThis code cannot stop looping even when I enter n or N.  
+What is causing this?
+    char next = "";
+
+    printf("Do u want continue\n");
+    scanf("%c", &next);
+    getchar();
+    do
+    {
+        if (next=='y' ||next=='Y')
+        {
+            selection();
+        }
+        else
+        {
+            printf("invalid Please Enter again");
+            scanf("%c", &next);
+        }
+    } while (next !='n'|| next!='N')The conditional (next !='n'|| next!='N') is always true.
+If next is 'n' then next!='N' is true making the whole expression true.  Similarly, if next is 'N' then next!='n' is true again making the whole expression true.
+What you want here is to use a logical AND &&:
+} while (next !='n' && next!='N')Your while conditional will always evaluate to true. The input character will always be either NOT 'N' or NOT 'n'. Because it's only a single character, so it will always not be one of the two. You need you need to instead ensure that it's NEITHER of them. This is a logical AND check, rather than and OR check. So, instead, change that conditional to an AND, a.k.a next !== 'n' && next !== 'N', or, if you find using OR makes more sense, the following conditional is equivalent to the AND statement, through use of Boolean logic transformations !(next == 'n' || next == 'N').
+Cheers!Besides dbush's answer which is correct:
+
+char next = ""; is wrong, it should be char next;
+Don't use scanf but use only getchar, scanf is full of pitfalls.
+
+Replace this:
+char next;
+...
+scanf("%c", &next);
+getchar();
+
+with this:
+int next;
+...
+next = getchar();while (next !='n' || next!='N') is always true.
+
+You can simply change it like this:
+while (next !='n')
+
+Then you input n, it stopped.What should main() return in C and C++?What is the correct (most efficient) way to define the main() function in C and C++ — int main() or void main() — and why? And how about the arguments?
+If int main() then return 1 or return 0?
+
+There are numerous duplicates of this question, including:
+
+What are the valid signatures for C's main() function?
+The return type of main() function
+Difference between void main() and int main()?
+main()'s signature in C++
+What is the proper declaration of main()? — For C++, with a very good answer indeed.
+Styles of main() functions in C
+Return type of main() method in C
+int main() vs void main() in C
+
+Related:
+
+C++ — int main(int argc, char **argv)
+C++ — int main(int argc, char *argv[])
+Is char *envp[] as a third argument to main() portable?
+Must the int main() function return a value in all compilers?
+Why is the type of the main() function in C and C++ left to the user to define?
+Why does int main(){} compile?
+Legal definitions of main() in C++14?The return value for main indicates how the program exited. Normal exit is represented by a 0 return value from main. Abnormal exit is signaled by a non-zero return, but there is no standard for how non-zero codes are interpreted. As noted by others, void main() is prohibited by the C++ standard and should not be used. The valid C++ main signatures are:
+int main()
+
+and
+int main(int argc, char* argv[])
+
+which is equivalent to
+int main(int argc, char** argv)
+
+It is also worth noting that in C++, int main() can be left without a return-statement, at which point it defaults to returning 0. This is also true with a C99 program. Whether return 0; should be omitted or not is open to debate. The range of valid C program main signatures is much greater.  
+Efficiency is not an issue with the main function. It can only be entered and left once (marking the program's start and termination) according to the C++ standard. For C, re-entering main() is allowed, but should be avoided.The accepted answer appears to be targetted for C++, so I thought I'd add an answer that pertains to C, and this differs in a few ways. There were also some changes made between ISO/IEC 9899:1989 (C90) and ISO/IEC 9899:1999 (C99).
+main() should be declared as either:
+int main(void)
+int main(int argc, char **argv)
+
+Or equivalent. For example, int main(int argc, char *argv[]) is equivalent to the second one. In C90, the int return type can be omitted as it is a default, but in C99 and newer, the int return type may not be omitted.
+If an implementation permits it, main() can be declared in other ways (e.g., int main(int argc, char *argv[], char *envp[])), but this makes the program implementation defined, and no longer strictly conforming.
+The standard defines 3 values for returning that are strictly conforming (that is, does not rely on implementation defined behaviour): 0 and EXIT_SUCCESS for a successful termination, and EXIT_FAILURE for an unsuccessful termination. Any other values are non-standard and implementation defined. In C90, main() must have an explicit return statement at the end to avoid undefined behaviour. In C99 and newer, you may omit the return statement from main(). If you do, and main() finished, there is an implicit return 0.
+Finally, there is nothing wrong from a standards point of view with calling main() recursively from a C program.Standard C — Hosted Environment
+For a hosted environment (that's the normal one), the C11 standard (ISO/IEC 9899:2011) says:
+
+5.1.2.2.1 Program startup
+The function called at program startup is named main. The implementation declares no
+  prototype for this function. It shall be defined with a return type of int and with no
+  parameters:
+int main(void) { /* ... */ }
+
+or with two parameters (referred to here as argc and argv, though any names may be
+  used, as they are local to the function in which they are declared):
+int main(int argc, char *argv[]) { /* ... */ }
+
+or equivalent;10) or in some other implementation-defined manner.
+If they are declared, the parameters to the main function shall obey the following
+  constraints:
+
+The value of argc shall be nonnegative.
+argv[argc] shall be a null pointer.
+If the value of argc is greater than zero, the array members argv[0] through
+  argv[argc-1] inclusive shall contain pointers to strings, which are given
+  implementation-defined values by the host environment prior to program startup. The
+  intent is to supply to the program information determined prior to program startup
+  from elsewhere in the hosted environment. If the host environment is not capable of
+  supplying strings with letters in both uppercase and lowercase, the implementation
+  shall ensure that the strings are received in lowercase.
+If the value of argc is greater than zero, the string pointed to by argv[0]
+  represents the program name; argv[0][0] shall be the null character if the
+  program name is not available from the host environment. If the value of argc is
+  greater than one, the strings pointed to by argv[1] through argv[argc-1]
+  represent the program parameters.
+The parameters argc and argv and the strings pointed to by the argv array shall
+  be modifiable by the program, and retain their last-stored values between program
+  startup and program termination.
+
+10) Thus, int can be replaced by a typedef name defined as int, or the type of argv can be written as
+  char **argv, and so on.
+
+Program termination in C99 or C11
+The value returned from main() is transmitted to the 'environment' in an implementation-defined way.
+
+5.1.2.2.3 Program termination
+1 If the return type of the main function is a type compatible with int, a return from the
+  initial call to the main function is equivalent to calling the exit function with the value
+  returned by the main function as its argument;11) reaching the } that terminates the
+  main function returns a value of 0. If the return type is not compatible with int, the
+  termination status returned to the host environment is unspecified.
+11) In accordance with 6.2.4, the lifetimes of objects with automatic storage duration declared in main
+  will have ended in the former case, even where they would not have in the latter.
+
+Note that 0 is mandated as 'success'. You can use EXIT_FAILURE and EXIT_SUCCESS from <stdlib.h> if you prefer, but 0 is well established, and so is 1. See also Exit codes greater than 255 — possible?.
+In C89 (and hence in Microsoft C), there is no statement about what happens if the main() function returns but does not specify a return value; it therefore leads to undefined behaviour.
+
+7.22.4.4 The exit function
+¶5 Finally, control is returned to the host environment. If the value of status is zero or EXIT_SUCCESS, an implementation-defined form of the status successful termination is returned. If the value of status is EXIT_FAILURE, an implementation-defined form of the status unsuccessful termination is returned. Otherwise the status returned is implementation-defined.
+
+Standard C++ — Hosted Environment
+The C++11 standard (ISO/IEC 14882:2011) says:
+
+3.6.1 Main function [basic.start.main]
+¶1 A program shall contain a global function called main, which is the designated start of the program. [...]
+¶2 An implementation shall not predefine the main function. This function shall not be overloaded. It shall
+  have a return type of type int, but otherwise its type is implementation defined.
+  All implementations
+  shall allow both of the following definitions of main:
+int main() { /* ... */ }
+
+and
+int main(int argc, char* argv[]) { /* ... */ }
+
+In the latter form argc shall be the number of arguments passed to the program from the environment
+  in which the program is run. If argc is nonzero these arguments shall be supplied in argv[0]
+  through argv[argc-1] as pointers to the initial characters of null-terminated multibyte strings (NTMBSs) (17.5.2.1.4.2) and argv[0] shall be the pointer to the initial character of a NTMBS that represents the
+  name used to invoke the program or "". The value of argc shall be non-negative. The value of argv[argc]
+  shall be 0. [ Note: It is recommended that any further (optional) parameters be added after argv. —end
+  note ]
+¶3 The function main shall not be used within a program. The linkage (3.5) of main is implementation-defined. [...]
+¶5 A return statement in main has the effect of leaving the main function (destroying any objects with automatic
+  storage duration) and calling std::exit with the return value as the argument. If control reaches the end
+  of main without encountering a return statement, the effect is that of executing
+return 0;
+
+
+The C++ standard explicitly says "It [the main function] shall have a return type of type int, but otherwise its type is implementation defined", and requires the same two signatures as the C standard to be supported as options. So a 'void main()' is directly not allowed by the C++ standard, though there's nothing it can do to stop a non-standard implementation allowing alternatives.  Note that C++ forbids the user from calling main (but the C standard does not).
+There's a paragraph of §18.5 Start and termination in the C++11 standard that is identical to the paragraph from §7.22.4.4 The exit function in the C11 standard (quoted above), apart from a footnote (which simply documents that EXIT_SUCCESS and EXIT_FAILURE are defined in <cstdlib>).
+Standard C — Common Extension
+Classically, Unix systems support a third variant:
+int main(int argc, char **argv, char **envp) { ... }
+
+The third argument is a null-terminated list of pointers to strings, each of which is an environment variable which has a name, an equals sign, and a value (possibly empty).  If you do not use this, you can still get at the environment via 'extern char **environ;'.  This global variable is unique among those in POSIX in that it does not have a header that declares it.
+This is recognized by the C standard as a common extension, documented in Annex J:
+
+J.5.1 Environment arguments
+¶1 In a hosted environment, the main function receives a third argument, char *envp[],
+  that points to a null-terminated array of pointers to char, each of which points to a string
+  that provides information about the environment for this execution of the program (5.1.2.2.1).
+
+Microsoft C
+The Microsoft VS 2010 compiler is interesting. The web site says:
+
+The declaration syntax for main is
+ int main();
+
+or, optionally,
+int main(int argc, char *argv[], char *envp[]);
+
+Alternatively, the main and wmain functions can be declared as returning void (no return value). If you declare main or wmain as returning void, you cannot return an exit code to the parent process or operating system by using a return statement. To return an exit code when main or wmain is declared as void, you must use the exit function.
+
+It is not clear to me what happens (what exit code is returned to the parent or OS) when a program with void main() does exit — and the MS web site is silent too.
+Interestingly, MS does not prescribe the two-argument version of main() that the C and C++ standards require. It only prescribes a three argument form where the third argument is char **envp, a pointer to a list of environment variables.
+The Microsoft page also lists some other alternatives — wmain() which takes wide character strings, and some more.
+The Microsoft Visual Studio 2005 version of this page does not list void main() as an alternative.  The versions from Microsoft Visual Studio 2008 onwards do.
+Standard C — Freestanding Environment
+As noted early on, the requirements above apply to hosted environments. If you are working with a freestanding environment (which is the alternative to a hosted environment), then the standard has much less to say. For a freestanding environment, the function called at program startup need not be called main and there are no constraints on its return type.  The standard says:
+
+5.1.2 Execution environments
+Two execution environments are defined: freestanding and hosted. In both cases,
+  program startup occurs when a designated C function is called by the execution
+  environment. All objects with static storage duration shall be initialized (set to their initial values) before program startup. The manner and timing of such initialization are otherwise unspecified. Program termination returns control to the execution environment.
+5.1.2.1 Freestanding environment
+In a freestanding environment (in which C program execution may take place without any benefit of an operating system), the name and type of the function called at program startup are implementation-defined. Any library facilities available to a freestanding program, other than the minimal set required by clause 4, are implementation-defined.
+The effect of program termination in a freestanding environment is implementation-defined.
+
+The cross-reference to clause 4 Conformance refers to this:
+
+¶5 A strictly conforming program shall use only those features of the language and library specified in this International Standard.3) It shall not produce output dependent on any unspecified, undefined, or implementation-defined behavior, and shall not exceed any minimum implementation limit.
+¶6 The two forms of conforming implementation are hosted and freestanding. A conforming hosted implementation shall accept any strictly conforming program. A conforming freestanding implementation shall accept any strictly conforming program in which the use of the features specified in the library clause (clause 7) is confined to the contents of the standard headers <float.h>, <iso646.h>, <limits.h>, <stdalign.h>,
+  <stdarg.h>, <stdbool.h>, <stddef.h>, <stdint.h>, and
+  <stdnoreturn.h>. A conforming implementation may have extensions (including
+  additional library functions), provided they do not alter the behavior of any strictly conforming program.4)
+¶7 A conforming program is one that is acceptable to a conforming implementation.5)
+3) A strictly conforming program can use conditional features (see 6.10.8.3) provided the use is guarded by an appropriate conditional inclusion preprocessing directive using the related macro. For example:
+#ifdef __STDC_IEC_559__ /* FE_UPWARD defined */
+    /* ... */
+    fesetround(FE_UPWARD);
+    /* ... */
+#endif
+
+4) This implies that a conforming implementation reserves no identifiers other than those explicitly reserved in this International Standard.
+5) Strictly conforming programs are intended to be maximally portable among conforming implementations. Conforming programs may depend upon non-portable features of a conforming implementation.
+
+It is noticeable that the only header required of a freestanding environment that actually defines any functions is <stdarg.h> (and even those may be — and often are — just macros).
+Standard C++ — Freestanding Environment
+Just as the C standard recognizes both hosted and freestanding environment, so too does the C++ standard. (Quotes from ISO/IEC 14882:2011.)
+
+1.4 Implementation compliance [intro.compliance]
+¶7 Two kinds of implementations are defined: a hosted implementation and a freestanding implementation. For a hosted implementation, this International Standard defines the set of available libraries. A freestanding
+  implementation is one in which execution may take place without the benefit of an operating system, and has an implementation-defined set of libraries that includes certain language-support libraries (17.6.1.3).
+¶8 A conforming implementation may have extensions (including additional library functions), provided they do not alter the behavior of any well-formed program. Implementations are required to diagnose programs that
+  use such extensions that are ill-formed according to this International Standard. Having done so, however, they can compile and execute such programs.
+¶9 Each implementation shall include documentation that identifies all conditionally-supported constructs that it does not support and defines all locale-specific characteristics.3
+3) This documentation also defines implementation-defined behavior; see 1.9.
+17.6.1.3 Freestanding implementations [compliance]
+Two kinds of implementations are defined: hosted and freestanding (1.4). For a hosted implementation, this International Standard describes the set of available headers.
+A freestanding implementation has an implementation-defined set of headers. This set shall include at least the headers shown in Table 16.
+The supplied version of the header <cstdlib> shall declare at least the functions abort, atexit, at_quick_exit, exit, and quick_exit (18.5). The other headers listed in this table shall meet the same requirements as for a hosted implementation.
+Table 16 — C++ headers for freestanding implementations
+Subclause                           Header(s)
+                                    <ciso646>
+18.2  Types                         <cstddef>
+18.3  Implementation properties     <cfloat> <limits> <climits>
+18.4  Integer types                 <cstdint>
+18.5  Start and termination         <cstdlib>
+18.6  Dynamic memory management     <new>
+18.7  Type identification           <typeinfo>
+18.8  Exception handling            <exception>
+18.9  Initializer lists             <initializer_list>
+18.10 Other runtime support         <cstdalign> <cstdarg> <cstdbool>
+20.9  Type traits                   <type_traits>
+29    Atomics                       <atomic>
+
+
+What about using int main() in C?
+The standard §5.1.2.2.1 of the C11 standard shows the preferred notation — int main(void) — but there are also two examples in the standard which show int main(): §6.5.3.4 ¶8 and §6.7.6.3 ¶20.  Now, it is important to note that examples are not 'normative'; they are only illustrative.  If there are bugs in the examples, they do not directly affect the main text of the standard.  That said, they are strongly indicative of expected behaviour, so if the standard includes int main() in an example, it suggests that int main() is not forbidden, even if it is not the preferred notation.
+
+6.5.3.4 The sizeof and _Alignof operators
+…
+¶8 EXAMPLE 3 In this example, the size of a variable length array is computed and returned from a function:
+#include <stddef.h>
+
+size_t fsize3(int n)
+{
+    char b[n+3]; // variable length array
+    return sizeof b; // execution time sizeof
+}
+int main()
+{
+    size_t size;
+    size = fsize3(10); // fsize3 returns 13
+    return 0;
+}I believe that main() should return either EXIT_SUCCESS or EXIT_FAILURE. They are defined in stdlib.hNote that the C and C++ standards define two kinds of implementations: freestanding and hosted.
+
+C90 hosted environment
+
+Allowed forms 1:
+    int main (void)
+    int main (int argc, char *argv[])
+
+    main (void)
+    main (int argc, char *argv[])
+    /*... etc, similar forms with implicit int */
+
+Comments:
+The former two are explicitly stated as the allowed forms, the others are implicitly allowed because C90 allowed "implicit int" for return type and function parameters. No other form is allowed.
+
+C90 freestanding environment
+
+Any form or name of main is allowed 2.
+
+C99 hosted environment
+
+Allowed forms 3:
+    int main (void)
+    int main (int argc, char *argv[])
+    /* or in some other implementation-defined manner. */
+
+Comments:
+C99 removed "implicit int" so main() is no longer valid.
+A strange, ambiguous sentence "or in some other implementation-defined manner" has been introduced. This can either be interpreted as "the parameters to int main() may vary" or as "main can have any implementation-defined form".
+Some compilers have chosen to interpret the standard in the latter way. Arguably, one cannot easily state that they are not conforming by citing the standard in itself, since it is is ambiguous.
+However, to allow completely wild forms of main() was probably(?) not the intention of this new sentence. The C99 rationale (not normative) implies that the sentence refers to additional parameters to int main 4.
+Yet the section for hosted environment program termination then goes on arguing about the case where main does not return int 5. Although that section is not normative for how main should be declared, it definitely implies that main might be declared in a completely implementation-defined way even on hosted systems.
+
+C99 freestanding environment
+
+Any form or name of main is allowed 6.
+
+C11 hosted environment
+
+Allowed forms 7:
+    int main (void)
+    int main (int argc, char *argv[])
+    /* or in some other implementation-defined manner. */
+
+
+C11 freestanding environment
+
+Any form or name of main is allowed 8.
+
+Note that int main() was never listed as a valid form for any hosted implementation of C in any of the above versions. In C, unlike C++, () and (void) have different meanings. The former is an obsolescent feature which may be removed from the language. See C11 future language directions:
+
+6.11.6 Function declarators
+The use of function declarators with empty parentheses (not prototype-format parameter type declarators) is an obsolescent feature.
+
+
+
+C++03 hosted environment
+
+Allowed forms 9:
+    int main ()
+    int main (int argc, char *argv[])
+
+Comments:
+Note the empty parenthesis in the first form. C++ and C are different in this case, because in C++ this means that the function takes no parameters. But in C it means that it may take any parameter.
+
+C++03 freestanding environment
+
+The name of the function called at startup is implementation-defined. If it is named main() it must follow the stated forms 10:
+    // implementation-defined name, or 
+    int main ()
+    int main (int argc, char *argv[])
+
+
+C++11 hosted environment
+
+Allowed forms 11:
+    int main ()
+    int main (int argc, char *argv[])
+
+Comments:
+The text of the standard has been changed but it has the same meaning.
+
+C++11 freestanding environment
+
+The name of the function called at startup is implementation-defined. If it is named main() it must follow the stated forms 12:
+    // implementation-defined name, or 
+    int main ()
+    int main (int argc, char *argv[])
+
+
+References
+
+ANSI X3.159-1989 2.1.2.2 Hosted environment. "Program startup"
+
+
+The function called at program startup is named main. The
+implementation declares no prototype for this function. It shall be
+defined with a return type of int and with no parameters:
+
+    int main(void) { /* ... */ } 
+
+
+or with two parameters (referred to here as
+argc and argv, though any names may be used, as they are local to the
+function in which they are declared):
+
+    int main(int argc, char *argv[]) { /* ... */ }
+
+
+ANSI X3.159-1989 2.1.2.1 Freestanding environment:
+
+
+In a freestanding environment (in which C program execution may take
+place without any benefit of an operating system), the name and type
+of the function called at program startup are implementation-defined.
+
+
+ISO 9899:1999 5.1.2.2 Hosted environment -> 5.1.2.2.1 Program startup
+
+
+The function called at program startup is named main. The
+implementation declares no prototype for this function. It shall be
+defined with a return type of int and with no parameters:
+
+    int main(void) { /* ... */ } 
+
+
+or with two parameters (referred to here as
+argc and argv, though any names may be used, as they are local to the
+function in which they are declared):
+
+    int main(int argc, char *argv[]) { /* ... */ }
+
+
+or equivalent;9) or in some other implementation-defined
+manner.
+
+
+Rationale for International Standard — Programming Languages — C, Revision 5.10. 5.1.2.2 Hosted environment --> 5.1.2.2.1 Program startup
+
+
+The behavior of the arguments to main, and of the interaction of exit, main and atexit
+(see §7.20.4.2) has been codified to curb some unwanted variety in the representation of argv
+strings, and in the meaning of values returned by main.
+
+
+The specification of argc and argv as arguments to main recognizes extensive prior practice.
+argv[argc] is required to be a null pointer to provide a redundant check for the end of the list, also on the basis of common practice.
+
+
+main is the only function that may portably be declared either with zero or two arguments. (The number of other functions’ arguments must match exactly between invocation and definition.)
+This special case simply recognizes the widespread practice of leaving off the arguments to main when the program does not access the program argument strings. While many implementations support more than two arguments to main, such practice is neither blessed nor forbidden by the Standard; a program that defines main with three arguments is not strictly conforming (see §J.5.1.).
+
+
+ISO 9899:1999 5.1.2.2 Hosted environment --> 5.1.2.2.3 Program termination
+
+
+If the return type of the main function is a type compatible with int, a return from the initial call to the main function is equivalent to calling the exit function with the value returned by the main function as its argument;11) reaching the } that terminates the main function returns a value of 0. If the return type is not compatible with int, the termination status returned to the host environment is unspecified.
+
+
+ISO 9899:1999 5.1.2.1 Freestanding environment
+
+
+In a freestanding environment (in which C program execution may take place without any benefit of an operating system), the name and type of the function called at program startup are implementation-defined.
+
+
+ISO 9899:2011 5.1.2.2 Hosted environment -> 5.1.2.2.1 Program startup
+
+This section is identical to the C99 one cited above.
+
+ISO 9899:1999 5.1.2.1 Freestanding environment
+
+This section is identical to the C99 one cited above.
+
+ISO 14882:2003 3.6.1 Main function
+
+
+An implementation shall not predefine the main function. This function shall not be overloaded. It shall have a return type of type int, but otherwise its type is implementation-defined. All implementations shall allow both of the following definitions of main:
+
+    int main() { /* ... */ }
+
+
+and
+
+    int main(int argc, char* argv[]) { /* ... */ }
+
+
+ISO 14882:2003 3.6.1 Main function
+
+
+It is implementation-defined whether a program in a freestanding environment is required to define a main function.
+
+
+ISO 14882:2011 3.6.1 Main function
+
+
+An implementation shall not predefine the main function. This function shall not be overloaded. It shall have a return type of type int, but otherwise its type is implementation-defined. All implementations shall
+allow both
+— a function of () returning int and
+— a function of (int, pointer to pointer to char) returning int
+as the type of main (8.3.5).
+
+
+ISO 14882:2011 3.6.1 Main function
+
+This section is identical to the C++03 one cited above.Return 0 on success and non-zero for error. This is the standard used by UNIX and DOS scripting to find out what happened with your program.main() in C89 and K&R C unspecified return types default to ’int`.
+return 1? return 0?
+
+
+If you do not write a return statement in int main(), the closing { will return 0 by default.
+return 0 or return 1 will be received by the parent process. In a shell it goes into a shell variable, and if you are running your program form a shell and not using that variable then you need not worry about the return value of main().
+
+See How can I get what my main function has returned?.
+$ ./a.out
+$ echo $?
+
+This way you can see that it is the variable $? which receives the least significant byte of the return value of main().
+In Unix and DOS scripting, return 0 on success and non-zero for error are usually returned. This is the standard used by Unix and DOS scripting to find out what happened with your program and controlling the whole flow.Keep in mind that,even though you're returning an int, some OSes (Windows) truncate the returned value to a single byte (0-255).The return value can be used by the operating system to check how the program was closed.
+Return value 0 usually means OK in most operating systems (the ones I can think of anyway).
+It also can be checked when you call a process yourself, and see if the program exited and finished properly.
+It's NOT just a programming convention.I was under the impression that standard specifies that main doesn't need a return value as a successful return was OS based (zero in one could be either a success or a failure in another), therefore the absence of return was a cue for the compiler to insert the successful return itself.
+However I usually return 0.The return value of main() shows how the program exited. If the return value is zero it means that the execution was successful while any non-zero value will represent that something went bad in the execution.Returning 0 should tell the programmer that the program has successfully finished the job.Omit return 0
+When a C or C++ program reaches the end of main the compiler will automatically generate code to return 0, so there is no need to put return 0; explicitly at the end of main.  
+Note: when I make this suggestion, it's almost invariably followed by one of two kinds of comments:  "I didn't know that." or "That's bad advice!"  My rationale is that it's safe and useful to rely on compiler behavior explicitly supported by the standard.  For C, since C99; see ISO/IEC 9899:1999 section 5.1.2.2.3:
+
+[...] a return from the initial call to the main function is equivalent to calling the exit function with the value returned by the main function as its argument; reaching the } that terminates the main function returns a value of 0.
+
+For C++, since the first standard in 1998; see ISO/IEC 14882:1998 section 3.6.1:
+
+If control reaches the end of main without encountering a return statement, the effect is that of executing return 0;
+
+All versions of both standards since then (C99 and C++98) have maintained the same idea.  We rely on automatically generated member functions in C++, and few people write explicit return; statements at the end of a void function.  Reasons against omitting seem to boil down to "it looks weird".  If, like me, you're curious about the rationale for the change to the C standard read this question.  Also note that in the early 1990s this was considered "sloppy practice" because it was undefined behavior (although widely supported) at the time.  
+Additionally, the C++ Core Guidelines contains multiple instances of omitting return 0; at the end of main and no instances in which an explicit return is written.  Although there is not yet a specific guideline on this particular topic in that document, that seems at least a tacit endorsement of the practice.
+So I advocate omitting it; others disagree (often vehemently!)  In any case, if you encounter code that omits it, you'll know that it's explicitly supported by the standard and you'll know what it means.What to return depends on what you want to do with the executable. For example if you are using your program with a command line shell, then you need to return 0 for a success and a non zero for failure. Then you would be able to use the program in shells with conditional processing depending on the outcome of your code. Also you can assign any nonzero value as per your interpretation, for example for critical errors different program exit points could terminate a program with different exit values , and which is available to the calling shell which can decide what to do by inspecting the value returned.
+If the code is not intended for use with shells and the returned value does not bother anybody then it might be omitted. I personally use the signature int main (void) { .. return 0; .. }If you really have issues related to efficiency of returning an integer from a process, you should probably avoid to call that process so many times that this return value becomes an issue.
+If you are doing this (call a process so many times), you should find a way to put your logic directly inside the caller, or in a DLL file, without allocate a specific process for each call; the multiple process allocations bring you the relevant efficiency problem in this case.
+In detail, if you only want to know if returning 0 is more or less efficient than returning 1, it could depend from the compiler in some cases, but generically, assuming they are read from the same source (local, field, constant, embedded in the code, function result, etc.) it requires exactly the same number of clock cycles.Here is a small demonstration of the usage of return codes...
+When using the various tools that the Linux terminal provides one can use the return code for example for error handling after the process has been completed. Imagine that the following text file myfile is present:
+
+This is some example in order to check how grep works.
+
+When you execute the grep command a process is created. Once it is through (and didn't break) it returns some code between 0 and 255. For example:
+$ grep order myfile
+
+If you do
+$ echo $?
+$ 0
+
+you will get a 0. Why? Because grep found a match and returned an exit code 0, which is the usual value for exiting with a success. Let's check it out again but with something that is not inside our text file and thus no match will be found:
+$ grep foo myfile
+$ echo $?
+$ 1
+
+Since grep failed to match the token "foo" with the content of our file the return code is 1 (this is the usual case when a failure occurs but as stated above you have plenty of values to choose from).
+Now the following bash script (simply type it in a Linux terminal) although very basic should give some idea of error handling:
+$ grep foo myfile
+$ CHECK=$?
+$ [ $CHECK -eq 0] && echo 'Match found'
+$ [ $CHECK -ne 0] && echo 'No match was found'
+$ No match was found
+
+After the second line nothing is printed to the terminal since "foo" made grep return 1 and we check if the return code of grep was equal to 0. The second conditional statement echoes its message in the last line since it is true due to CHECK == 1.
+As you can see if you are calling this and that process it is sometimes essential to see what it has returned (by the return value of main()).What is the correct (most efficient) way to define the main() function in C and C++ — int main() or void main() — and why?
+
+Those words "(most efficient)" don't change the question.  Unless you're in a freestanding environment, there is one universally correct way to declare main(), and that's as returning int.
+
+What should main() return in C and C++?
+
+It's not what should main() return, it's what does main() return.  main() is, of course, a function that someone else calls.  You don't have any control over the code that calls main().  Therefore, you must declare main() with a type-correct signature to match its caller.  You simply don't have any choice in the matter.  You don't have to ask yourself what's more or less efficient, or what's better or worse style, or anything like that, because the answer is already perfectly well defined, for you, by the C and C+ standards.  Just follow them.
+
+If int main() then return 1 or return 0?
+
+0 for success, nonzero for failure.  Again, not something you need to (or get to) pick: it's defined by the interface you're supposed to be conforming to.In C, the Section 5.1.2.2.1 of the C11 standard (emphasis mine):
+
+It shall be defined with a return type of int and with no
+parameters:
+int main(void) { /* ... */ }
+
+or with two parameters (referred to here as argc and argv, though
+any names may be used, as they are local to the function in which they
+are declared):
+int main(int argc, char *argv[]) { /* ... */ }
+
+
+However for some beginners like me, an abstract example would allow me to get a grasp on it:
+When you write a method in your program, e.g. int read_file(char filename[LEN]);, then you want, as the caller of this method to know if everything went well (because failures can happen, e.g. file could not be found). By checking the return value of the method you can know if everything went well or not, it's a mechanism for the method to signal you about its successful execution (or not), and let the caller (you, e.g. in your main method) decide how to handle an unexpected failure.
+So now imagine I write a C program for a micro-mechanism which is used in a more complex system. When the system calls the micro-mechanism, it wants to know if everything went as expected, so that it can handle any potential error. If the C program's main method would return void, then how would the calling-system know about the execution of its subsystem (the micro-mechanism)? It cannot, that's why main() returns int, in order to communicate to its caller a successful (or not) execution.
+In other words:
+The rational is that the host environment (i.e. Operating System (OS)) needs to know if the program finished correctly. Without an int-compatible type as a return type (eg. void), the "status returned to the host environment is unspecified" (i.e. undefined behavior on most OS).On Windows, if a program crashes due to an access violation, the exit code will be STATUS_ACCESS_VIOLATION (0xC0000005).  Similar for other kinds of crashes from an x86 exception as well.
+So there are things other than what you return from main or pass to exit that can cause an exit code to be seen.Socket Programming : Client Disconnection keeps server hangingI am trying to build a sample TCP Forwarder. Here is the functionality in brief:
+
+The forwarder will listen at a given port.
+It contains a map of clients to servers
+Clients will connect to the forwarder and the forwarder will lookup the map and create a 2-way-forwarding-connection.
+To achieve this, it creates two threads per client.
+Thread 1: reads from the client and writes to the target server
+Thread 2: reads from the target server and write to the client.
+
+All this is written in C. 
+The Client and Target servers can be written in any language, right now its Java.
+When I run a client for the first time, it works as expected. However, if I kill the client and restart it, the server never receives the new connection.
+Here is my server code which I suspect is fault. 
+Socket clientSocket = serverSocket.accept();
+InputStream inputStream = clientSocket.getInputStream();
+OutputStream outputStream = clientSocket.getOutputStream();
+
+while (true) {
+    byte[] bArray = new byte[2048];
+    try {
+        System.out.println(String.format("SERVER:%s: Attempting to read", this.name));
+        inputStream.read(bArray);
+        System.out.println(String.format("SERVER:%s: Received %s", this.name, new String(bArray)));
+        byte[] bytes = (name + ":" + counter).getBytes();
+        counter++;
+        outputStream.write(bytes);
+        System.out.println(String.format("SERVER:%s: Sent %s", this.name, new String(bytes)));
+    } catch (IOException e) {
+        System.out.println(String.format("SERVER:%s: Client Disconnected ", this.name));
+        clientSocket = serverSocket.accept();
+        inputStream = clientSocket.getInputStream();
+    }
+}
+
+In the C program, I detect the disconnection and close the socket as shown below:
+LOGINFO("Reading from Client Socket.");
+iResult = read(readSocket, buff, recvbuflen);
+if (iResult <= 0) {
+    LOGERROR("Receiving failed");
+    close(readSocket);          
+    break;
+}Try to modify your server logic by using concurrency to manage each request. In this way, server will be able to handle each client separately in a thread. Reading and writing data must be performed in the related thread. A pool thread paradigm is often used to avoid thread overhead[1].
+For example: 
+ExecutorService threadPool = Executors.newFixedThreadPool(n);
+ServerSocket serverSocket = null;
+
+//...
+
+while(!isStopped()){
+   Socket clientSocket = null;
+   try {
+       clientSocket = this.serverSocket.accept();
+       threadPool.execute(new WorkerRunnable(clientSocket));
+       // Process data in the WorkerRunnable class
+   } catch (IOException e) {
+       if(isStopped()) {
+           System.err.println("Server Stopped.") ;
+           break;
+       }
+       throw new RuntimeException("Error accepting client connection", e);
+   } 
+}
+
+A well designed example can be found here: http://tutorials.jenkov.com/java-multithreaded-servers/thread-pooled-server.htmlYou should use 
+   shutdown(socket_fd, SHUT_WR);
+
+instead of close(socket_fd) in order to properly close socket.
+If you use SHUT_WR, a FIN packet will be sent to another side to inform them we don't have more data to send.How does (*prt)[N][N] work when dealing with heap allocation memory?Today a colleague at work showed me a way of declaring a 2D array in such a way that I can allocate it linearly but still use 2D square bracket ([][]) notation to access elements.
+For example:
+#include <stdio.h>
+#include <stdlib.h>
+
+#define SIZE 2
+
+int main () {
+  int (*a)[SIZE][SIZE] = malloc (sizeof (int) * SIZE * SIZE);
+
+  for (int i = 0; i < SIZE; i++) {
+    for (int j = 0; j < SIZE; j++) {
+      (*a)[i][j] = 0;
+    }
+  }
+
+  (*a)[0][1] = 100;
+
+  /* should yield:
+   *   0
+   *   100
+   *   0
+   *   0
+   */
+  for (int i = 0; i < SIZE; i++) {
+    for (int j = 0; j < SIZE; j++) {
+      printf ("%d\n", (*a)[i][j]);
+    }
+  }
+
+  free (a);
+
+  return EXIT_SUCCESS;
+}
+
+This is in contrast to computing the index and then perform pointer arthimetic (e.g. *(a + (x * SIZE + y)) or more tersly a[x * SIZE + y]) to access an element.
+The critical part is the shape declaration of the pointer x (e.g. (*x)[][]), which seems to encode this information as a type for the value that x points to.
+Beyond this though I do not understand how this works. What does this notation exactly doing? Is it syntactic sugar? It looks symilar to dynamic stack allocation for arrays (see Array size at run time without dynamic allocation is allowed? as one example of this), but clearly this allocation is happening on the heap. 
+I've looked for more information about this notation/declaration of the pointer but can't find much other than the term element type coming up - but I'm not certain that this is related.
+EDIT #1:
+I should have mentioned this question is in the context of using the heap, and not the stack. I'm aware of stack based dynamic allocation of arrays, but the work I'm doing specifically looks at dynamic memory allocations.It is not wrong but not the more usual (and idiomatic way). To declare a dynamic array of size N, you use: int *arr = malloc(N * sizeof(int));. In fact this declares arr as a pointer to the first element of an array of N int. A 2D array is an array of arrays so to declare an 2D array N*N, the more common way is :
+int (*arr)[N] = malloc(N * N * sizeof(int));
+
+This actually declares arr as a pointer to the first element of N arrays of N int. You can then normally use arr[i][j].
+So what is that amazing int (*a)[SIZE][SIZE] = malloc (sizeof (int) * SIZE * SIZE);?
+You declare arr as a pointer to the first (and single) element of an array of 2D arrays NxN of integers. The good news is that the declaration is explicit for the size of all dimensions, but the downside is that you must consistently dereference it: (*arr)[i][j] which is not different per definition of the [] operator in C from arr[0][i][j].
+It is nothing more than my own opinion, but I strongly urge you to stick to the first method. That first and single element trick is likely to disturb any future reader or maintainer of your code because it is not idiomatic.int (*a)[SIZE][SIZE]
+
+declares a as a pointer to a SIZE by SIZE array of int - assuming SIZE == 3, you get something like this:
+   +---+          +---+---+---+
+a: |   | -------> |   |   |   |
+   +---+          +---+---+---+
+                  |   |   |   |
+                  +---+---+---+
+                  |   |   |   |
+                  +---+---+---+
+
+(actually, layout would be strictly linear, but we'll go with this representation for now).  
+To access any element of the pointed-to array, we'd write (*a)[i][j] - we have to dereference a explicitly, since we don't want to index into a, we want to index into what a points to.  
+Remember that a[i] is defined as *(a + i) - given an address a, offset i elements (not bytes!) from that address and deference the result.  Thus, (*a)[i][j] is equivalent to a[0][i][j].  
+Now, if a points to a 3x3 array of int, then a + 1 points to the next 3x3 array of int:
+   +---+          +---+---+---+
+a: |   | -------> |   |   |   |
+   +---+          +---+---+---+
+                  |   |   |   |
+                  +---+---+---+
+                  |   |   |   |
+                  +---+---+---+
+a + 1: ---------> |   |   |   |
+                  +---+---+---+
+                  |   |   |   |
+                  +---+---+---+
+                  |   |   |   |
+                  +---+---+---+
+
+which we would access as (*(a + 1))[i][j], or simply a[1][i][j].
+Now, why use a pointer to an array in the first place?  In this case we're dynamically allocating the array, which we would do if a) we didn't know how many SIZExSIZE arrays we'd need until runtime, or b) if the resulting array would be too large to allocate as an auto variable, or c) if we want to extend or shrink the number of SIZExSIZE arrays as necessary.
+How does this method of allocating a multidimensional array work?  Let's start by allocating an N-element array of T:
+T *arr = malloc( sizeof *arr * N );
+
+sizeof *arr is equivalent to sizeof (T), so we're setting aside space for N objects of type T.  
+Now let's replace T with an array type, R [M]:
+R (*arr)[M] = malloc( sizeof *arr * N );
+
+sizeof *arr is equivalent to sizeof (R [M]), so we're setting aside space for N objects of type R [M] - IOW, N M-element arrays of R.  We've dynamically created the equivalent of R a[M][N].  
+We could also have written this as
+R (*arr)[M] = malloc( sizeof (R) * M * N );
+
+although I prefer using sizeof *arr; you'll see why in a second.
+Now, we can replace R with yet another array type, S [L]:
+S (*arr)[L][M] = malloc( sizeof *arr * N );
+
+sizeof *arr is equivalent to sizeof (S [L][M]), so we're allocating enough space for N objects of type S [L][M], or N L by M arrays of S.  We've dynamically created the equivalent of S arr[L][M][N].  
+The semantics for dynamically allocating 1D, 2D, and 3D arrays are exactly the same - all that's changed is the type. By using sizeof *arr each time, I only need to track how many elements I need of that type.int (*a)[SIZE][SIZE] is an array pointer to an array of type int[SIZE][SIZE]. This is a special kind of pointer that is used to point at whole arrays, but otherwise works like any other pointer. So when you write (*a)[i][j] you say "give me the contents of the pointer (the 2D array), then in those contents give me item number [i][j]".
+But since array pointers behave like other pointers, you can use it point to the first element instead of the whole 2D array. (Just like you can use int* to point at the first item of an int[n] array.) This is done using the trick of omitting the left-most dimension: int (*a)[SIZE] = .... This now points to the first 1D array in the array of arrays. And now you can use it as a[i][j] instead, which is far more readable and convenient.
+Array pointers, the above trick, and how to use them to dynamically allocate 2D arrays as one single chunk of memory is all addressed in my answer to Correctly allocating multi-dimensional arrays.What int (*a)[SIZE][SIZE] = malloc (sizeof (int) * SIZE * SIZE); does is declaring a pointer to a two-dimensional array of integers. This would only be useful when you purposely want to allocate the space in the heap instead of in the stack (for example, if the dimensions of the array are unknown at compile time) You would then dereference the pointer and access it as you would with a normal two-dimensional array. 
+You could skip the dereferencing step by declaring your variable as an array of pointers, each one of them pointing to a standard array of integers int *a[SIZE], or even as int **a. In both cases you could access any value using bracket notation a[x][y] without needing to dereference a before.
+If you know the dimensions of the array prior at compilation time, and don't need to allocate it in the heap, you can just declare the array like this:
+int a[SIZE][SIZE];
+
+which is both shorter and more efficient as it allocates the space in the stack.
+You can always access an array using [][]. You have to keep in mind that everything in C works with memory address offsets. When you have an integer array declared as int a[4] and you access it with square brackets like this a[3] you're telling the processor to take the memory address of a and apply an offset of 3 * sizeof(int). You could access the same element by using *(&a + 3), or even with 3[a], as taking the address and adding the offset is the same as taking the offset and adding the address.
+So when you use a[2][3], the compiler is doing exactly the same as above, only with more dimensions. So you don't need to do a[x * SIZE + y] because that's exactly what the compiler is doing for you when you do a[x][y].How do I count the number of words if the user enters multiple lines/spaces?I have a char array, which contains what the user has inputted. How would I count the words?
+The user in permitted to to do something crazy like:
+hello this
+               is a test
+   how are
+you today?
+
+So the number of words here should be 9 but my program tells me 23. Why is this not working? Its counting the spaces, but I have taken that into account with sentence_entered[i + 1] != ' '
+My code:
+int i = 0;    
+while (sentence_entered[i] != '\0') {
+
+        if (
+            (sentence_entered[i] == ' ' ||
+            sentence_entered[i] == '\n') &&
+            (sentence_entered[i + 1] != ' ' ||
+            sentence_entered[i + 1] != '\n')
+           ) {
+            words += 1;
+    }
+i++
+}The negation of a || b is !a && !b.
+Your condition should read:
+       (sentence_entered[i] == ' ' ||
+        sentence_entered[i] == '\n') &&
+        (sentence_entered[i + 1] != ' ' &&
+        sentence_entered[i + 1] != '\n')How do I read user input across multiple lines, spaces etc?I am trying to scan in some user input, but when I run the program, all I get is a bunch of 3/4 fractions.
+I need to be able to scan in characters, spaces and break lines. If a user enters something like:
+Hello this
+  is
+     a test123 234     !!!
+
+Once they are done entering what they want to enter, they will press CTRL+D, and that is how I will know to stop reading what they are saying.
+Here is my code:
+char user_input[1000];
+int i = 0;
+    while (scanf("%c", &user_input[i]) == 1) {
+        i++;
+}Your code is ok. The following program:
+#include <stdio.h>
+
+int main()
+{
+    char user_input[1000];
+    int i = 0;
+    while (scanf("%c", &user_input[i]) == 1) {
+        i++;
+    }
+    user_input[i] = '\0';
+    printf("%d\n", i);
+    printf("%s", user_input);
+    return 0;
+}
+
+Produced with your input the following:
+42
+Hello this
+  is
+     a test123 234     !!!
+
+However scanf is generally used to scan formatted input. I would advise to read one character at a time using getchar() or fgets()
+int main(void) {
+   char user_input[1000];
+   int i = 0;
+   int temp;
+   while ((temp = getchar()) != EOF) {
+        user_input[++i] = temp;
+   }
+   user_input[i] = '\0';
+}To have more control over the user input, you could read the user input character by character with getchar(), it will return EOF when the user enters CTRL-D, usually. After that, the string can be parsed to extract the entered fractions and the like.
+If you you'd still like to use something like scanf(), you might consider to replace it with a call to fgets(), to prevent buffer overflows. Or use scanf() with an appropriate formatting string (with a specified maximum number of characters).
+    /* gcc -o test_getchar test_getchar.c  && ./test_getchar */
+
+    #include <stdio.h>
+
+    int main()
+    {
+        char user_input[1000] = {0};
+        int i = 0;
+        char c;
+        while ((c = getchar()) != EOF) {
+            /* do something with c here... */
+            user_input[i] = c;
+            ++i;
+            if (i >= sizeof(user_input)-1)
+                break;
+        }
+        user_input[i] = 0;
+        printf("user input: %s\r\n", user_input);
+        return 0;
+    }mpfr_set_str don't give good valueFor a project in C, I try to use the GNU MPFR Library.
+But I don't understand the functioning of the mpfr_printf function.
+For exemple for the code :
+mpfr_t x;
+mpfr_init( x );
+mpfr_set_str( x, "213598703592091008239502270499962879705109534182641740644", 10, MPFR_RNDN);
+mpfr_printf( "%.0RF\n", x );
+mpfr_printf( "%.0RNf\n", x );
+mpfr_printf( "%.0R*f\n", MPFR_RNDN, x );
+
+Show for all mpfr_printf the value 213598703592090993136552875701722213572989498633163374592
+It's clearly not the same value... but I don't know why?
+I can't use the The GNU Multiple Precision Arithmetic Library because I need the function of MPFR like "log" and "exp".
+I have also try differents Rounding Modes in place of "MPFR_RNDN" but none works.All three of those mpfr_printf statements are equivalent. (I assume you got them from here )
+mpfr_printf( "%.0RF\n", x );
+
+Rounds to the nearest value (default)
+mpfr_printf( "%.0RNf\n", x );
+
+Rounds to nearest (because "RN")
+mpfr_printf( "%.0R*f\n", MPFR_RNDN, x );
+
+Rounds to nearest (because "MPFR_RNDN")From GNU MPFR 4.0.1:
+ A floating-point number, or float for short, is an arbitrary precision
+ significand (also called mantissa) with a **limited** precision exponent.
+ The C data type for such objects is mpfr_t
+ ....
+ The precision is the **number of bits used to represent the significand**
+ of a floating-point number;...
+
+The 'mpfr' numbers are represented as float and have precision. You may read about floating number precision (the number of bits in the significant) on wiki.
+Each mpfr must be initialized with a precision by user. mpfr_init initialized number with a default precision. From manual: The default precision is set to 53 bits initially.
+Use mpfr_init2 function to set the precision (try to use it always). The following will run as expected, however you may run out of memory:
+int main()
+{
+    mpfr_t x;
+    mpfr_init2(x, 200);
+    mpfr_set_str( x, "213598703592091008239502270499962879705109534182641740644", 10, MPFR_RNDN);
+    mpfr_printf( "%.0RF\n", x );
+    mpfr_printf( "%.0RNf\n", x );
+    mpfr_printf( "%.0R*f\n", MPFR_RNDN, x );
+    return 0;
+}Transform comparison routine to Intel SIMDI have a routine where is should test if a float number is less than zero or not.  If yes I should store the sign and I get it is absolute values.
+int sign = 1;
+if (x < 0)
+{
+    sign = -1;
+}
+x = fabs(x);
+
+I looked into Intel SIMD intrinsics and I found this instruction dst = _mm_cmplt_ps(a,b) that generate a vector containing (0xffffffff for true) or (0 for false) but I am stuck there; how can I know which element of the dst vector is negative or not to build the sign_vector.With one small exception (x==+0.0f), you can generate the integer mask using the instruction sign:
+_mm_sign_epi32(_mm_set1_epi32(1), x)
+
+This will negate 1, if x<0, but produces the sign==0 when x==0.
+If 0 is not allowed, x can be made nonzero by oring with 0<mask<0x80000000.
+auto s=_mm_set1_epi32(1);
+auto y=_mm_or_si128(x, s); // fix for x==0
+s=_mm_sign_epi32(s, y);Assuming your input values are in a vector __m128 v:
+__m128 vmask = _mm_set1_ps(-0.0f);      // create sign bit mask
+__m128 vsign = _mm_and_ps(v, vmask);    // create vector of sign bits (MSB)
+__m128i vsigni = _mm_add_epi32(_mm_srai_epi32((__m128i)vsign, 30), _mm_set1_epi32(1));
+                                        // convert sign bits to integer +1/-1 (if needed (*))
+v = _mm_andnot_ps(vmask, v);            // clear sign bits in v (i.e. v = fabsf(v))
+
+(*) rather than wasting cycles generating +1/-1 for the sign, consider whether you could just work with the sign bits directly, and omit this step.Sorting list in ascending and descending orderI need to sort a list either in ascending or descending order according to the preference order computed by whatever function is passed as its second argument. 
+Pretty much the algorithm finds the minimum value, swaps it with the value in the first position or the last position depending on the calculation by the function passed as its 2nd argument of sort list( ) function call. 
+Here is my code I just don't know how to implement a function passing for it to go ascending or descending. Mine only goes one way:
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct iorb {
+int base_pri;
+struct iorb *link;
+char filler[100];
+} IORB;
+
+int push(struct iorb **h, int x)
+{
+struct iorb *temp = (struct iorb*)malloc(sizeof(struct iorb));
+temp->base_pri = x;
+temp->link = *h;
+*h = temp;
+return 0;
+}
+
+void print(struct iorb *head)
+{
+struct iorb *temp = head;
+while(temp != NULL)
+{
+    printf("%d ",temp->base_pri);
+    temp = temp->link;
+}
+printf("\n");
+}
+
+void sort(struct iorb **h)
+{
+int a;
+
+struct iorb *temp1;
+struct iorb *temp2;
+
+for(temp1=*h;temp1!=NULL;temp1=temp1->link)
+  {
+    for(temp2=temp1->link;temp2!=NULL;temp2=temp2->link)
+      { 
+        if(temp2->base_pri < temp1->base_pri)
+          {
+            a = temp1->base_pri;
+            temp1->base_pri = temp2->base_pri;
+            temp2->base_pri = a;
+          }
+       }
+   }
+}
+
+int main()
+{
+struct iorb * head = NULL;
+push(&head,5);
+push(&head,4);
+push(&head,6);
+push(&head,2);
+push(&head,9);
+printf("List is : ");
+print(head);
+sort(&head);
+printf("after sorting list is : ");
+print(head);
+return 0;
+}You need to provide comparator functions. You can pass it to sorting function as function pointers, and use them instead of built-in operation.
+Like this:
+int less(int lh, int rh)
+{
+    return lh < rh;
+}
+
+int greater(int lh, int rh)
+{
+    return !less(lh, rh);
+}
+
+void sort(struct iorb **h, bool (*comp)(int, int))
+{
+int a;
+
+struct iorb *temp1;
+struct iorb *temp2;
+
+for(temp1=*h;temp1!=NULL;temp1=temp1->link)
+  {
+    for(temp2=temp1->link;temp2!=NULL;temp2=temp2->link)
+      { 
+        if(comp(temp2->base_pri, temp1->base_pri))  // Using a comparator.
+          {
+            a = temp1->base_pri;
+            temp1->base_pri = temp2->base_pri;
+            temp2->base_pri = a;
+          }
+       }
+   }
+}
+
+Then
+sort(&head, less);
+
+or
+sort(&head, greater);How to measure time in c for the purposes of real-time numerical integration?I have trying to write c code where some numerical calculations containing time derivatives need to be performed in a real-time dynamic system setting. For this purpose, I need the most accurate time assessment possible from one cycle to the next in a variable called "dt":
+static clock_t prev_time;
+prev_time = clock();
+while(1){
+    clock_t current_time = clock();
+    //do something
+    double dt = (double)(current_time - prev_time)/CLOCKS_PER_SEC;
+prev_time = current_time;
+}
+
+However, when I test this code by integrating (continuously adding) dt, i.e
+static double elapsed_time = 0;
+//the above-mentioned declaration and initialization in done here
+while(1){
+   //the above-mentioned code is executed here
+   elapsed_time += dt;
+   printf("elapsed_time : %lf\n", elapsed_time);
+}
+
+I obtain results that are significantly lower than reality, by a factor that is constant at runtime, but seems to vary when I edit unrelated parts of the code (it ranges between 1/10 and about half the actual time).
+My current guess is that clock() doesn't account for time required for memory access (at several points throughout the code, I open an external textfile and save data in it for diagnosis purposes). 
+But I am not sure if this is the case.
+Also, I couldn't find any other way to accurately measure time.
+Does anyone why this is happening?
+EDIT: the code is compiled and executed on a raspberry pi 3, and is used to implement a feedback controlerUPDATE: As it turns out, clock() is not suitable for real-time numerical calculation, as it only accounts for the time used on the processor. I solved the problem by using the clock_gettime() function defined in <time.h>. This returns the global time with a nanosecond resolution (of course, this comes with a certain error which is dependent on your clock resolution, but is is about the best thing out there).
+The answer was surprisingly hard to find, so thanks to Ian Abbott  for the very useful helpDoes anyone why this is happening?
+
+clock measures CPU time, which is the amount of time slices/clock ticks that the CPU spent on your process. This is useful when you do microbenchmarking as you often don't want to measure time that the CPU actually spent on other processes in a microbenchmark, but it's not useful when you want to measure how much time actually passes between events. 
+Instead, you should use time or gettimeofday to measure wall clock time.How do I use enumerate type structs in C?I am trying to set a Nokia LCD screen to turn all pixels off, all pixels on, inverse mode on and normal mode on, depending on which button the user pushes. I have all the code complete apart for setting the mode of the LCD screen. This is because they are displayed as enumerated type structs and I am not familiar with either concepts. The struct is:
+typedef enum lcd_display_mode_t {
+    lcd_display_all_off = 0b000,
+    lcd_display_all_on  = 0b001,
+    lcd_display_normal  = 0b100,
+    lcd_display_inverse = 0b101,
+} lcd_display_mode_t;
+
+My best guess is that, being a enumerate type, I would simply have to type:
+if SWITCH X IS ON{
+    lcd_display_mode_t = 0;
+}
+
+Which would set the display mode to lcd_display_all_off. Is this the correct use of structs in this context? If not, what would I type to set the display modes?An enum is not a struct. Using enums for storing binary data is a bad idea. One gets all kinds of weird side effects such as the type used being a signed int - which in turn is entirely unsuitable for the kind of hardware-related programming it will be used for. In addition, binary literals are not even standard C.
+Note that the typedef makes lcd_display_mode_t a type, not a variable. Whoever wrote the code was a bit confused, it would be sufficient to just write typedef enum { ... } lcd_display_mode_t;.
+They intended you to use the code like this:
+lcd_display_mode_t mode;
+...
+mode = lcd_display_all_off;Write to file in binary on a microcontrollerI'm using a STM32476 Nucleo board, and right now I write some data from sensors in a readable file, but it's way too slow. To show some code of what I'm doing now:
+static char buffer[LINE_MAX];
+char* p = buffer;
+p += sprintf(p, "%f,%f,%f,", s.ax.val, s.ay.val, s.az.val);
+p += sprintf(p, "%f,%f,%f,", s.gx.val, s.gy.val, s.gz.val);
+p += sprintf(p, " %f"DEGREE_UTF8"C\r\n", s.temperature);
+
+int ret;
+
+unsigned bytes_written=0;
+if ((ret = f_write(&USERFile, buffer, length, &bytes_written)) != FR_OK || bytes_written != length) {
+    hang("write failed: %d (written = %u)", ret, bytes_written);
+}
+
+How could I change this to write in binary instead?In the most simplest form you just dump the data as is:
+float data = ...
+fwrite(&file, &data, sizeof data, &written);
+
+This of course doesn't handle endianness gracefully, and doesn't have any structure (you might want to look at more sophisticated formats for that, like CBOR).
+If I remember correctly, FatFS already does some buffering behind the scenes, but it could also be faster to memcpy all data to temporary buffer first and then write that. You need to experiment, if speed is your top priority.Transform Temperature into Voltage in AVR studioI have to write a program in C, using ATmega 328p, which turns the temperature into voltage.
+So far I have done this:
+#include <avr/io.h>
+unsigned int Ctemp;
+unsigned int Ftemp;
+
+int main(void)
+{
+
+ADMUX = (1<<REFS1) | (1<<REFS0) | (0<<ADLAR) | (1<<MUX3) | (0<<MUX2) | (0<<MUX1) | (0<<MUX0);
+
+ADCSRA = (1<<ADPS2) | (1<<ADPS1) | (1<<ADEN);
+
+ADCSRA |= (1<<ADSC);
+
+while ((ADCSRA & (1<<ADSC)) != 0);
+
+while(1)
+{
+    ADCSRA |= (1<<ADSC);
+
+    while ((ADCSRA & (1<<ADSC)) != 0);
+
+    Ctemp = (ADC - 247)/1.22;
+    Ftemp = (Ctemp * 1.8) + 32;
+}
+
+return 1;
+}
+
+Can you help me to complete the conversion part?At the risk of overstating the obvious, it seems to me that there are two basic operations here:
+1) obtain temperature 
+2) generate an output voltage 
+It appears that the OP isn’t so much hung up on numeric representation as in actually producing an analog voltage that is a function of the temperature acquired in step 1. This isn’t surprising, since most microcontrollers (328P included) don’t have analog outputs. But PWM outputs are available on the 328P, so it’s very common to simply integrate the PWM output so as to get the desired result in Step 2.How to calculate the stack frame in assembly within gdb?I'm trying to explore the debugging of an assembly code (x86, 32bit, C source code). 
+I would like to understand how can I calculate the actual size of the stack frame of particular function in my assembly code, while using the gdb. 
+Is the size of the frame, the absolute difference between the %esp and %ebp, summed with every value that affects on the %esp, before everything is poped up?
+pushl   %ebp
+movl    %esp, %ebp
+subl    $24, %esp
+subl    $48, 8(%ebp)
+
+Software: GNU gdb (Debian 7.12-6) 7.12.0.20161007-git
+gcc -m32 -fno-asynchronous-unwind-tables -fno-pic -S main.c
+gcc -c -m32 main.s -o main.out
+gcc -g -m32 main.s -o main.out
+gcc -m32 -g -o main main.s
+as -a main.s
+
+I would be thankful, if someone can help me.In an ideal world, the local variables will be located with a constant offset from the EBP, so you could figure out the size of the stack frame. However, the compiler and optimisations are too important, and one of the scenarios could be that EBP is used as GPR (Trying to understand gcc option -fomit-frame-pointer). Could be a static analysis a nice solution?No you can't.
+A stack frame extends from the point where the first parameter is pushed onto the stack up to the last modification of the stack due to any action or instruction. I.e. allocating space for a dynamic variable using alloca() or pushing a register, or simply storing a register in preallocated stack position. 
+Actual compiler technology is so advanced that even the standard functions prologues and epilogues can be modified for the most aggressive optimization, making even more complex the frame unwinding.
+Acting only on the base frame, that in the case of a 32bits X86 code corresponds to the value stored in the %ebp register, isn't enough.
+Most recent evolution, as also @Jester said, demonstrated that even %ebp isn't necessary for exceptions stack unwind, and aggressive optimization switches in compilers, as -fomit-frame-pointer in GCC, doesn't save it on stack anymore (see libunwind below).
+To access the previous frame, starting from the base frame address hold in %ebp, you need the stack width of the stack frame for the relative function, inclusive of all stack operations.
+This information is normally stored in a specific section of the executable, generally using a list of records about stack operations. The sections are:
+
+.pdata for Microsoft PE executables
+.eh_frame and .eh_frame_hdr for ELF format (Linux).
+
+Depending on which OS you want to work on you can get more info starting from https://www-user.tu-chemnitz.de/~heha/viewchm.php/hs/Win32SEH.chm/Win32SEH.htm for Microsoft executables.
+For Linux based system you can start to look here https://gnu.wildebeest.org/blog/mjw/2007/08/23/stack-unwinding/ and eventually have an in deep reading about the DWARF debugger http://wiki.dwarfstd.org/index.php?title=Special:SpecialPages, and the https://www.nongnu.org/libunwind/ for a technically detailed immersion.How to append elements without overwriting in struct in cI'm trying to call rrandom to choose one random id and name and put it in buff struct, and second time calling rrandom to choose new random value and putting it also in buff struct as a second item. 
+How can assign the second value to buff struct without deleting the first item ?
+#include <stdio.h>    
+#include <stdlib.h>   
+#include <string.h>  
+#define size 4
+
+typedef struct Org                  
+{
+   int  id[4]; 
+   char name[4][7];  
+}org;
+
+void rrandom(org select[size], ???){
+int i,j,r=0;
+for (i=0; i<1;i++){
+   r = (rand() % (4 - 0)) + 0;
+  for( j=0;j<4;j++){ 
+    buf[i].id[j]= select[r].id[j] ;
+    strcpy(buf[i].name[j], select[r].name[j]);
+
+  }}
+for ( int i=0; i<2 ;i++){
+
+   for(int j=0;j<4;j++){ 
+   printf("bname %s  bid = %d \n", buf[i].name[j], buf[i].id[j]);
+
+ }}
+}
+void main(  )
+{
+int i,j;
+
+org select[size]; 
+org buf[2];
+
+sprintf(select[0].name[0],"1ello1");
+sprintf(select[0].name[1],"1ello2");
+sprintf(select[0].name[2],"1ello3");
+sprintf(select[0].name[3],"1ello4");
+sprintf(select[1].name[0],"2ello1");
+sprintf(select[1].name[1],"2ello2");
+sprintf(select[1].name[2],"2ello3");
+sprintf(select[1].name[3],"2ello4");
+sprintf(select[2].name[0],"3ello1");
+sprintf(select[2].name[1],"3ello2");
+sprintf(select[2].name[2],"3ello3");
+sprintf(select[2].name[3],"3ello4");
+sprintf(select[3].name[0],"4ello1");
+sprintf(select[3].name[1],"4ello2");
+sprintf(select[3].name[2],"4ello3");
+sprintf(select[3].name[3],"4ello4");
+sprintf(select[4].name[0],"5ello1");
+sprintf(select[4].name[1],"5ello2");
+sprintf(select[4].name[2],"5ello3");
+sprintf(select[4].name[3],"5ello4");
+printf(" Initial id :\n");
+for(i=0;i<4 ;i++)                         
+{
+    for(j=0;j< 4;j++)                       
+    { 
+         select[i].id[j]= j;        
+}    }
+rrandom(select,???);
+rrandom(select,???);
+for ( int i=0; i<2 ;i++){   
+   for(int j=0;j<4;j++){ 
+   printf("from main bname %s  bid = %d ", buf[i].name[j], 
+    buf[i].id[j]);}
+    printf("\n\n");
+ } 
+}You should pass the address of the resulting struct in rrandom:
+void rrandom(org select[size], struct buff &bf){
+  int j,r=0;
+  r = (rand() % (4 - 0)) + 0;
+  for( j=0;j<4;j++){ 
+    bf->bid[j]= select[r].id[j] ;
+    strcpy(bf->bname[j], select[r].name[j]);
+  }
+  for(int j=0;j<4;j++){ 
+    printf("bname %s  bid = %d \n", bf->bname[j], bf->bid[j]);
+  }
+}
+
+You can then use it in your main by replacing your rresult calls with:
+rrandom(select, buf);
+rrandom(select, buf + 1);Extract data from the frame using CI have a function as follows:
+union u_t
+{
+  uint16_t u16;
+  uint8_t u8[2];
+};
+
+uint16_t Frame2Data(uint8_t *data,uint8_t startBit,uint16_t length)
+{
+  uint16_t mask;
+  uint8_t start;
+  uint8_t firstByte,offset;
+  uint8_t numShift;
+  union u_t ut;
+
+  for(i=0;i<16;i++)
+  {
+    if(length == i)
+    mask|=(1<<i);
+  }
+
+  firstByte = startBit / 8;
+  offset = (firstByte+2) * 8;
+  start = startBit + length;
+  numShift = offset - start;
+  ut.u8[1] = data[firstByte];
+  ut.u8[0] = data[firstByte+1];
+  return (ut.u16 >> numShift) & mask;
+}
+
+The start bit is 46 and length is 7 and the data in 8 bytes is 0x00 0x09 0x03 0x84 0x03 0x70 0x02 0xA8 has to be passed. I have to extract the data with start bit 46 and upto a length of 7 bits and find out its value. I have a doubt with numbershift and is my function working correctly? It would be great if someone confirms this.Thanks in advance.Your problem here, is the way in which you set your mask:
+for(i=0;i<16;i++)
+{
+    if(length == i)
+    mask|=(1<<i); /* BTW, mask is not initialized */
+}
+
+is simply equivalent to:
+mask |= (1 << length);
+
+which will set only one bit in you mask. So either you substruct one from mask after the for, or you set it directly:
+#define UINT16_WIDTH 16
+mask = (1u << (length & (UINT16_WIDTH - 1))) - 1u;
