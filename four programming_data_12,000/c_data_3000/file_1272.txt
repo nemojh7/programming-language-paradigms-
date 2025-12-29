@@ -1,0 +1,3081 @@
+C issue: Program terminates itself#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+
+char choice;
+struct {
+    char name[20];
+    int rn;
+}read,write;
+
+void wr(){
+    FILE *fp;
+    fp = fopen("record.txt","a+");
+    printf("Enter Your Name: ");
+    scanf("%s",write.name);
+    printf("Enter Your Roll Number: ");
+    scanf("%d",&write.rn);
+
+    fprintf(fp,"%s\t%d",write.name,write.rn);
+
+    fclose(fp);
+
+    menu();
+}
+void rd(){
+    FILE *fp;
+    fp = fopen("record.txt","r");
+    while(fscanf(fp,"%s %d",read.name,&read.rn)!= EOF){
+        printf("%s\t%d\n",read.name,read.rn);
+    }
+
+    fclose(fp);
+    getche();
+    menu();
+}
+
+void menu(){
+    system("cls");
+    printf("Do you want to read/write/exit the data R/W/E: ");
+    scanf("%c",&choice);
+    tolower(choice);
+
+    if(choice == 'w'){
+        wr();
+    }
+    else if(choice == 'r'){
+        rd();
+    }
+    else if(choice == 'e'){
+        exit(1);
+    }
+}
+
+int main() {
+
+    menu();
+    getche();
+    system("cls");
+    return 0;
+}
+
+I want to terminate it when user enters 'e' but it terminates after every information entry as well as I read data. 
+Means after every time read or write function works and the program should ask again about the choice it terminates.You need to use a for or a while loop like so:
+int main() 
+{
+while(1) // while true
+{
+    menu();
+    getche();
+    system("cls");
+}
+return 0;
+}
+
+You are already calling exit(1) in your else if of menu(), so add the while(true) and it will work as you want it to.fgets(), signals (EINTR) and input data integrityfgets() was intended for reading some string until EOF or \n occurred. It is very handy for reading text config files, for example, but there are some problems.
+First, it may return EINTR in case of signal delivery, so it should be wrapped with loop checking for that.
+Second problem is much worse: at least in glibc, it will return EINTR and loss all already read data in case it delivered in middle. This is very unlikely to happen, but I think this may be source of some complicated vulnerabilities in some daemons.
+Setting SA_RESTART flag on signals seems to help avoiding this problem but I'm not sure it covers ALL possible cases on all platforms. Is it?
+If no, is there a way to avoid the problem at all?
+If no, it seems that fgets() is not usable for reading files in daemons because it may lead to random data loss.
+Example code for tests:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+
+static  char buf[1000000];
+static volatile int do_exit = 0;
+static void int_sig_handle(int signum) { do_exit = 1; }
+
+void try(void) {
+  char * r;
+  int err1, err2;
+  size_t len;
+
+  memset(buf,1,20); buf[20]=0;
+  r = fgets(buf, sizeof(buf), stdin);
+  if(!r) {
+    err1 = errno;
+    err2 = ferror(stdin);
+    printf("\n\nfgets()=NULL, errno=%d(%s), ferror()=%d\n", err1, strerror(err1), err2);
+    len = strlen(buf);
+    printf("strlen()=%u, buf=[[[%s]]]\n", (unsigned)len, buf);
+  } else if(r==buf) {
+    err1 = errno;
+    err2 = ferror(stdin);
+    len = strlen(buf);
+    if(!len) {
+      printf("\n\nfgets()=buf, strlen()=0, errno=%d(%s), ferror()=%d\n", err1, strerror(err1), err2);
+    } else {
+      printf("\n\nfgets()=buf, strlen()=%u, [len-1]=0x%02X, errno=%d(%s), ferror()=%d\n",
+        (unsigned)len, (unsigned char)(buf[len-1]), err1, strerror(err1), err2);
+    }
+  } else {
+    printf("\n\nerr\n");
+  }
+}
+
+int main(int argc, char * * argv) {
+  struct sigaction sa;
+  sa.sa_flags = 0; sigemptyset(&sa.sa_mask); sa.sa_handler = int_sig_handle;
+  sigaction(SIGINT, &sa, NULL);
+
+  printf("attempt 1\n");
+  try();
+  printf("\nattempt 2\n");
+  try();
+  printf("\nend\n");
+  return 0;
+}
+
+This code can be used to test signal delivery in middle of "attempt 1" and ensure that its partially read data become completely lost after that.
+How to test:
+
+run program with strace
+enter some line (do not press Enter), press Ctrl+D, see read() syscall completed with some data
+send SIGINT
+see fread() returned NULL, "attempt 2" and enter some data and press Enter
+it will print second entered data but will not print first anywhere
+
+FreeBSD 11 libc: same behaviour
+FreeBSD 8 libc: first attempt returns partially read data and sets ferror() and errno
+EDIT: according with @John Bollinger recommendations I've added dumping of the buffer after NULL return. Results:
+glibc and FreeBSD 11 libc: buffer contains that partially read data but NOT NULL-TERM so the only way to get its length is to clear entire buffer before calling fgets() which looks not like intended use
+FreeBSD 8 libc: still returns properly null-terminated partially-read datastdio is indeed not reasonably usable with interrupting signal handlers.
+Per ISO C 11 7.21.7.2 The fgets function, paragraph 3:
+
+The fgets function returns s if successful. If end-of-file is encountered and no characters have been read into the array, the contents of the array remain unchanged and a null pointer is returned. If a read error occurs during the operation, the array contents are indeterminate and a null pointer is returned.
+
+EINTR is a read error, so the array contents are indeterminate after such a return.
+Theoretically, the behavior could be specified for fgets in a way that you could meaningfully recover from an error in the middle of the operation by setting up the buffer appropriately before the call, since you know that fgets does not write '\n' except as the final character before null termination (similar to techniques for using fgets with embedded NULs). However, it's not specified that way, and there would be no analogous way to handle other stdio functions like scanf, which have nowhere to store state for resuming them after EINTR.
+Really, signals are just a really backwards way of doing things, and interrupting signals are an even more backwards tool full of race conditions and other unpleasant and unfixable corner cases. If you want to do this kind of thing in a safe and modern way, you probably need to have a thread that forwards stdin through a pipe or socket, and close the writing end of the pipe or socket in the signal handler so that the main part of your program reading from it gets EOF.First, it may return EINTR in case of signal delivery, so it should be
+  wrapped with loop checking for that.
+
+Of course you mean that fgets() will return NULL and set errno to EINTR.  Yes, this is a possibility, and not only for fgets(), or even for stdio functions generally -- a wide variety of functions from the I/O realm and others may exhibit this behavior.  Most POSIX functions that may block on events external to the program can fail with EINTR and various function-specific associated behaviors.  It's a characteristic of the programming and operational environment.
+
+Second problem is much worse: at least in glibc, it will return EINTR
+  and loss all already read data in case it delivered in middle. This is
+  very unlikely to happen, but I think this may be source of some
+  complicated vulnerabilities in some daemons.
+
+No, at least not in my tests.  It is your test program that loses data.  When fgets() returns NULL to signal an error, that does not imply that it has not transferred any data to the buffer, and if I modify your program to print the buffer after an EINTR is signaled then I indeed see that the data from attempt 1 have been transferred there.  But the program ignores that data.
+Now it is possible that other programs make the same mistake that yours does, and therefore lose data, but that is not because of a flaw in the implementation of fgets().
+
+FreeBSD 8 libc: first attempt returns partially read data and sets ferror() and errno
+
+I'm inclined to think that this behavior is flawed -- if the function returns before reaching end of line / file then it should signal an error by providing a NULL return value.  It may, but is not obligated to, transfer some or all of the data read to that point to the user-provided buffer.  (But if it doesn't transfer data then they should remain available to be read.)  I also find it surprising that the function sets the file's error flag at all.  I'm inclined to think that erroneous, but I'm not prepared to present an argument for that at the moment.How to deal with single line wrapped into multiple lines in gdb?For example, 
+int main()
+{
+        int aa = 1, bb =2, cc = 3;
+        int dd = ( (aa + 3 - 1)
+                 / bb)
+                 << cc;                                                                                                          
+        printf("%d\n", dd);
+        return 1;
+}
+
+So I break int dd line to multiple lines just to demonstrate.
+Then I use gdb to debug. 
+Breakpoint 1, main () at a.c:25
+25              int aa = 1, bb =2, cc = 3;
+(gdb) n
+26              int dd = ( (aa + 3 - 1)
+(gdb) n
+27                       / bb)
+(gdb) n
+26              int dd = ( (aa + 3 - 1)
+(gdb) n
+29              printf("%d\n", dd);
+(gdb) n
+8
+30              return 1;
+
+As you can see int dd shown multiple times and << cc does not show.
+How to avoid this? For example when I type n and enter, gdb show the complete int dd line once, and when I type n again, gdb goes to next line?There is nothing you can do from within GDB because it merely follows the debugging information produced by the compiler. You can see the assembly output with gcc -g -S -fverbose-asm -fno-dwarf2-cfi-asm -o - main.c. Thanks to the annotations you should be able to get the gist of it even if you don't know assembly.
+Here is an excerpt:
+# main.c:4:         int dd = ( (aa + 3 - 1)
+    movl    -4(%rbp), %eax  # aa, tmp91
+    addl    $2, %eax    #, _1
+# main.c:5:                  / bb)
+    cltd
+    idivl   -8(%rbp)    # bb
+    movl    %eax, %edx  # tmp92, _2
+# main.c:4:         int dd = ( (aa + 3 - 1)
+    movl    -12(%rbp), %eax # cc, tmp94
+    movl    %eax, %ecx  # tmp94, tmp99
+    sall    %cl, %edx   # tmp99, _2
+    movl    %edx, %eax  # _2, tmp95
+    movl    %eax, -16(%rbp) # tmp95, dd
+
+The last block is equivalent to
+int dd = _2 << cc;
+
+Since the result of an operation has to be stored somewhere the shift and assignment are not split. The reference is to the line containing the assignment.
+You should rewrite the code to have one operation per statement:
+int t1 = (aa + 3 - 1);
+int t2 = t1 / bb;
+int dd = t2 << cc;
+
+Here is the corresponding assembly:
+# main.c:4:     int t1 = (aa + 3 - 1);
+    movl    -4(%rbp), %eax  # aa, tmp92
+    addl    $2, %eax    #, tmp91
+    movl    %eax, -16(%rbp) # tmp91, t1
+# main.c:5:     int t2 = t1 / bb;
+    movl    -16(%rbp), %eax # t1, tmp96
+    cltd
+    idivl   -8(%rbp)    # bb
+    movl    %eax, -20(%rbp) # tmp94, t2
+# main.c:6:     int dd = t2 << cc;
+    movl    -12(%rbp), %eax # cc, tmp100
+    movl    -20(%rbp), %edx # t2, tmp102
+    movl    %eax, %ecx  # tmp100, tmp106
+    sall    %cl, %edx   # tmp106, tmp102
+    movl    %edx, %eax  # tmp102, tmp101
+    movl    %eax, -24(%rbp) # tmp101, dd
+
+It is essentially the same as before but now the blocks match the statements perfectly. You can't control the compiler's output but it will try to preserve the boundaries between statements, so that is your best option.Linux bare system calls, not glibcI'm reading an article that explains how to call bare syscalls without passing through glibc. To call chmod and exit, use:
+#include <linux/unistd.h>
+_syscall2(int,chmod,char*,f,int,m)
+_syscall1(int,exit,int,r)
+
+My gcc complains about them. What are their use, how do they work?
+$ gcc --version
+gcc (Ubuntu 7.4.0-1ubuntu1~18.04) 7.4.0
+$ gcc e.c 
+e.c:2:15: error: unknown type name ‘setresuid’; did you mean ‘__NR_setresuid’?
+ _syscall3(int,setresuid,int,r,int,e,int,s)
+               ^~~~~~~~~
+               __NR_setresuid
+e.c:2:29: error: unknown type name ‘r’
+ _syscall3(int,setresuid,int,r,int,e,int,s)
+                             ^
+e.c:2:35: error: unknown type name ‘e’
+ _syscall3(int,setresuid,int,r,int,e,int,s)
+                                   ^
+e.c:2:41: error: unknown type name ‘s’
+ _syscall3(int,setresuid,int,r,int,e,int,s)
+                                         ^Your article is probably obsolete.
+If you code in C, there is no reason to avoid using the syscalls(2) (notice the plural) as documented. Be also aware of the vdso(7). You could use some other C standard library than the glibc  (e.g. musl-libc, dietlibc, etc...) and you might (but that is not recommended) statically link it.
+You might use syscall(2) (notice the singular) instead. I see no reason to do that, e.g. use read(2) or mmap(2) without syscall.
+The Assembly HowTo might be an interesting read (beware, it might be too 32 bits centric, most Linux PCs today are 64 bits x86-64).
+See also osdev.org
+BTW, some old Unixes (e.g. Solaris) had a libsys providing just the syscalls, and their libc linked to it. I would like a libsys too! But on current Linux systems, it does not really matter, since almost every process (running some dynamically linked ELF executable) is mmap(2)-ing, after ld-linux.so(8), several segments and sections of your libc.so.6; for details, read Drepper's How to write a shared library (since it also explains in details how shared libraries actually work). Use also pmap(1) on some running process (e.g. pmap $$ in a shell).
+Some rare syscalls (e.g. userfaultfd(2) today 2Q2019) are not known by the glibc. They are an exception, because most system calls are wrapped by your libc (the wrapping usually just deals with errno(3) setting on failure). Be aware of strace(1).
+And you also should read Operating Systems: Three Easy Pieces (it is a freely downloadable book, explaining the role of, and reason for, system calls)Concurrency issue (Deadlock?)I have one server and multiple clients. The server uses the first function through it's main function, and the clients call the second function through a thread (one client uses one thread to read in an infinite loop). 
+This is for a school assignment, the final purpose is to pass on the gameData struct through shared memory, to recreate the Arkanoid Game
+BOOL EmitBroadcast(JOGO * structure) {//called by the server
+    WaitForSingleObject(hMutexServer, WAIT_ABANDONED);
+    structure->numPlayersAtivosAux = structure->numPlayersAtivos;
+
+    memcpy(pBufGameData, structure, sizeof(JOGO));
+
+    ReleaseMutex(hMutexServer);
+    SetEvent(hServerHasWritten);
+
+    return TRUE;
+}
+
+JOGO ReceiveBroadcast(JOGO * structure) {//used by the client's thread in loop
+    //R/W de Michel Raynal 
+    WaitForSingleObject(hServerHasWritten, INFINITE);
+    WaitForSingleObject(hMutexCliente, INFINITE);//lock r
+
+    structure= &(*pBufGameData);
+
+    if (structure->numPlayersAtivosAux == structure->numPlayersAtivos) {
+        WaitForSingleObject(hMutexServer, INFINITE);//lock g
+    }
+
+    structure= pBufGameData;
+
+    (structure->numPlayersAtivosAux)--;
+    memcpy(pBufGameData, structure, sizeof(JOGO));
+
+    if (structure->numPlayersAtivosAux == 0) {
+        ReleaseMutex(hMutexServer);//unlock g
+        ResetEvent(hServerHasWritten);
+    }
+
+    ReleaseMutex(hMutexCliente);//unlock r
+
+    return * structure;
+}
+
+void receiveLoop(LPVOID lParam) {//client thread loop function
+    JOGO * gameInfoIn = (JOGO *)lParam;
+
+    do {
+        *gameInfoIn = ReceiveBroadcast(gameInfoIn);
+        _tprintf(TEXT("\n%d"), gameInfoIn->vidas);
+
+        Sleep(300);//testing purposes
+    } while (closeThreadReceiveLoop || gameInfoIn->vidas != 0);
+}
+
+When I open more than one client and the server, after 1 successful read of each client, the server sends correctly and one client locks in the WaitForSingleObject(hMutexServer, INFINITE); line. Expected result is multiple successful reads.Ok, so as pointed out by  Michael Chourdakis  in the comments, I had a wrongful parameter in the WaitForSingleObject function. I worked this around by adding an event to the first client that blocks the serverMutex. 
+That makes the first client thread wait for the remaining client threads to finish. The last client thread triggers the event and the first client is able to terminate and release the server mutex lock. 
+Thanks for the comments  Michael Chourdakis and OznOg.invalid read of size 8 only when rehashing hash table in cThe invalid read occurs in my HTSize function in the code but it also happens in other functions.The issue occurs only when the hash table gets rehashed.It propably has to do with my HTCreate function but Im not really sure.
+I ' ve tried using malloc and calloc but nothing works out.
+typedef char* KeyType;
+typedef int HTItem;
+typedef struct node{
+    KeyType key;
+    HTItem item;
+    struct node *next;
+}List;
+typedef struct {
+    List *head;
+}TableEntry;
+typedef TableEntry *HTHash;
+
+
+int TABLESIZE = 10;
+
+HTHash HTCreate(void)
+{
+//malloc
+//      int i;
+//      HTHash table = (HTHash)malloc(TABLESIZE*sizeof(TableEntry));
+//      for(i=0;i<TABLESIZE;i++)
+//          table[i].head = NULL;
+//      return table;
+//calloc    
+        return calloc(TABLESIZE, sizeof(TableEntry));
+}
+
+int HTSize(HTHash hash)
+{
+    int i,count=0;
+    List *temp; 
+    for(i=0;i<TABLESIZE;i++)
+    {
+        if(hash[i].head != NULL)
+        {
+            count++;
+            temp = hash[i].head->next;
+            while(temp != NULL)
+           {
+                count++;
+                temp = temp->next;
+           }
+        }   
+    }
+    return count;   
+}
+
+void HTInsert(HTHash hash, KeyType key, HTItem item)
+{
+    float a = 0.0;
+    int index = h(key);
+    int i;
+    List *NewNode = (List*)malloc(sizeof(List));
+    NewNode->key = key;
+    NewNode->item = item;
+    NewNode->next = NULL;
+    if(hash[index].head == NULL)
+        hash[index].head = NewNode;
+    else
+    {
+        if(!strcmp(hash[index].head->key,key))
+            hash[index].head->item = item;
+        else
+        {
+            while(hash[index].head->next != NULL)
+            {
+                if(!strcmp(hash[index].head->next->key,key))
+                {
+                    hash[index].head->next->item = 
+item;
+                    break;
+                }
+                hash[index].head->next = hash[index].head- 
+>next->next;
+            }
+            if(hash[index].head->next == NULL)
+                hash[index].head->next = NewNode;
+        }
+    }
+    a = (1.0 * HTSize(hash))/ TABLESIZE;
+    if(a>=0.9)
+    {
+        printf("hash table is rehashing!\n");
+        HTRehash(hash); 
+    }
+}
+
+void HTRehash(HTHash hash)
+{
+    int i;
+    HTHash temp = hash;
+    int n = TABLESIZE;
+    TABLESIZE = 2 * TABLESIZE;
+    hash = HTCreate();
+    for(i=0;i<n;i++)
+    {
+        List* list = temp[i].head;
+        while(list!=NULL)
+        {
+            HTInsert(hash,list->key,list->item);
+            list = list->next;
+        }
+    }
+}
+
+In HTSize running it with valgrind it gives me the "invalid read of size 8" 3 times.Your problem seems to be that you call HTRehash with a single pointer. Then you reallocate the hash table, but now you cannot return this new memory.
+You must either call it with a double pointer, so the new memory will be available to the caller, or you must return the new pointer. The latter is more simple, in outline:
+HTHash HTRehash(HTHash hash)
+{
+    //...
+    hash = HTCreate();
+    //...
+    return hash;
+}
+
+I also note that you do not release the old hash table.How do I make a function in C for checking if two matrices are same dimensionsI need a function that I could use to check if I could multiply two matrices.
+In it, I should check if the matrices are the same dimension, if not function returns -1, else returns 1. Later, function below multiplies matrices and returns **matrix previously declared.
+//function prototype
+double** matrixMultiply(double** M1, int r1, int c1, double** M2, int r2, int c2);
+
+//I need to check if M1 and M2 have the same number of rows and cols, but I dont know how
+double** matrixElementwiseMultiply(double** M1, double** M2, int rows, int columns)
+Error message should be -1, else the function should carry on. I would use a flag.Thanks, it works now. Checking wheather or not the matrices were same dimension (meaning that matrix 1 dimensions x*y is the same dimension of matrix 2) wasn't actually being tested in the program, and I all had to check is if the number of columns in matrix one is equal to number of rows in matrix two (if c1==r2).Mysql C API: Commands out of sync; you can't run this command nowI use the C api  mysql, however, I encounter an error when I am connected to the database, and I chose the selected item.
+"Commands out of sync; you can't run this command now"
+boolean
+check_token(char *token) {
+    MYSQL_RES   *res;
+    MYSQL_ROW   row;
+    char        *pass;
+    char        query[200];
+
+    snprintf(query, 200, "SELECT * FROM tokens WHERE token = \"%s\"", token); //  SELECT * FROM tokens WHERE token = "84ds4d3d3sd453s"
+    if (mysql_query(&db, query)) {
+        fprintf(stderr, "%s\n", mysql_error(&db));
+        return (FALSE);
+    }
+    printf("OK\n");
+    if (!(res = mysql_store_result(&db))) {
+        fprintf(stderr, "%s\n", mysql_error(&db));
+        return (FALSE);
+    }
+    if (!(row = mysql_fetch_row(res)))
+        return (FALSE);
+    pass = row[1];
+    printf("Le token est %s\n", pass);
+    mysql_free_result(res);
+    return (TRUE);
+}
+
+No further requests are made just before. Just the connection to the database that is successful.There is a chance that you will not free the MYSQL_RES if mysql_fetch_row call fails, making next subsequent calls fail.
+free the result before returning from the function.
+if (!(row = mysql_fetch_row(res)))
+{
+    mysql_free_result(res); //Free before returning
+    return (FALSE);
+}
+
+pass = row[1];
+printf("Le token est %s\n", pass);
+mysql_free_result(res);
+return (TRUE);FreeRTOS starvation and time slicingI got problem with running FreeRTOS on cortex m4 processor. I got 3 tasks: periodic and 2 continous.
+static const char text1[] = "Periodic task\r\n";
+static const char text2[] = "Continous Task\r\n";
+static const char text3[] = "Continous Task 2\r\n";
+
+void periodicTask(void *pvParameter)
+{
+    TickType_t prevCount;
+    char *printText = (char*)pvParameter;
+
+    prevCount= xTaskGetTickCount();
+
+    for(;;)
+    {
+        printf(printText);
+
+        vTaskDelayUntil(&prevCount,pdMS_TO_TICKS(5));
+    }
+}
+
+void continousTask(void *pvParameter)
+{
+    char *printText = (char*)pvParameter;
+
+    for(;;)
+    {
+        printf(printText);
+        vTaskDelay(1);
+    }
+}
+
+int main(void) 
+{
+
+    xTaskCreate(periodicTask,"periodic task",200,(void*)text1,3,NULL);
+    xTaskCreate(continousTask,"continous task 1",200,(void*)text2,0,NULL);
+    //xTaskCreate(continousTask,"continous task 2",200,(void*)text3,0,NULL);
+
+
+    vTaskStartScheduler();
+
+    while(1)
+    {
+
+    }
+    return 0 ;
+}
+
+Above code is running just fine but only if i got vTaskDelay(1) in continousTask if i remove it my continous task 2 and periodic task will starve(or run not on desired period) which shouldn't take place because periodic task is higher priority. Continous task 2 also shouldn't starve because i got configUSE_TIME_SLICING 1 defined.Most likely cause would be the print statements.  How are they implemented?  If they use semihosting then the scheduler is not going to work properly as there will be hardware conflicts.  If they are not using semihosting then make sure they are blocking writes (by which I mean the task performing the write enters the blocked state, so not using any cpu time and allows the other task to run, while the IO is actually performed).  The free book (https://www.freertos.org/Documentation/RTOS_book.html ) has more on the perils of using printf().How to fix ‘memory leak’ in CI'm writing a C program a dynamically allocated
+Can someone please explain how to fix this memory leak in "goto"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+
+int main()
+{
+    printf("start main\n");
+    char *f = NULL;
+    L1:
+        f = (char *)malloc(10);
+        if (f == NULL)
+            return -1;
+        printf("body lebel\n");
+        f = "A";
+        if (f == "B") {
+            free(f);
+            goto L1;
+        }
+
+      return 0;
+
+ return 0;
+} 
+
+valgrind --leak-check=full ./a.out, 
+Output:
+==7217== HEAP SUMMARY:
+==7217==     in use at exit: 10 bytes in 1 blocks
+==7217==   total heap usage: 2 allocs, 1 frees, 1,034 bytes 
+allocatedFirst
+f = "A";
+
+assigns the char pointer f to point to "A", which is a const char* that lives somewhere in the process image.  This completely orphans the memory you allocated with malloc.  To copy the string "A" to the memory that f points to, you need to write something like
+strcpy(f, "A");
+
+or
+strncpy(f, "A", 10);
+
+with the caveat that strcpy might overrun the buffer you have allocated for f and strncpy might leave it non-null-terminated.
+Second, you only free f inside of the if statement before you jump to L1.  To free f before the program exits as well, you also have to write free(f) before return 0.
+Third, f == "B" checks whether f points to the const char* value "B", not whether its contents are the same as "B".  In your program, this is always false since you assign it to "A" just before you compare it.  You need to use function like strcmp for null-terminated strings or memcmp for possibly non-null-terminated strings.
+It would also be possible to move the first free to the beginning of the label, so that you don't have to make sure that you free it before jumping, since free(NULL) does not do anything.  Also in the interest of posterity you should declare "A" and "B" as variables and move the constant 10 into a variable as well to help prevent memory violations in the future:
+int main()
+{
+    const char a_str[] = "A";
+    const char b_str[] = "B";
+    size_t buffer_size = 10;
+    printf("start main\n");
+    char *f = NULL;
+    L1:
+        free(f);
+        f = (char *)malloc(buffer_size);
+        if (f == NULL)
+            return -1;
+        printf("body lebel\n");
+        if (buffer_size < sizeof(a_str)) {
+            printf("Buffer too small for %s\n", a_str);
+            exit(1);
+        }
+        memcpy(f, a_str, sizeof(a_str));
+        if (buffer_size < sizeof(b_str)) {
+            printf("Buffer too small for comparison with %s\n", b_str);
+            exit(1);
+        }
+        if (!memcmp(f, b_str, sizeof(b_str)) {
+            goto L1;
+        }
+    free(f);
+
+    return 0;
+}Unexpected result when changing location of retuurn#include <stdio.h>
+
+int* plusOne(int* digits, int digitsSize, int* returnSize){
+    int* result=0;
+
+    if (digits[digitsSize-1]<9){
+        *returnSize=digitsSize;
+        int* result = (int *)malloc(*returnSize*(sizeof(int)));
+        memcpy( result, digits, *returnSize*(sizeof(int)) );
+        result[digitsSize-1]= (result[digitsSize-1])+1;
+    }
+
+    return result;
+
+}
+
+int main()
+{
+    int array[3]={1,2,3};
+    int* resultSize= malloc(sizeof(int));
+    int* result = plusOne(&array,3,resultSize);
+    printf("%i",result[2]);
+
+    return 0;
+}
+
+The code above segfaults at printf("%i",result[2]); because result for some reason is 0... However when I put the return result; within the if statement then the code works as expected.
+Why is this the case? The if would be evaluated and the return would be same regardless in this situation. Is it compiler optimization? (It just skips the if statement?)There are two objects with the identifier result in your function plusOne().
+int* plusOne(int* digits, int digitsSize, int* returnSize){
+    int* result=0;
+    //   ^^^^^^
+    if (digits[digitsSize-1]<9){
+        *returnSize=digitsSize;
+        int* result = (int *)malloc(*returnSize*(sizeof(int)));
+        //   ^^^^^^ inner result
+        memcpy( result, digits, *returnSize*(sizeof(int)) );
+        result[digitsSize-1]= (result[digitsSize-1])+1;
+    }
+    return result;
+}
+
+When you return from inside the if you return the inner result; otherwise you return the outer one.
+Hint: your compiler can warn you about shadowing.How can I use two random numbers generated in a function as matrix coordinates?I came up with this function to generate two random numbers, r and c, so that I can use them in as coordinates in matrix board[r][c]. Is this even possible?
+int coordAleatoria()
+{
+    srand((unsigned int)time(0));
+    int r=rand()%9;
+    int c=rand()%9;
+    while(r==c)
+    {
+        c=rand()%9;
+    }
+    printf("%d %d", r, c);
+    return r;
+    return c;
+}
+
+This is for a chess-like game. The PC is supposed to generate random moves. This function does generate coordinates, I'm just not sure how to make my program treat them as coordinates.
+I hope I can get r and c in board[r][c] to be the values generated in coordAleatoria().You cannot return more than one time. So you can combine the coordinates using structure as Jabberwocky suggested in the comment. If you are still finding it difficult than here is the implementation.
+#include<stdio.h>
+#include<stdlib.h>//for rand()
+#include<time.h>//for time()
+struct Pair
+{
+    int row,col;
+};
+struct Pair coordAleatoria()
+{
+    int r=rand()%9;
+    int c=rand()%9;
+    while(r==c)
+    {
+        c=rand()%9;
+    }
+    printf("Inside function: row=%d and col=%d\n",r,c);
+    //Create a pair
+    struct Pair p;
+    //Assign values
+    p.row=r,p.col=c;
+    //return it
+    return p;
+}
+int main()
+{
+    srand((unsigned int)time(0));
+    //Get the returned value as a Pair
+    struct Pair p=coordAleatoria();
+    //Collect the row and column values
+    int r=p.row;
+    int c=p.col;
+    //Now you can use them here
+    printf("Outside function: row=%d and col=%d\n",r,c);
+}rand()%9 generates 9 different values.  With while(r==c), looks like code is looking for 9*(9-1) or 72 different pairs.  For a speedier approach, call rand() once.
+Code could return a single int and later divine/mod by 9 to recover the row/column.
+srand((unsigned int)time(0)); should not be repeated  called in coordAleatoria().  Call it once, perhaps in main().
+
+
+int coordAleatoria(void) {
+  int rc = rand()%72;
+  int r = rc/9;
+  int c = rc%9;
+  if (r==c) r++;
+  return (r*9) + c;
+}Rather than calling rand() twice (after properly seeding the random number generator with a call to srand()), you can simply call rand() once and take the first two digits as your coordinates, e.g.
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+typedef struct {
+    int x, y;
+} pair_t;
+
+void rand_coords (pair_t *coords)
+{
+    int n = rand();
+
+    coords->x = n % 10;
+    n /= 10;
+    coords->y = n % 10;
+}
+
+int main (void) {
+
+    pair_t coords = { .x = 0 };
+
+    srand (time (NULL));         /* seed random number generator */
+
+    rand_coords (&coords);
+
+    printf ("coords.x : %d\ncoords.y : %d\n", coords.x, coords.y);
+
+    return 0;
+}
+
+(or take the modulo of whatever your actual coordinate range is)
+Example Use/Output
+$ ./bin/coords_rand
+coords.x : 9
+coords.y : 8
+
+$ ./bin/coords_rand
+coords.x : 1
+coords.y : 1
+
+$ ./bin/coords_rand
+coords.x : 5
+coords.y : 7
+
+$ ./bin/coords_rand
+coords.x : 8
+coords.y : 0Return value of an malloc() for a structure type#include <stdio.h>
+
+struct student
+{
+  int roll_no;
+  int mark;
+  struct student *p;
+};
+
+int main()
+{
+  struct student *stu;
+  stu = malloc(sizeof(struct student));
+}
+
+What is the actual return value of malloc() for a structure type? How is it being assigned to the structure variable?
+Now for the statement,
+struct student *stu;
+
+Memory allocation like stu with 4 bytes lets just say starting from 1000.
+And for the statement
+stu = malloc(sizeof(struct student));
+
+First allocates block of memory, let's just say 2000 - 2012. Then the assignment part a pointer to 2000 stored at 1000.
+This is how the assignment part works for malloc() and structure variable.
+And now pointer i.e stu holding the starting address 2000. So now stu->roll_no will access the 1st 4 bytes and stu->mark will access the next 4 bytes and so on. The question is how does the compiler understand it, it's not like stu->roll_no is equivalent to *(stu+0) and stu->mark is equivalent to *(stu+1). Explanation to this will be much appreciated.malloc() returns a pointer to a block of memory (void *) large enough to hold size (first argument) bytes regardless of what the argument is or what the result is being casted to.
+For example, stu->roll_no would access the first four bytes (assuming int is 32-bit) of the allocated memory (assuming that the structure is not padded).
+In C, void * pointers are implicitly converted into the pointer type of what they are assigned to.
+Your understanding is correct except for this statement:
+
+And for clarity sake, unlike a normal structure variable which will allocate 12 bytes for the struct student whereas a structure pointer variable allocates just 4 bytes.
+
+The pointer to the structure is allocated on the stack in this case and the structure itself is allocated on the heap. If you had used a structure directly,  it would allocate 12 bytes on the stack and no bytes on the heap.
+You're correct on this:
+
+it's not like stu->roll_no is equivalent to *(stu+0) and stu->mark is equivalent to *(stu+1)
+
+stu->roll_no is equivalent to *((int *)stu+0) and stu->mark is equivalent to *((int *)stu+1). Note the casts to int *.malloc return void * pointer to a place in the memory in size you sent it that you can cast to any - https://www.tutorialspoint.com/cprogramming/c_type_casting.htm type you want see malloc definition :
+https://www.tutorialspoint.com/c_standard_library/c_function_malloc.htmWhat is the syntax for a function signature which returns an array of struct pointers in C?I need a function to return an array of pointers to structs. What is the syntax for this? Conceptually I'm thinking struct my_struct *[] create_my_struct_table(int arr[], size_t length); But this does not work. I am not trying to return an array of struct my_struct but rather an array of struct my_struct *.You cannot return an array in C.  You can return a struct that contains an array (which may be an array of pointers).  You can also return a pointer to an array, which must have a lifetime longer than the function that returns it, such as a static array or one returned from calloc().  If it is dynamically-allocated, the caller must free it once and only once.  Or the caller can allocate the destination array and pass its address as an output parameter.struct mystruct ** foo(struct mystruct **arrayOFpointers)
+{
+
+    int i =0;
+    while(arrayOFpointers[i] != NULL)
+    {
+        //do something with *arrayOFpointers[i]
+        i++;
+    }
+    return arrayOFpointers;
+}
+int main()
+{
+    int n = 10; // size
+    struct mystruct *pointers[n];
+    pointers[0] = (struct mystruct*)malloc(sizeof(struct mystruct));
+    //allocate all other pointers in the array like this
+
+    struct mystruct *processed_Pointers[n];
+
+    processed_Pointers = foo(pointers);
+return 0;
+}How to declare a set of structures with non-linear dependency?I am looking at generating C structures from XML data, generally speaking the C compiler must have a definition of something before it is used, which means an XML document tree would have to be written out starting from its leaves and going toward its root.
+It doesn't seem like a split definition/declaration can be made of structs similar to functions.
+Can it?
+I don't know XML enough to know if nodes can have a circular or generally non linear relationship.  Such as "rock > scissors" "scissors > paper", "paper > rock".
+I wrote some testing:
+struct _child
+{
+    char *child_name;
+
+    struct _parent *father_reference;
+};
+
+struct _parent
+{
+    char *parent_name;
+
+    struct _child *child_reference;
+};
+
+It seems declaring them out of order will work fine (all ISO standards compliant?) if the out of order members are pointers, but this can't be done with actual structures:
+struct _child
+{
+    char *child_name;
+
+    struct _parent father;
+};
+
+struct _parent
+{
+    char *parent_name;
+
+    struct _child *child_reference;
+};
+
+
+main.c:6:17: error: field ‘father’ has incomplete type
+  struct _parent father;
+                 ^~~~~~
+
+Not surprising exactly - how would you calculate the size of an object that grows by its on size at compilation time?
+Could this be an issue when converting an XML defined data structure to a C structure implementation?
+Would it be correct to say that there is a strict linear ordering to structure declarations in C?Ah; you need forward declarations.
+Add these declarations near the top*:
+struct _child;
+struct _parent;
+
+Once given this much, the compiler can handle pointers to structures of these types. Your header declarations then compile.
+*Once you get around to using header files, these go right after the double-include guard. Right now, put them right after standard includes.C, How to get the program to not skip through scanf() when using fork()The program needs to take ten inputs, this is too happen simultaneously while other processes happen, using fork(). Instead it just goes "Enter input:
+Enter input: Enter input: Enter input:Enter input: Enter input: Enter input: Enter input: ..."
+
+int main(int argc, char * argv[]) 
+{ 
+
+  int n1 = fork();
+  int n2 = fork();
+  if (n1 == 0 && n2 > 0 ){
+     getMarks();
+  }
+  else if (n1 > 0 && n2 == 0){ 
+     printf("child2")
+  }
+
+  else if (n1 > 0 && n2 > 0){
+     printf("Parent");
+  }
+  else {
+     printf("Child3");
+  }
+
+
+
+}
+
+void getMarks(){
+    printf("Enter ten marks: \n");
+    int i = 0;
+    int highestMark = 0;
+    for (i; i < 10; i++){
+        int num = 0;
+        printf("Enter Mark: ");
+        scanf("%d", &num);
+        if (num > highestMark) { 
+            highestMark = num; 
+        }
+
+    }   
+    printf("Highest Mark is : %d", highestMark);
+
+}
+
+
+The expected result would be for the other childs and parent to print into the console, while also being able to give input into getMarks()Uggh don't do that then.
+Your first character of entry got sent to the shell. Your second character of entry got sent to the program. scanf can't recover from input errors very well.
+To avoid this problem, don't read standard input from child processes whose parent isn't alive anymore. Arrange your code so this doesn't ever happen.How to free the space allocatedI'm working on a homework assignment that's supposed to number each line(s) in a file along with the content of the line(s). My teacher briefly mentioned how to free and delete the space we create after we allocate a space but I can't find any of the examples he provided in class. How would I free the space in my code?
+#include <stdio.h>
+#include <stdlib.h>
+#include "read_lines.h"
+#include <string.h>
+
+
+void read_lines(FILE* fp, char*** lines, int* num_lines) {
+
+  char letter;
+  int size = 0;
+  int sizeOfLines[10000];
+  int index = 0;
+  *num_lines = 0;
+
+  for(size = 0; !feof(fp);size++){
+    letter = fgetc(fp);
+    size++;
+    if (letter == '\n') {
+      sizeOfLines[index] = size;
+      index++;
+      size = 0;
+        (*num_lines)++;
+      }
+    }
+
+  while(!feof(fp)){
+    letter = fgetc(fp);
+    size++;
+    if(letter == '\n'){
+      sizeOfLines[index] = size;
+      index++;
+      size = 0;
+      (*num_lines)++;
+    }
+  }
+  (*lines) = (char**)malloc(*num_lines *sizeof(char*));
+  int i = 0;
+  while (i<*num_lines){
+        (*lines)[i] = (char *) malloc(sizeOfLines[i] + 1 * sizeof(char));
+        i++;
+
+  }
+
+  rewind(fp);
+  i = 0;
+  while (i < *num_lines) {
+    fgets((*lines)[i], (sizeOfLines[i] + 1), fp);
+    i++;
+  }You call function to read lines into file. Good. When you're done with that function, call this one to free the lines.
+void free_lines(char** lines, int num_lines)
+{
+    while (num_lines --> 0)
+        free(lines[num_lines]);
+    free(lines);
+}
+
+Don't just uplift this code. Make sure you understand it.
+Assuming your invocation for read_lines looks like this:
+    char **lines = NULL;
+    int num_lines = 0;
+    FILE *fp = fopen(...)
+    if (fp)
+    read_lines(fp, &lines, &num_lines);
+    fclose(fp);
+
+You would invoke free_lines like this:
+    free_liens(lines, num_lines);
+
+Disclaimer: I haven't tested your read_lines and I have no intention of doing so.What is the difference between pointer's address and the int value converted from pointerI thought the ptr's address and a's address is the same with each other. And also I thought the ptr's address is the same with its int value converted from pointer.
+But the result of console denied me.What's the reason? How can i understand the result.
+#include <stdio.h>
+
+int main() {
+    int a[5] = {1, 2, 3, 4, 5};
+    int *ptr = (int *) ((int) a);
+
+    printf("a's address: %p \n", a);
+    printf("ptr's address: %p \n", ptr);
+    printf("ptr's int value: %x", (int)ptr);
+
+    return 0;
+}
+
+the console's result is 
+a's address: 0x7ffee8d30600 
+ptr's address: 0xffffffffe8d30600 
+ptr's int value: e8d30600
+
+ps
+I have edited the title, and the original ambiguous title is "What is the difference between pointer's address and pointer's int value"Not really what you are trying to achieve here. An int only contains a 32-bit value. Thus, (int)ptr will only return a 32-bit value of ptr's address, which is the lower 4 bytes you get.C has a type uintptr_t which lets you store a pointer value:
+void *p = …;
+uintptr_t u = (uintptr_t)p;
+void *q = (void *)q;
+// here q is equivalent to p
+
+On many platforms, u stores the address of the object that p point to, just like p does, and u and p have the same representation in memory. This is not an obligation: C implementations are allowed to use a different representation. But using the same representation is the most obvious way to meet the requirement in the C standard.
+Note that a conversion from uintptr_t to a pointer type only gives a usable pointer if the uintptr_t value was obtained from a pointer that is still valid. This can be subtle. Even on processor architectures where the representation is the same (which is almost all of them), compilers are allowed to assume that you don't do too crazy things and to optimize accordingly. See responses to the Cerberus survey for some examples.
+In your case, you didn't try to store the pointer value in an uintptr_t, you tried to store it in an int. This failed because on your platform, int is too small to store a pointer value. Evidently, on your platform, pointers are 64-bit values and int are 32-bit values. This is a very common arrangement.
+
+a is the address of the array. (It's a pointer to the first element of the array, and on your platform a pointer is just represented by an address.). In this particular run, it's 0x7ffee8d30600. Nothing remarkable there.
+(int) a converts the address of a to an int value. This is implementation-defined. Your implementation does the usual thing: since int is too small, it truncates the value. Truncating the address above to an unsigned 32-bit value yields 0xe8d30600. To get a signed value, the most significant bit becomes the sign bit, so a happens to be negative: a is -388823552.
+p is (int *) ((int) a). This conversion is again implementation-defined, and your implementation again does the same thing as most. It takes the 32-bit signed int value -388823552, extends it to the desired width and shifts it to the unsigned range, yielding 264 - 388823552 = 0xffffffffe8d30600.
+(int)p applies the same truncation process as (int)a above, and again yields -388823552. But you're using the %x specifier to print it out, so this value is converted to unsigned (a 32-bit type on your platform), which gives the value 232 - 388823552 = 0xe8d30600.I have understand it. The machine is based with 64bit address. Converting the address to int value will loss the upper value of address. So here the a's address is different from ptr's address.
+If to use pointer in C++, we can use intptr_t or preferably uintptr_tHow to Create a Makefile to comile a C file and Java File SeparatelyI am new to creating makefiles with java files and c files together.  I am trying to just have the two files compiled separately by using one makefile.  The clean commands don't seem to be an issue, but the below code only compiles the C file.
+What am I missing?
+#target: dependencies
+
+helloWorld: helloWord.c
+        g++ -std=c++0x helloWorld.c -o helloWorld
+
+hi.class: hi.java
+        javac hi.java
+
+clean:
+        rm helloWorld
+        rm hi.classBy default, it will only build the first target. Option 1, add an "all" before helloWorld like (also, there's a typo on your version of helloWorld).
+all: helloWorld hi.class
+
+helloWorld: helloWorld.c
+    g++ -std=c++0x helloWorld.c -o helloWorld
+
+Or, you can explicitly run your existing target
+make hi.classStoring line from standard input never changesI'm working on this problem(Uva227).I've almost received correct results when I test the cases, but I've met a problem. I used function gets() to get a line from standard input, and store it in a[0]. but after the first input matrix, a[0] never changes anymore. What's wrong with it?
+P.S. In Puzzle #2(i.e., the second input matrix), a[0] didn't changed, so I got a wrong answer. But if I put it first, it returned a correct output. So I think the algorithm is correct, but something went wrong when reading the first line.
+English is not my native language; please excuse my syntax errors.
+#include <stdio.h>
+#include <string.h>
+
+char a[5][5];
+
+
+
+int main(){
+    int _case = 1;
+    char c;
+    while(gets(a[0])){//Please focus on this line;it seems that a[0] never changed since first reading.
+        if(a[0][0] == 'Z')  break;
+        int blank_i, blank_j;
+        for(int i = 0; i < 5; i++){
+            if(i)   gets(a[i]);
+            for(int j = 0; j < 5; j++){
+                if(a[i][j] == ' '){
+                     blank_i = i;
+                     blank_j = j;
+                }
+            }
+        }
+        bool flag = true;
+        int i = 0;
+        while((c = getchar()) != '0'){
+            switch(c){
+                case 'A':
+                    a[blank_i][blank_j] = a[blank_i - 1][blank_j];
+                    a[--blank_i][blank_j] = ' ';    break;
+                case 'B':
+                    a[blank_i][blank_j] = a[blank_i + 1][blank_j];
+                    a[++blank_i][blank_j] = ' ';    break;
+                case 'L':
+                    a[blank_i][blank_j] = a[blank_i][blank_j - 1];
+                    a[blank_i][--blank_j] = ' ';    break;
+                case 'R':
+                    a[blank_i][blank_j] = a[blank_i][blank_j + 1];
+                    a[blank_i][++blank_j] = ' ';    break;
+                default:    break;
+             }
+        }
+        //add a getchar() here will fix the problem.
+        printf("Puzzle #%d:\n", _case);
+        if(blank_i < 0 || blank_i > 4 || blank_j < 0 || blank_j >  4)
+             printf("This puzzle has no final configuration.\n");
+        else{
+            for(int i = 0; i < 5; i++){
+                for(int j = 0; j < 5; j++){
+                    printf("%c ", a[i][j]);
+                }
+            printf("\n");
+            }
+        }
+        printf("\n");
+        _case++;
+    }
+    return 0;
+}You've misdiagnosed the problem. It's not the case that "after the first input matrix, a[0] never changes anymore." The actual problem is that after you read the '0' that ends the list of moves, there's a newline before the next puzzle begins. Your code doesn't take this into account, and so treats the newline as the first character of the first line of the next puzzle. Fix it by swallowing this newline before getting back to the beginning of the while loop.
+Aside: Some commenters pointed out that you shouldn't use gets. They're 100% right, but it's not related to this problem, and switching away from it won't fix this.In additions to Joeseph's answer, you invite Undefined Behavior by failing to validate that your i, j, blank_i, blank_j indexes remain in bounds. (and *Never, ever use gets() it has been removed from the current C standard). See: Why gets() is so dangerous it should never be used!
+Instead, use fgets and trim the trailing '\n' from the resulting string by overwriting with the nul-characer, e.g.
+#define ROWS 5      /* if you need a constant, #define one (or more) */
+#define COLS ROWS
+
+char a[ROWS][COLS];
+...
+        for(int i = 0; i < ROWS; i++){
+            if (i)                                  /* skips a[0] */
+                if (fgets (a[i], COLS, stdin))
+                    a[i][strcspn(a[i], "\n")] = 0;  /* overwrite '\n' */
+                else {  /* handle failed input */
+                    fputs ("error: EOF encountered.\n", stderr);
+                    return 1;
+                }
+           ...
+
+Next, in the following for loop you assign blank_i = i; and blank_j = j;, e.g.
+            for (int j = 0; j < COLS; j++){
+                if(a[i][j] == ' ') {
+                     blank_i = i;
+                     blank_j = j;
+                }
+            }
+
+Subsequently, you then increment a[blank_i++][blank_j]; and used blank_j-- and blank_j++ (you must also ensure blank_i-- never results in a negative value). To avoid Undefined Behavior, you must validate your indexes remain in range. For example, taking your case 'B':, you can do something similar to:
+                case 'B':
+                    {   /* create new block to allow variable declaration
+                         * blank_i + 1 can exceed 4 invokding Undefined
+                         * Behavior. You must validate/handle value.
+                         */
+                        int row = blank_i + 1 % ROWS;
+                        a[blank_i][blank_j] = a[row][blank_j];
+                        /* same with ++blank_i */
+                        blank_i = (blank_i + 1) % ROWS;
+                        a[blank_i][blank_j] = ' ';
+                        break;  /* lines don't cost $, done hide break at end */
+                    }
+
+Since you are looping while ((c = getchar()) != '0') both values blank_i and blank_j can exceed your array bounds or result in a negative index invoking Undefined Behavior -- long before your ever check:
+        printf("Puzzle #%d:\n", _case);
+        if(blank_i < 0 || blank_i > 4 || blank_j < 0 || blank_j >  4)
+             printf("This puzzle has no final configuration.\n");
+
+Go through and fix your indexing (handling it any way you need) to validate your indexes remain within the bounds of your array.Faster File and memory writeI have a code as defined below, but it is taking too long, I know the reason is there are too many iterations, but is there a solution to make this loop fast, (each loop has to read a float number from a file and write it to the memory) and there are 15874861 numbers.
+  float  SysMem;
+  float fw;
+  unsigned long  j;
+   for (j = 0 ; j < 15874861 ; j++) 
+    {
+      fscanf(fp,"%f",&fw); // Read from file
+      *((float *) (weights+j*0x04))  = fw; // Write to memory
+      // Below lines are just to test, but even just read from file and writing is taking too long.
+      SysMem= *((float *) (weights+j*0x04)); // Read back from memory
+      if(fw != SysMem) 
+         printf("Memory Error\n"); // If read back wrong flag a error
+    }
+
+Trying to make it fasterIt may or may not make a difference here, because I/O is the slowest thing that should be happening here, but all those casts don't help performance and may even result in buggy code. A cast tells a compiler “I'm doing something weird here”, and that tends to tell the compiler not to optimize.
+For example, on most platforms, the size of float is 4 bytes, and it's faster to assign a 4-byte value at an address that's a multiple of 4 than at an arbitrary address. When the compiler sees a variable of type float or array of float, it will align this variable correctly in memory to be able to use the fast-4-byte-assignment method. When the compiler sees (float *) (weights+j*0x04), it isn't sure whether this is a multiple of 4, so it might generate code that is sure to copy what you expect, but is slower because it copies the individual bytes one by one. (The compiler doesn't have to generate slower code: it can be nasty and assume that weights is correctly aligned, and generate code that doesn't copy what you expect if weights is not correctly aligned.)
+The body of the loop should be just
+fscanf(fp, "%f", weights[j]);
+
+(Assuming that you know that the input file is well-formed, otherwise you need to add error checking.)So here is what I did, for data maneuvering.
+FILE *fp;
+  fp = fopen("/media/card/kernel.txt", "r");
+  n=0;
+  //Read from the file. 
+  while(fscanf(fp, "%f", &array[n++])!= EOF);
+  // Copy the whole data to memory at the given address
+  memcpy(weights, array, sizeof(array) );
+
+// Read back first few and last few values back just to cross check on functionality.
+    for (int j = 0 ; j < 10; j++) {
+               SysMem= *((float *) (weights+j*0x04));
+     printf("Read %f\n", SysMem);
+    }
+
+               for (int j = 15874861 ; j > 15874850; j--) {
+               SysMem= *((float *) (weights+j*0x04));
+     printf("Read %f\n", SysMem);
+    }
+
+Why I did this? 
+2 Reasons, I am not running this on a conventional system, it's a custom board.
+So I figured out the memory read/writes are costly on time and IO is also slow.
+So I just moved the data withing using memcpy.
+Thank you all for your help and suggestions.Printing struct to a file printing all empty elements of a char arrayI am trying to create a program to create a text file, write an unknown amount of structures and other files contents into one main file. When I write a structure to a text file, it writes all the empty elements of a character array, and I want to avoid this. Any idea on how to prevent these elements from being written? I am at a beginning part of the program and am working on building it.
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+struct hdr
+{
+  int file_size;
+  char deleted[1];
+  char file_name[256];
+};
+
+int main()
+{
+
+  //Open the main file, check if the main header exists
+  FILE *fp;
+  int exists = 0;
+  fp = fopen("CS3411TAR.txt","a+b");
+
+  //Check if exists
+  char* buf[100];
+  while(fscanf(fp," %*s %*s %s ",buf) >0){
+    exists = 1;
+  }
+
+
+
+  if(exists == 0){
+    //file header DNE
+    struct  hdr create = {atoi("-10"),"0","CS3411 TAR"};
+    fwrite( &create, sizeof(struct hdr),1,fp);
+
+  }
+  //To-Do  open file arguments names create headers and write
+
+  fclose(fp);
+
+
+
+  return 0;
+}
+
+
+
+This is the file output, some elements have been removed as it just continues 200+ odd times
+öÿÿÿ0CS3411 TAR^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@^@
+
+Im hoping for an output of
+-10
+0
+CS3411 TARPlease remember that the if clause needs an expression to evaluate.
+Your expression exists = 0 always results in the value of exists which is 0.
+Correct the if expression to !exists which is a boolean expression to compare exists against the value zero.
+If exists has a value not equal to 0, you write to the file, otherwise you skip the write statement.
+That's what you meant.
+Add a fread statement instead of fscanf to check if the header exists in the file you just opened.
+You write binary, so read binary, too.
+The real problem appears, when all simple issues are fixed, is: the file opened for appending is positioned at the end of file.
+Use fseekto position the file pointer everytime you want to read the header or a record from the file.
+Here ist my working version:
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+typedef struct hdr
+{
+  int file_size;
+  char deleted;
+  char file_name[256];
+} Header;
+
+const Header defaultHeader = {-10, 0, "CS3411 TAR"};
+
+int main()
+{
+  //Open the main file, check if the main header exists
+  FILE *fp;
+  int exists = 0;
+  fp = fopen("CS3411TAR.txt", "a+");
+  if (!fp)
+  {
+
+    perror("Couldn't open file");
+    return EXIT_FAILURE;
+  }
+  Header header;
+
+  //Check if exists
+  fseek(fp, 0, SEEK_SET);
+  int bytesRead = fread(&header, sizeof(Header), 1, fp);
+  printf("bytesRead: %d\n", bytesRead);
+  if (bytesRead == 1)
+  {
+    printf("Header found!\n");
+  }
+  else
+  {
+    fseek(fp, 0, SEEK_SET);
+    //file header DNE
+    fwrite(&defaultHeader, sizeof(Header), 1, fp);
+
+    printf("Header written.\n");
+  }
+
+  //To-Do  open file arguments names create headers and write
+
+  fclose(fp);
+
+  return EXIT_SUCCESS;
+}Can I ask the kernel to populate (fault in) a range of anonymous pages?In Linux, using C, if I ask for a large amount of memory via malloc or a similar dynamic allocation mechanism, it is likely that most of the pages backing the returned region won't actually be mapped into the address space of my process.
+Instead, a page fault is incurred each time I access one of the allocated pages for the first time, and then kernel will map in the "anonymous" page (consisting entirely of zeros) and return to user space.
+For a large region (say 1 GiB) this is a large number of page faults (~260 thousand for 4 KiB pages), and each fault incurs a user-to-kernel-user transition which are especially slow on kernels with Spectre and Meltdown mitigations. For some uses, this page-faulting time might dominate the actual work being done on the buffer.
+If I know I'm going to use the entire buffer, is there some way to ask the kernel to map an already mapped region ahead of time?
+If I was allocating my own memory using mmap, the way to do this would be MAP_POPULATE - but that doesn't work for regions received from malloc or new.
+There is the madvise call, but the options there seem mostly to apply to file-backed regions. For example, the madvise(..., MADV_WILLNEED) call seems promising - from the man page:
+
+MADV_WILLNEED
+Expect access in the near future.  (Hence, it might be a good idea to read some pages ahead.)
+
+The obvious implication is if the region is file-backed, this call might trigger an asynchronous file read-ahead, or perhaps a synchronous additional read-ahead on subsequent faults. From the description, it isn't clear if it will do anything for anonymous pages, and based on my testing, it doesn't.It's a bit of a dirty hack, and works best for priviledged processes or on systems with a high RLIMIT_MEMLOCK, but... an mlock and munlock pair will achieve the effect you are looking for.
+For example, given the following test program:
+# compile with (for e.g.,): cc -O1 -Wall    pagefaults.c   -o pagefaults
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <err.h>
+#include <sys/mman.h>
+
+#define DEFAULT_SIZE        (40 * 1024 * 1024)
+#define PG_SIZE     4096
+
+void failcheck(int ret, const char* what) {
+    if (ret) {
+        err(EXIT_FAILURE, "%s failed", what);
+    } else {
+        printf("%s OK\n", what);
+    }
+}
+
+int main(int argc, char **argv) {
+    size_t size = (argc == 2 ? atol(argv[1]) : DEFAULT_SIZE);
+    char *mem = malloc(size);
+
+    if (getenv("DO_MADVISE")) {
+        failcheck(madvise(mem, size, MADV_WILLNEED), "madvise");
+    }
+
+    if (getenv("DO_MLOCK")) {
+        failcheck(mlock(mem, size), "mlock");
+        failcheck(munlock(mem, size), "munlock");
+    }
+
+    for (volatile char *p = mem; p < mem + size; p += PG_SIZE) {
+        *p = 'z';
+    }
+    printf("size: %6.2f MiB, pages touched: %zu\npoitner value : %p\n",
+            size / 1024. / 1024., size / PG_SIZE, mem);
+}
+
+Running it as root for a 1 GB region and counting pagefaults with perf results in:
+$ perf stat ./pagefaults 1000000000
+size: 953.67 MiB, pages touched: 244140
+poitner value : 0x7f2fc2584010
+
+ Performance counter stats for './pagefaults 1000000000':
+
+        352.474676      task-clock (msec)         #    0.999 CPUs utilized          
+                 2      context-switches          #    0.006 K/sec                  
+                 0      cpu-migrations            #    0.000 K/sec                  
+           244,189      page-faults               #    0.693 M/sec                  
+       914,276,474      cycles                    #    2.594 GHz                    
+       703,359,688      instructions              #    0.77  insn per cycle         
+       117,710,381      branches                  #  333.954 M/sec                  
+           447,022      branch-misses             #    0.38% of all branches        
+
+       0.352814087 seconds time elapsed
+
+However, if you run prefixed with DO_MLOCK=1, you get:
+sudo DO_MLOCK=1 perf stat ./pagefaults 1000000000
+mlock OK
+munlock OK
+size: 953.67 MiB, pages touched: 244140
+poitner value : 0x7f8047f6b010
+
+ Performance counter stats for './pagefaults 1000000000':
+
+        240.236189      task-clock (msec)         #    0.999 CPUs utilized          
+                 0      context-switches          #    0.000 K/sec                  
+                 0      cpu-migrations            #    0.000 K/sec                  
+                49      page-faults               #    0.204 K/sec                  
+       623,152,764      cycles                    #    2.594 GHz                    
+       959,640,219      instructions              #    1.54  insn per cycle         
+       150,713,144      branches                  #  627.354 M/sec                  
+           484,400      branch-misses             #    0.32% of all branches        
+
+       0.240538327 seconds time elapsed
+
+Note that the number of page faults has dropped from 244,189 to 49, and there is a 1.46x speedup. The overwhelming majority of the time is still spend in the kernel, so this could probably be a lot faster if it wasn't necessary to invoke both mlock and munlock and possibly also because the semantics of mlock are more than is required.
+For non-privileged processes, you'll probably hit the RLIMIT_MEMLOCK if you try to do a large region all at once (on my Ubuntu system it's set at 64 Kib), but you could loop over the region calling mlock(); munlock() on a smaller region.Is it possible to have a segmentation fault due to an x-server?For a school project, I'm building a GUI, but I wanted to work on this project at home, and as I only own a windows computer, I installed a x-server (to use with the Windows Subsystem for Linux) : "VcXsrv Windows X Server".
+For some of my test programs it worked perfectly, but for one, I've got a segmentation fault (core dumped).
+So I tried to debug with gdb (which doesn't neet the x-server to work), but... it worked perfectly...
+So here's my question : is it possible to get a segmentation fault due to the x-server ?If your program fails with a segmentation fault then the root cause is almost certain to be in your program, not the environment.  It is possible, however, that the undefined behavior of your program that manifests as a segfault in one environment manifests differently in another environment or with a different configuration.  In that sense, you could say that an X server could "cause" a segfault, but characterizing it that way does not in any way let your program off the hook.
+It's not uncommon that UB manifests differently when a program is run under a debugger than when run directly.  This goes along with being "undefined".  If you're seeing segfaults then it's not unreasonable to turn to a debugger, but a more likely tool for characterizing the problem would be a memory-usage analyzer, such as Valgrind.Is sizeof(<variable>) instead of sizeof(<type>) always safe?I know that I can protect myself by writing
+int *ptr = malloc(sizeof (*ptr))
+
+instead of
+int *ptr = malloc(sizeof (int))
+
+The benefit is that if you decide to change the type of ptr to for instance long* instead of int*, then you only need to change the code at one place.
+My question is, is this strategy always safe to do? Is there any situation where the construct T *ptr = malloc(sizeof(*ptr)) would not work? Does it matter if T is some complex struct, pointer to pointer, function pointer or an array? Or a combination of them for that matter.
+I have tried to come up with a situation where it causes problems, but to me it seems safe. But I want to be able to trust the code completely.The only case I could see causing problems is if *ptr has a variable-length array type, because that's the only case where sizeof evaluates its operand.
+That is:
+int n = ...;
+T (*ptr)[n] = malloc(sizeof *ptr);
+
+has undefined behavior because the type of *ptr is T [n], which is a variable-length array type, which means sizeof evaluates its operand, which dereferences an uninitialized pointer (*ptr).
+However, it's hard to run into that issue by accident. Normally you'd just do
+T *ptr = malloc(n * sizeof *ptr);
+
+which is fine1.
+
+1 Well, the multiplication might overflow. To protect against that, you need something like T *ptr = calloc(n, sizeof *ptr);.It is safe, portable  and it is considered as a good practice. 
+Of course it will not safe if someone will hide pointers in the typedefs and make the code unreadable. But this is considered as a very bad practice.
+Function pointers are very specific as they do not need the memory for the object (function)How to parse C declarators with only two tokens of lookahead?Looking at https://www.lysator.liu.se/c/ANSI-C-grammar-y.html#direct-abstract-declarator, it seems like int f((int)); can be interpreted either as
+
+'function f (int)'  using the '(' abstract_declarator ')' rule or
+'function f(function(int))' using the '(' parameter_type_list ')' rule.
+
+However, when I compile the file with bison, it doesn't mention any shift-reduce conflicts besides the dangling if/else. cdecl just says 'syntax error'. GCC and Clang seems to parse it as 2:
+$ gcc -x c - -o /dev/stdout -S "$@"
+int f((int));
+<stdin>:1:7: error: expected declaration specifiers or '...' before '(' token
+$ clang -x c - -o /dev/stdout -S "$@"
+int f((int));
+<stdin>:1:8: warning: type specifier missing, defaults to 'int' [-Wimplicit-int]
+
+What's the proper way to parse this? Is this sufficiently arcane that I should just assume no one is using this part of the language?for loop not executing after assigning pointer to NULL in main()I wrote this C code from a pointers practice video and the problem I am having is that after integrating head as a local main variable over a global variable declared before main(), the program is no longer entering the for loop and I can't seem to figure out why.
+The interesting part is that I delete the head=NULL, the loop seems to be executing. Does anyone know where the problem with assigning NULL to head is? 
+Here is my code:
+#include <stdlib.h>
+#include <stdio.h>
+
+struct Node{
+    int data;
+    struct Node* next;
+};
+
+struct Node* Insert(struct Node* head, int data){
+    struct Node* new_node = (struct Node*)malloc(sizeof(struct Node));    
+    (*new_node).data = data;
+    (*new_node).next = head;
+
+    head = new_node;
+}
+
+void Print(struct Node* head){
+    struct Node* temp = (struct Node*)malloc(sizeof(struct Node));
+    temp = head;
+
+    while(temp!=NULL){
+        printf("%d", (*temp).data);
+        temp = (*temp).next;
+    }
+
+    printf("\n");
+}
+
+int main(){
+    struct Node* head = NULL;
+
+    int n, i, x;
+    printf("%s", "How large do you want your array to be?\n");
+    scanf("%d", &n);
+
+    for(i; i<n; i++){
+        printf("Enter a number:\n");
+        scanf("%d",&x);
+        head = Insert(head, x);
+        Print(head);    
+    }
+    return 0;
+}I can see a couple of problems with your code:
+struct Node* temp = (struct Node*)malloc(sizeof(struct Node));
+temp = head;
+
+should be
+struct Node* temp = head;
+
+Then we have
+for(i; i<n; i++)
+
+that should be
+for(i=0; i<n; i++)
+
+This can be the cause of your problem, since this is undefined behavior.
+Another thing that can cause trouble is that you don't do return head as a final statement in Insert.
+Two of these could be easily discovered by turning on compiler warnings.
+Also, don't cast mallocSparse tool not detecting any erros/warnings on drivers/staging directoryI want to find out any warnings regarding coding style issues or logical bugs in drivers/staging directory in Linux kernel. To do this I am using Sparse tool.
+However, I am not able to see any warnings/bugs in drivers/staging. But it detects warnings/bugs in other directories such as drivers/USB, etc.
+Are there really no warnings/errors in staging directory or am I missing something special which needs to be taken care here before anything is seen?
+
+I installed the sparse tool by following the instructions mentioned here.
+I cloned the Linux-next by following the instructions mentioned here.
+I copied the configuration by using following command:
+~>cp /boot/config-`uname -r` .config
+
+I ran the sparse using following command:
+~>make -j4 C=1 M=drivers/staging > logfile.txt 2>&1
+
+
+[Edit 1: I have also tried it with C=2.]
+
+When I looked into the file logfile.txt, I found out there are no warnings/bugs.
+
+When I followed the same procedure for drivers/usb just to check if it works on some other directory, I was able to see lots of warnings.
+Could anybody please help on with this problem?
+TIA.gdb debugging what is the 8 byte gap for?I'm debugging a function to learn more about the structure of a stack in memory. I am using gdb on the Ubuntu OS x86. My function consists of the following: 
+function func(){
+   long local1=0;
+   printf("address of swap is %p\n",&local1);
+}
+
+In gdb I set a breakpoint inside the function and print out the frame values using info frame. I am able to get the address of the saved registers of ebp and eip which I presume holds the saved base pointer and return address respectively. I also print out the address of local1. So using these addresses I constructed the following stack: 
+bffff03c --> eip (stores the return address)
+bffff038 --> ebp (saved base pointer)
+bffff02c --> local1 address
+
+Now I must be missing something because there is a 8 byte gap between ebp and local1. I assumed local1 data type is 4 bytes which leaves the address between bffff030 -> bffff038 unaccounted for. Would really appreciate help with this one. 
+EDIT
+here is the assembly code. the only anomaly i could think of is the SUB instruction following mov esp,ebp, though I'm not sure how it relates to the gap.The 8 byte gap is because on x86 calling conventions require 16 byte stack alignment on entrance to a function, and a return pointer is only 8 bytes. So we get the 8 bytes of "wasted" space.How to count the files in a directory using CThe canonical way of determining a file's type is to use the commented 
+out code in this snippet:
+// Return the number of files in dirName. Ignore directories and links.
+#include <sys/types.h>
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char** argv) {
+  int fCt = 0;
+
+  struct dirent *dir;
+  DIR *d;
+  d = opendir(argv[1]);
+  if (d == NULL) {
+    printf("%s was not opened!\n", argv[1]);
+    exit(0);
+  }
+
+  // Count all of the files.
+  while ((dir = readdir(d)) != NULL) {
+    // struct stat buf;
+    // stat(dir->d_name, &buf);
+    // if (S_ISREG(buf.st_mode)) { fCt++; }
+    if (dir->d_type == 8) { fCt++; }
+  }
+  return fCt;
+}
+
+
+The element buf.st_mode returns 41ED (hex), 16877 (decimal) for both directories and regular files. S_ISREG fails to find the right bit set for both types.
+Note that the line:
+    if (dir->d_type == 8) { fCt++; }
+
+returns an accurate file count.
+Why did the commented out method fail?Two-Dimensional Array with malloc [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Why is it safer to use sizeof(*pointer) in malloc
+
+                                (3 answers)
+                            
+
+
+How do I work with dynamic multi-dimensional arrays in C?
+
+                                (9 answers)
+                            
+
+Closed 2 years ago.
+
+
+
+I am studying C and I am encountering an issue with a program I am writing for practicing purposes.
+In this program: I create a dynamic two-dimensional table (array) by allocating memory after the user sets the rows and columns of the table.
+However the program will execute till the end, only if the table's rows are set to a very low value e.g. up 2-3 rows max.
+Setting a higher number of rows will result in the program exiting.
+The only way to see the program running through the end and where it finally prints the values of the table is to pause the execution early (like you can see in the code below pasted below).
+Is there any explanation for this behavior? Is there anything that I am missing or doing it wrongly?
+main()
+{
+  int **p; 
+  int i, j, N, M;
+
+  printf("Set Table Rows: ");
+  scanf("%d", &M);
+  printf("Set Table Columns: ");
+  scanf("%d", &N);
+
+  p = malloc(sizeof(int) * M);
+
+  system("echo \"Press any button to continue\"");
+  system("read");
+  if (!p)
+  {
+    printf("Memory Allocation Failed!");
+    exit(0);
+  }
+
+  for (i = 0; i < M; i++)
+  {
+    p[i] = malloc(sizeof(int) *N);
+    if (!p[i])
+    {
+      printf("Memory Allocation Failed!");
+      exit(0);
+    }
+  }
+  for (i = 0; i < M; i++)
+  {
+    for (j = 0; j < N; j++)
+    {
+      p[i][j] = (i+2) * (j+1);
+    }
+  }
+
+
+  printf("\n-------------------\n");
+  for (i = 0; i < M; i++)
+  {
+    for (j = 0; j < N; j++)
+    {
+      printf("%d\t",p[i][j]);
+    }
+    printf("\n");
+  }
+
+}For every father of only a leaf node, remove the leaf and add its value with the fatherIf I find a father with only a leaf as a child I have to remove the leaf and add its value with the father
+This is my solution but I have a problem when I try to remove the leaf
+bool isLeaf(tree a){ //function to verify if the node is a leaf
+
+if(a->left==NULL && a->right==NULL)
+    return true;
+else
+    return false;
+}
+
+
+void removeLeaves(tree* a){
+
+if(*a == NULL) return;
+
+//verify if the node has only a child
+ if(((*a)->left==NULL&&(*a)->right!=NULL) || ((*a)->right==NULL&&(*a)->left!=NULL)){
+
+    if((*a)->right==NULL){ //if has only left child,verify  if it is a leaf
+        if(isLeaf((*a)->left)){
+            (*a)->info = (*a)->info + (*a)->left->info; 
+            free((*a)->left);
+
+
+
+        }
+    }
+    if((*a)->left==NULL){ //if has only right child,verify  if it is a leaf
+        if(isLeaf((*a)->right)){
+            (*a)->info = (*a)->info + (*a)->right->info; 
+            free((*a)->right);
+
+        }
+    }
+}
+
+
+removeLeaves(&((*a)->left));
+removeLeaves(&((*a)->right));
+}
+
+Minimal:
+if((*a)->right==NULL){ //if has only left child,verify  if it is a leaf
+        if(isLeaf((*a)->left)){
+            (*a)->info = (*a)->info + (*a)->left->info; 
+            free((*a)->left);
+
+If I reach this point (there's only a child to the left and it is a leaf), I sum its value with the father and then free it. without the free I obtain the sum but with the free I get segmentation fault. Same thing with only a child to the right.
+Edit1:
+I changed the condition to:
+if(((*a)->right==NULL&&(*a)->left!=NULL) && isLeaf((*a)->left)){
+
+
+        (*a)->info = (*a)->info + (*a)->left->info; 
+
+        free((*a)->left);
+        (*a)->left = NULL;  
+
+}
+
+And this works but I don't understand why.
+Edit2:(implementation with struct)
+    #include <stdio.h>
+#include <cstdlib>
+
+
+typedef int InfoTree;
+
+typedef struct StructTree {
+  InfoTree info;
+  struct StructTree* right;
+  struct StructTree* left;
+} NodeTree;
+
+typedef NodeTree* Tree;
+
+//functions
+Tree createTree(InfoTree infoRoot,Tree left,Tree right);
+Tree emptyTree();
+void print_tree(Tree a);
+bool isLeaf(Tree a);
+void removeLeaves(Tree* a);
+
+int main(){
+
+    /* Binary Tree:                */
+    /*          3               */
+    /*       /     \           */
+    /*      7       5          */
+    /*    /   \      \         */
+    /*   4    2       9        */
+    /*       /                     */
+    /*      6                      */
+
+    Tree A = createTree( 6  , emptyTree(), emptyTree() ) ;
+    Tree B = createTree( 2 , emptyTree(), emptyTree() ) ;
+    Tree C = createTree( 9 , emptyTree(), emptyTree() ) ;
+
+    Tree D = createTree( 5 , emptyTree(), C);
+    Tree E = createTree( 4  , A, emptyTree());
+
+    Tree F = createTree( 7 , E, B);
+
+    Tree H = createTree( 3  , F, D);
+    Tree t = H;
+    print_tree(t);
+    removeLeaves(&t);
+    printf("\n");
+    print_tree(t);
+    return 0;
+
+
+
+}
+
+Tree createTree(InfoTree infoRoot,
+              Tree left,
+              Tree right) {
+  Tree a = (Tree) malloc(sizeof(Tree));
+  a->info = infoRoot;
+  a->left = left;
+  a->right = right;
+  return a;
+}
+
+Tree emptyTree() {
+  return NULL;
+}
+
+
+void print_tree(Tree a) {
+    if (a==NULL) {
+        printf("()");
+    }
+    else {
+        printf("( %d ",a->info);
+        print_tree(a->left);
+        printf(" ");
+        print_tree(a->right);
+        printf(" )");
+    }
+}
+
+bool isLeaf(Tree a){ //function to verify if the node is a leaf
+
+if(a->left==NULL && a->right==NULL)
+    return true;
+else
+    return false;
+}
+
+
+void removeLeaves(Tree* a){
+
+if(*a == NULL) return;
+
+//verify if the node has only a child
+ if(((*a)->left==NULL&&(*a)->right!=NULL) || ((*a)->right==NULL&&(*a)->left!=NULL)){
+
+    if((*a)->right==NULL){ //if has only left child,verify  if it is a leaf
+        if(isLeaf((*a)->left)){
+            (*a)->info = (*a)->info + (*a)->left->info; 
+            free((*a)->left);
+        (*a)->left = NULL;
+
+
+
+        }
+    }
+    if((*a)->left==NULL){ //if has only right child,verify  if it is a leaf
+        if(isLeaf((*a)->right)){
+            (*a)->info = (*a)->info + (*a)->right->info; 
+            free((*a)->right);
+            (*a)->right = NULL;
+
+        }
+    }
+}
+
+
+removeLeaves(&((*a)->left));
+removeLeaves(&((*a)->right));
+}
+
+This is the original source code with the tree structure and the functions to work on the tree. If I modify it with the above conditions (first Edit1) it works but I don't understand why.
+Thank youAfter freeing the leaf you need to set its entry in the father to null.
+Your function is recursive. If it finds a single leaf its memory is freed, but at the end of the function it tries to access that memory. This is known as "dangling pointer."
+Edit:
+There is another issue, here shown at your initial source:
+if((*a)->right==NULL){
+    if(isLeaf((*a)->left)){
+        // ... irrelevant lines removed ...
+        (*a)->left = NULL;
+    }
+}
+if((*a)->left==NULL){ // <== see text below
+    if(isLeaf((*a)->right)){ // BOOM!
+
+If a leaf is found in the first part then the right pointer is NULL. After setting the left pointer to NULL the marked if evaluates to true, and isLeaf() is called with a NULL pointer giving you the segmentation fault.Windows System Classes vs Windows ControlsI'm curious as to what is the difference between:
+
+Windows created using Window System Class, as seen in: MSDN: Window System Class
+Windows Controls, as seen in: MSDN: Windows Controls
+
+It seems to me that both serve the same purpose. I'd even dare to say both are the same thing. Creating a window using a Window System Class seem to be a little bit more fiddly to work with, in contrast to Windows Controls where one can simply drag-n-drop them in a Dialog Box (and of course add it programmatically). Is it just a matter of backwards compatibility?
+Also in the first link (MSDN: Window System Class), there seems to only exist a handful of Window System Classes, compared to the number of Windows Controls one can choose from.
+As I'm writing this question, and looking for links, I've just found a page talking about this (MSDN: Control Messages), that seems to support my initial thought of this mess being all about backwards compatibility. In there you can read:
+
+(...) common controls send notifications as either WM_COMMAND or WM_NOTIFY
+  messages, as specified in the reference topic for the notification.
+  Typically, older notifications (those that have been in the API for a
+long time) use WM_COMMAND.
+
+I'm curious to know if anyone here ever thought about this, and dug deep down inside Microsoft's crazy and gigantic documentation to find an answer for this.
+The quote above might just have answered my own question, but I still post it here in case someone else has a few cents they want to add to this topic.
+ThanksArray of pointers - memory allocationI'm new into array of pointers (putting functions into array) and allocating memory for it using malloc. Can you help me with this piece of code? Have functions: int comp_int(int a, int b); int comp_int_abs(int a, int b); int comp_int_length(int a, int b); int comp_int_digits_sum(int a, int b);
+and would like to put pointers to these functions in array of pointers. Firstly would like to dynamically allocate memory for the array and put functions' pointers into it. Stuck in this place, what am I doing wrong?
+int (**funcs)(int, int) = malloc(4*sizeof(int));
+
+if(!*funcs)
+{
+    printf("Failed to allocate memory");
+    return 8;
+}
+
+*funcs={add_int, sub_int, div_int, mul_int};First off, why allocate dynamic memory?
+If you use a normal array, things get a bit simpler:
+int (*funcs[])(int, int) = {
+    comp_int,
+    comp_int_abs,
+    comp_int_length,
+    comp_int_digits_sum,
+};
+
+If you want to use dynamic allocation, there are a few things to look out for.
+int (**funcs)(int, int) = malloc(4 * sizeof *funcs);
+
+First we need to allocate the right amount of memory. By multiplying with the size of the dereferenced pointer, we don't have to worry about the element type of the dynamic array. (But if we wanted to write the type manually, it would be sizeof (int (*)(int, int)), not sizeof (int) as in your code; the elements of our array are pointers to functions, not integers.)
+Then we check for allocation failure:
+if (!funcs) {
+
+Note: We check the pointer itself (funcs), not the first element of the dynamic array (which may not exist!) as in your code (*funcs). If malloc fails and returns NULL, then !*funcs will try to dereference a null pointer, which will most likely crash your program.
+    fprintf(stderr, "Failed to allocate memory\n");
+
+Error messages go to stderr, not stdout. Lines are terminated by '\n'.
+    return 8;
+}
+
+Since we don't have a real array here, we can't use initialization syntax. In particular, = { is not valid in assignment expressions.
+The most straightforward solution is to assign the elements manually:
+funcs[0] = comp_int;
+funcs[1] = comp_int_abs;
+funcs[2] = comp_int_length;
+funcs[3] = comp_int_digits_sum;
+
+It's a bit error prone because we have to specify every index manually. However, we can combine this with the "normal array" code from above:
+int (*const funcs_init[])(int, int) = {
+    comp_int,
+    comp_int_abs,
+    comp_int_length,
+    comp_int_digits_sum,
+};
+
+int (**funcs)(int, int) = malloc(sizeof funcs_init);
+if (!funcs) { ... }
+
+memcpy(funcs, funcs_init, sizeof funcs_init);
+
+We just initialize our array as usual (here called funcs_init), then copy the contents into our dynamically allocated memory using memcpy.First, change the allocation from:
+int (**funcs)(int, int)=malloc(4*sizeof(int));
+
+to
+int (**funcs)(int, int)=malloc(4*sizeof(*funcs));
+
+Change 
+*funcs={add_int, sub_int, div_int, mul_int};
+
+to
+funcs[0]=add_int;
+funcs[1]=sub_int;
+funcs[2]=div_int;
+funcs[3]=mul_int;
+
+The notation with braces, {} can only be used upon initializations and not assignments. If you use an array instead of a pointer, you can do this:
+int (*funcs[4])(int, int)={add_int, sub_int, div_int, mul_int};pointers between dynamic structs memoryI am trying to solve a little problem from my university, but i get into trouble completing it.
+The task is to write a code defining all the data structures and create a link between them using pointers and mallocs.
+ASSIGNMENT : 
+There are 3 blocks. 
+1) is a static block with 2 fields, 1st field is an integer, and a second field points to another block.
+2) a block with 2 fields. 1st field points to the first block and 2nd field points to the 3rd block.
+3) a block with 2 fields. 1st field is an integer and 2nd field points to the first block.
+I have started creating the code and making the links but i keep getting errors which i cant seem to find thier logic.
+struct A;
+struct B;
+struct C;
+typedef struct {
+int element;
+struct A * pointer3;
+}C;
+
+typedef struct {
+    struct A * pointer 1;
+    struct C * pointer 2;
+}B;
+
+
+typedef struct {
+    int element;
+    struct B * pointer 0;
+ }A;
+
+int main (){
+    A a;
+    a.pointer0 = (B*)malloc(sizeof(B));
+
+I have reached farther then that, but the problem i get is in the last line.
+Gives me the error warning: assignment from incompatible pointer typeQuestion: What does struct A look like? Answer: Your compiler has no idea because you never defined it. 
+You're assuming forward-declaring a structure type, then formally declaring a typedef alias to a structure where the alias name (but not tag) is the same as the structure tag (with no name) will resolve. It won't. You have to do that yourself.
+Start with simple. Get rid of the type aliases entirely. And get rid of any unnecessary forward decls as well (B and C) What would it look like?
+#include <stdio.h>
+#include <stdlib.h>
+
+struct A; // fwd decl
+
+struct C 
+{
+    int element;
+    struct A *pointer3; // uses fwd decl
+};
+
+struct B
+{
+    struct A *pointer1; // uses fwd decl 
+    struct C *pointer2; // uses prior def
+};
+
+struct A // resolves fwd decl
+{
+    int element;
+    struct B *pointer0; // uses prior def
+};
+
+int main() 
+{
+    struct A a;
+    a.pointer0 = malloc(sizeof(struct B));
+}
+
+That works (in the most optimistic definition of the term). If you want to use typedef aliases, you can add them in now. For example, here is all three structures both tagged and aliased.
+#include <stdio.h>
+#include <stdlib.h>
+
+struct A;
+typedef struct A A;
+
+typedef struct C 
+{
+    int element;
+    A *pointer3;
+} C;
+
+typedef struct B
+{
+    A *pointer1;
+    C *pointer2;
+} B;
+
+struct A 
+{
+    int element;
+    B *pointer0;
+};
+
+int main() 
+{
+    A a;
+    a.pointer0 = malloc(sizeof(B));
+}How to make a string from separate int valuesI'm trying to make a string out of 3 elements with the following format '0/5'.
+int start = 0;
+int finish = 5;
+I've tried doing this: 
+    char string[20];
+
+    string[0] = (char) start;
+    string[1] = '/';
+    string[2] = (char) finish;
+
+    string[strlen(string)] = '\0';
+
+
+But when I printf I get nothing.
+    char buffer[10];
+    char aux[5] = {'/', '\0'}; 
+    char aux2[5];
+    sprintf(buffer, "%d", start);
+    strcat(buffer, aux);
+    sprintf(aux2, "%d", finish);
+    strcat(buffer, aux2);
+
+This is what is working but seems very inefficient.When you print a char using printf, it's ASCII value is used. In this specific case, you could use
+string[0] = (char) (start + '0');
+string[1] = '/';
+string[2] = (char) (finish + '0');
+
+Or you could use string[0] = (char) start + 48;. The ASCII value of '0' is 48.
+Or better initialize start and finish as char start = '0', char finish = '5', etc.
+In addition, make sure that start and finish are between 0 and 9. Other values, will give you unexpected results.
+Also, the last line should be string[3] = '\0'. strlen works by iterating till it encounters a \0 and thus is useless in this case.
+DemoIf your integers are more than 1 digit long then maybe you should consider using something like sprintf()
+char string[20];
+int start = 13;
+int finish = 21;
+
+sprintf(string, "%d/%d", start, finish);
+
+It works exactly like printf() but instead of printing to the console it prints to a string you supply to it.char *tosomething(char *buff, int start, int end)
+{
+    sprintf(buff, "%d/%d", start, end);
+    return buff;
+}The code you posted can be made more efficient by just replacing the last 4 lines with a single sprintf().
+    char buffer[10];
+    char aux[5] = {'/', '\0'}; 
+    char aux2[5] = {'\0'};
+    sprintf(buffer, "%d%s%d%s", start, aux, end, aux2);Swscale - image patch (NV12) color conversion - invalid borderThe goal is to convert NV12 to BGR24 image, more exactly an image patch (x:0, y:0, w:220, h:220).
+The issue is the undefined pixel column on the right of the converted patch as shown:
+
+The question is why is this happening (even though the coordinates and the dimensions of the patch have even values) ?
+(Interestingly enough for an odd width value, that issue is not present)
+
+The patch has the following bounding box: (x:0, y:0, w:220, h:220).
+The behavior should be reproducible with any image. Conversion can be done using the ppm conversion page.   
+The following code creates a nv12 image from a bgr24 image and then converts a nv12 patch back to bgr24 patch. If everything worked properly the output should have been identical to a source image.
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+
+void readPPM(const char* filename, uint8_t** bgrData, int* stride, int* w, int* h)
+{
+    FILE* fp = fopen(filename, "rb");
+    fscanf(fp, "%*s\n"); //skip format check
+
+    fscanf(fp, "%d %d\n", w, h);
+    fscanf(fp, "%*d\n"); //skip max value check
+
+    *stride = *w * 3;
+    *bgrData = av_malloc(*h * *stride);
+
+    for (int r = 0; r < *h; r++)
+    {
+        uint8_t* rowData = *bgrData + r * *stride;
+        for (int c = 0; c < *w; c++)
+        {
+            //rgb -> bgr
+            fread(&rowData[2], 1, 1, fp);
+            fread(&rowData[1], 1, 1, fp);
+            fread(&rowData[0], 1, 1, fp);
+
+            rowData += 3;
+        }
+    }
+
+    fclose(fp);
+}
+
+void writePPM(const char* filename, uint8_t* bgrData, int stride, int w, int h)
+{
+    FILE* fp = fopen(filename, "wb");
+    fprintf(fp, "P6\n");
+    fprintf(fp, "%d %d\n", w, h);
+    fprintf(fp, "%d\n", 255);
+
+    for (int r = 0; r < h; r++)
+    {
+        uint8_t* rowData = bgrData + r * stride;
+        for (int c = 0; c < w; c++)
+        {
+            //bgr -> rgb
+            fwrite(&rowData[2], 1, 1, fp);
+            fwrite(&rowData[1], 1, 1, fp);
+            fwrite(&rowData[0], 1, 1, fp);
+
+            rowData += 3;       
+        }
+    }
+
+    fclose(fp);
+}
+
+
+void bgrToNV12(uint8_t* srcData[4], int srcStride[4], 
+               uint8_t* tgtData[4], int tgtStride[4],
+               int w, int h)
+{
+    struct SwsContext* context = sws_getContext(w, h, AV_PIX_FMT_BGR24,
+                                                w, h, AV_PIX_FMT_NV12, SWS_POINT, NULL, NULL, NULL);
+    {
+        sws_scale(context,
+                  srcData, srcStride, 0, h,
+                  tgtData, tgtStride);
+    }
+    sws_freeContext(context);
+}
+
+void nv12ToBgr(uint8_t* srcData[4], int srcStride[4],
+               uint8_t* tgtData[4], int tgtStride[4],
+               int w, int h)
+{
+    struct SwsContext* context = sws_getContext(w, h, AV_PIX_FMT_NV12,
+                                                w, h, AV_PIX_FMT_BGR24, SWS_POINT, NULL, NULL, NULL);
+    {
+        sws_scale(context,
+                  srcData, srcStride, 0, h,
+                  tgtData, tgtStride);
+    }
+    sws_freeContext(context);
+}
+
+
+int main()
+{
+    //load BGR image
+    uint8_t* bgrData[4]; int bgrStride[4]; int bgrW, bgrH;
+    readPPM("sample.ppm", &bgrData[0], &bgrStride[0], &bgrW, &bgrH);
+
+    //create NV12 image from the BGR image
+    uint8_t* nv12Data[4]; int nv12Stride[4];
+    av_image_alloc(nv12Data, nv12Stride, bgrW, bgrH, AV_PIX_FMT_NV12, 16);
+    bgrToNV12(bgrData, bgrStride, nv12Data, nv12Stride, bgrW, bgrH);
+
+    //convert nv12 patch to bgr patch
+    nv12ToBgr(nv12Data, nv12Stride, bgrData, bgrStride, 220, 220);   //invalid result (random column stripe)
+    //nv12ToBgr(nv12Data, nv12Stride, bgrData, bgrStride, 221, 220); //valid result
+
+    //save bgr image (should be exactly as original BGR image)
+    writePPM("sample-out.ppm", bgrData[0], bgrStride[0], bgrW, bgrH);
+
+    //cleanup
+    av_freep(bgrData);
+    av_freep(nv12Data);
+    return 0;
+}sws_scale makes a color conversion and scaling at the same time.
+Most of the used algorithms need to include neighboring pixels in the calculation of a target pixel. Of course, this could lead to problems at the edges if the image dimensions are not a multiple of x. Where x depends on the used algorithms.
+If you set the image dimensions here to a multiple of 8 (next multiple of 8 = 224), then it works without artifacts.
+nv12ToBgr(nv12Data, nv12Stride, bgrData, bgrStride, 224, 224);
+
+Demo
+Using image dimensions 220 x 220 on the left, gives an artifact on the right edge of the converted patch.
+If one chooses 224 x 224 it does not give an artifact, see the right image in the screenshot comparing both procedures.
+
+Theoretically Required Minimum Alignment
+Let's take a look at the YVU420 format:
+The luma values are determined for each pixel. The color information, which is divided into Cb and Cr, is calculated from a 2x2 pixel block. The minimum image size would therefore be a 2 x 2 image block resulting in 6 bytes (i.e. 12 pixels per byte = 12 * 4 = 48bit = 6 bytes), see graphic here:
+
+The minimum technical requirement is therefore an even width and height of the image.
+You have defined the SWS_POINT flag for scaling, i.e. the nearest neighbor method is used. So theoretically for each output pixel the nearest input pixel is determined and used, which does not cause any alignment restrictions.  
+Performance
+But an important aspect of the actual implementations of algorithms, however, is often performance. In this case, e.g. several adjacent pixels could be processed at once. Also do not forget the possibility of hardware-accelerated operations. 
+Alternative solution
+If for some reason you need to stick to a 220x220 format, you can alternatively use the SWS_BITEXACT flag.
+It does:
+
+Enable bitexact output.
+
+see https://ffmpeg.org/ffmpeg-scaler.html#scaler_005foptions
+So in nv12ToBgr you would use something like:
+struct SwsContext* context = sws_getContext(w, h, AV_PIX_FMT_NV12,
+                                            w, h, AV_PIX_FMT_BGR24, SWS_POINT | SWS_BITEXACT, NULL, NULL, NULL);
+
+This doesn't give any artifacts either. If you have to convert a lot of frames, I would take a look at the performance.How to save a modified array to a fileSo I created an array which is saved in a file. I have the number 4 printed out 100 times in the file. Now everytime the an element in the array is accessed it the value will decrease by 1. So if A[1] = 4 is accessed then it will become A[1] = 3 and be saved on the file. The thing is I can't save the modified array to the file.
+I already tried moving the placement of FILE pointer.
+void buildingB4()
+{
+    system("CLS");
+    FILE *input, *output;
+    int i, B4[100], room;
+
+    input = fopen("B4.txt", "r");
+    if (input == NULL)
+    {
+        output = fopen("B4.txt", "w");
+        for (i = 1; i <= 100; i++)
+        {
+            B4[i] = 4;
+            fprintf(output, "%d\n", B4[i]);
+        }
+        fclose(output);
+        for (i = 1; i <= 100; i++)
+        {
+            if (i % 10 == 0)
+            {
+                printf("\n\n");
+            }
+            printf("B-4-%d(%d)\t", i, B4[i]);
+        }
+    }
+    else
+    {
+
+        for (i = 1; i <= 100; i++)
+        {
+            fscanf(input, "%d\n", &B4[i]);
+            if (i % 10 == 0)
+            {
+                printf("\n\n");
+            }
+            printf("B-4-%d(%d)\t", i, B4[i]);
+        }
+        fclose(input);
+        printf("\nPlease choose a room:B-4-");
+        scanf("%d", &room);
+        B4[room] = B4[room] - 1;
+        output = fopen("B4.txt", "a");
+        fprintf(output, "%d\n", B4[i]);
+        studentDetails();
+    }
+}
+
+say if A[1] = 4
+and when user input is 1, 1 is saved in a variable called room.
+so A[room] = A[room] -1 
+so the result would be A[1] = 3 and it modify the A[1] saved in the file.Use fclose after the line 
+ fprintf(output, "%d\n", B4[i]);I've found little mistakes in your code and here is your fixed code:
+#define HOME_SIZE 100
+void show_rooms(int B[]){
+    for (int i = 0; i < HOME_SIZE; i++){
+            if (i % 10 == 0){
+                printf("\n\n");
+            }
+            printf("B-4-%3d(%d) ", i + 1, B[i]);
+        }
+}
+void buildingB4()
+{
+    FILE *input, *output;
+    input = fopen("B4.txt", "r");
+    unsigned int B[HOME_SIZE], room;
+    if (input == NULL){
+        fclose(input);
+        // Setting all homes to 4.
+        for (int i = 0; i < HOME_SIZE; ++i){
+            B[i] = 4;
+        }
+        output = fopen("B4.txt", "w");
+        for(int i = 0; i < HOME_SIZE; ++i)
+            fprintf(output, "%d\n", B[i]);
+        fclose(output);
+        show_rooms(B);
+    }
+    else{
+        for (int i = 0; i < HOME_SIZE; ++i){
+            fscanf(input, "%d", &B[i]);
+        }
+        fclose(input);
+        show_rooms(B);
+        printf("\nPlease choose a room:B-4-");
+        scanf("%d", &room);
+        if (room > 0 && room <= HOME_SIZE)
+            B[room - 1] -= 1;
+        output = fopen("B4.txt", "w");
+        for(int i = 0; i < HOME_SIZE; ++i)
+            fprintf(output, "%d\n", B[i]);
+    }
+}
+
+Notice that :
+
+In C index starts from 0 not 1.
+close using file after your work in order to save it properly.
+Don't use '%d\n' format for scanf, it will ignore ' ' and '\n' automatically.
+
+Tips for future development :
+
+Try using feof function to know if your file is ended or not instead of using constant size for your inputs.MQTT Last will is not retainingI bought a Huzzah ESP8266 which I'm using to control an LED strip through a web client.
+I implemented a rabbitmq mqtt server on a raspberry pi. 
+I started out using the PubSubClient library for mqtt. Everything was going pretty smoothly until I tried sending a Last will message that would be retained.
+byte willQoS = 0;
+const char* willTopic = "tv/pixel/status";
+const char* willMessage = "turn off";
+boolean willRetain = true;
+
+client.connect("Pixel", "username", "password", willTopic, willQoS, willRetain, willMessage);
+
+Which results in the payload being sent on timeout but it does not retain.
+I'm at a loss I've tried changing the variable around, looked through the .cpp library but I don't know enough about mqtt and C++ to solve it
+If this is a bug is there any other mqtt libraries out for arduino/esp8266 that I can send last will messages that can be retained?I have used mosquitto and it works perfectly fine. 
+It also provides pubsub library in setup. 
+This is the will messages for 
+
+In MQTT, you use the Last Will and Testament (LWT) feature to notify other clients about an ungracefully disconnected client. Each client can specify its last will message when it connects to a broker. 
+
+I hope u expects the same thing.Delete all the nodes from a list that respect a condition influenced by another listI am studying the lists and I came across this exercise which asks me to do the following steps:
+Define a function that, given two lists of integers L1 and L2, and an integer n>0, eliminate from the first list the nodes for which the sum of the contents of L1 and L2 in the corresponding position (with respect to the original positions) is a multiple of n. If L2 ends, consider only the content of L1 instead of the sum.
+I tried to analyze the problem with a single list and in this case I had no problems, but in this specific case I couldn't figure out how to proceed.
+my problem is that I can't understand how properly build the various cases (L1 must be always != NULL, so I have: L1 != NULL && L2 != NULL or L1 != NULL && L2 == NULL).
+Can someone explain to me the procedure to be performed and where am I wrong?
+This is my attempt:
+    struct data
+    {
+       int d;
+       struct data *next;
+    };
+
+    typedef struct data Nodo;
+    typedef Nodo *LIST;
+
+
+    void function(LIST *l1, LIST l2, int n)
+    {
+      LIST p, head_1, head_2;
+
+        while((*l1 != NULL && l2 != NULL)&&((*l1)->d + l2->d) % n == 0)
+        {
+           p = *l1;
+           *l1 = (*l1)->next;
+           free(p);
+        }
+
+        while((*l1 != NULL) && ((*l1)->d + l2->d) % n == 0)
+        {
+            p = *l1;
+            *l1 = (*l1)->next;
+            free(p);    
+        }
+
+        if (*l1 != NULL)
+        {
+           head_1 = *l1;
+           head_2 = l2;
+
+           while(head_1->next != NULL)
+           {
+              if (((head_1->next->d + head_2->next->d) % n) == 0)
+              {
+                p = head_1->next;
+                head_1->next = head_1->next->next;
+                free(p);
+              }
+              else
+              {
+                head_1 = head_1->next;
+                head_2 = head_2->next;
+              }
+           }
+         }
+      }
+
+Example:
+L1: 4->4->11->3->4->8->7->NULL
+L2: 5->1->5->1->5
+OUTPUT(L1): 4->4->4->7->NULLYou have a problem of logic with the consecutive loops :
+
+while((*l1 != NULL && l2 != NULL)&&((*l1)->d + l2->d) % n == 0) {
+  ...
+}
+while((*l1 != NULL) && ((*l1)->d + l2->d) % n == 0){
+  ...
+}
+
+
+if the sum of the elements are not a multiple of n you need to move to the next element, but you do not do
+Out of that to hide a pointer with a typedef like you do with typedef Nodo *LIST; is dangerous and is a good way to introduce problem, I recommend you to never do that.
+You can do that :
+void removeIf(Nodo ** l1, Nodo * l2, int n)
+{
+  while ((*l1 != NULL) && (l2 !=  NULL)) {
+    if ((((*l1)->d + l2->d) % n) == 0) {
+      /* cell must be removed */
+      Nodo * rm = *l1;
+
+      *l1 = (*l1)->next;
+      free(rm);
+    }
+    else {
+      /* cell not removed */
+      l1 = &(*l1)->next;
+    }
+
+    l2 = l2->next;
+  }
+
+  // case where l2 is shorter than l1
+  while (*l1 != NULL) {
+    if (((*l1)->d % n) == 0) {
+      /* cell must be removed */
+      Nodo * rm = *l1;
+
+      *l1 = (*l1)->next;
+      free(rm);
+    }
+    else {
+      /* cell not removed */
+      l1 = &(*l1)->next;
+    }
+  }
+}
+
+
+Making a full program for 
+
+L1: 4->4->11->3->4->8->7
+L2: 5->1->5->1->5
+N : 2
+
+#include <stdio.h>
+#include <stdlib.h>
+
+struct data {
+  int d;
+  struct data *next;
+};
+
+typedef struct data Nodo;
+
+void removeIf(Nodo ** l1, Nodo * l2, int n)
+{
+  while ((*l1 != NULL) && (l2 !=  NULL)) {
+    if ((((*l1)->d + l2->d) % n) == 0) {
+      /* cell must be removed */
+      Nodo * rm = *l1;
+
+      *l1 = (*l1)->next;
+      free(rm);
+    }
+    else {
+      /* cell not removed */
+      l1 = &(*l1)->next;
+    }
+
+    l2 = l2->next;
+  }
+
+  // case where l2 is shorter than l1
+  while (*l1 != NULL) {
+    if (((*l1)->d % n) == 0) {
+      /* cell must be removed */
+      Nodo * rm = *l1;
+
+      *l1 = (*l1)->next;
+      free(rm);
+    }
+    else {
+      /* cell not removed */
+      l1 = &(*l1)->next;
+    }
+  }
+}
+
+Nodo * make(int v, Nodo * n)
+{
+  Nodo * r = malloc(sizeof(Nodo));
+
+  r->d = v;
+  r->next = n;
+  return r;
+}
+
+void del(Nodo ** pl)
+{
+  while (*pl != NULL) {
+    Nodo * n = *pl;
+
+    *pl = (*pl)->next;
+    free(n);
+  }
+}
+
+int main()
+{
+  Nodo * l1 = make(4, make(4, make(11, make(3, make(4, make(8, make(7, NULL)))))));
+  Nodo * l2 = make(5, make(1, make(5, make(1, make(5, NULL)))));
+
+  removeIf(&l1, l2, 2);
+
+  /* show result */
+  for (Nodo * l = l1; l != NULL; l = l->next)
+    printf("%d ", l->d);
+  putchar('\n');
+
+  /* free resources */
+  del(&l1);
+  del(&l2);
+
+  return 0;
+}
+
+Compilation and execution :
+pi@raspberrypi:/tmp $ gcc -pedantic -Wall -Wextra ll.c
+pi@raspberrypi:/tmp $ ./a.out
+4 4 4 7 
+pi@raspberrypi:/tmp $ 
+
+Execution under valgrind :
+pi@raspberrypi:/tmp $ valgrind ./a.out
+==3758== Memcheck, a memory error detector
+==3758== Copyright (C) 2002-2017, and GNU GPL'd, by Julian Seward et al.
+==3758== Using Valgrind-3.13.0 and LibVEX; rerun with -h for copyright info
+==3758== Command: ./a.out
+==3758== 
+4 4 4 7 
+==3758== 
+==3758== HEAP SUMMARY:
+==3758==     in use at exit: 0 bytes in 0 blocks
+==3758==   total heap usage: 13 allocs, 13 frees, 1,120 bytes allocated
+==3758== 
+==3758== All heap blocks were freed -- no leaks are possible
+==3758== 
+==3758== For counts of detected and suppressed errors, rerun with: -v
+==3758== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 6 from 3)
+pi@raspberrypi:/tmp $Read from a file to a linked list CI'm trying to read a txt file, and then save it to a linked list in C. I have tried a lot but I haven't found a solution.
+This is what I have:
+typedef struct contact{
+
+    char name[50];
+    char number[10];
+    char bithday[15];
+    struct contact *next;
+}contact;
+
+struct contact *head;
+FILE *fp;
+
+This part saves the contacts that I've already have to a txt file.
+void backup(){
+
+    struct contact *ap;
+
+    fp=fopen("save_contacts.txt", "w");
+
+    if(fp==NULL){
+        printf(" Error\n");
+        system("pause");
+        return 1;
+    }
+    for (ap=head;ap!=NULL;ap=ap->next){
+        fprintf(fp,"%s ",ap->name);
+        //fprintf(fp,", ");
+        fprintf(fp,"%s ",ap->number);
+        //fprintf(fp,", ");
+        fprintf(fp,"%s ",ap->birthday);
+        //fprintf(fp,", ");
+        fprintf(fp,"; ");
+    }
+    fprintf(fp, "End");
+}
+
+So my problem is with this part, it doesn't read the txt file.
+void read() {
+    struct contact *ap;
+    int i;
+    head=NULL;
+    char aux[30];
+
+    FILE *fp=fopen("save_contacts.txt","r");
+
+    do{
+
+        head=NULL;
+        ap=(contact*)malloc(sizeof(contact));
+
+        fscanf(fp,"%s ",&ap->name);
+        fscanf(fp,"%s ",&ap->number);
+        fscanf(fp,"%s ",&ap->birthday);
+        fscanf(fp,"%s ",aux);
+
+        if(strcmp(aux,";")==0){
+            ap=ap->next;
+        }
+    }while(strcmp(aux,"End")!=0);
+
+}Doing
+
+   ap=(contact*)malloc(sizeof(contact));
+
+   fscanf(fp,"%s ",&ap->name);
+   fscanf(fp,"%s ",&ap->number);
+   fscanf(fp,"%s ",&ap->birthday);
+   fscanf(fp,"%s ",aux);
+
+   if(strcmp(aux,";")==0){
+       ap=ap->next;
+
+
+ap->next is not set so the second turn ap has an undefined value so the behavior is undefined when you dereference it
+Note your way to save with :
+
+ for (ap=head;ap!=NULL;ap=ap->next){
+   ...
+   fprintf(fp,"; ");
+ }
+ fprintf(fp, "End");
+
+
+is not compatible with your way to read where ';' is replaced by 'End' for the last element
+You can do that (I suppose there is no ';' for the last element) :
+int read() {      
+  FILE *fp=fopen("save_contacts.txt","r");
+
+  if (fp == NULL) {
+    fprintf(stderr, "cannot open 'save_contacts.txt'\n");
+    head = NULL;
+    return 0;
+  }
+
+  contact ** pp = &head;
+  char aux[30];
+  int result;
+
+  for (;;) {
+    *pp = malloc(sizeof(contact));
+
+    if (fscanf(fp,"%49s %9s %14s %29s", (*pp)->name, (*pp)->number, (*pp)->birthday, aux) != 4) {
+      fputs("invalid file, cannot read the 3 fields then ;/End\n", stderr);
+      result = 0;
+      free(*pp);
+      break;
+    }
+    pp = &(*pp)->next;
+    if (strcmp(aux,"End") == 0) {
+      result = 1;
+      break;
+    }
+    if (strcmp(aux, ";") != 0) {
+      fputs("invalid file, expected ; or End\n", stderr);
+      result = 0;
+      break;
+    }
+  }
+
+  *pp = NULL;
+  fclose(fp);
+
+  return result;
+}
+
+returning 0 in case of a problem, else 1
+Note I protect the read of the string to not write out of them and I check if the file is correct
+
+For instance having the full program
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct contact{
+  char name[50];
+  char number[10];
+  char birthday[15]; /* not bithday */
+  struct contact *next;
+}contact;
+
+struct contact *head;
+
+int read() {      
+  FILE *fp=fopen("save_contacts.txt","r");
+
+  if (fp == NULL) {
+    fprintf(stderr, "cannot open 'save_contacts.txt'\n");
+    head = NULL;
+    return 0;
+  }
+
+  contact ** pp = &head;
+  char aux[30];
+  int result;
+
+  for (;;) {
+    *pp = malloc(sizeof(contact));
+
+    if (fscanf(fp,"%49s %9s %14s %29s", (*pp)->name, (*pp)->number, (*pp)->birthday, aux) != 4) {
+      fputs("invalid file, cannot read the 3 fields then ;/End\n", stderr);
+      result = 0;
+      free(*pp);
+      break;
+    }
+    pp = &(*pp)->next;
+    if (strcmp(aux,"End") == 0) {
+      result = 1;
+      break;
+    }
+    if (strcmp(aux, ";") != 0) {
+      fputs("invalid file, expected ; or End\n", stderr);
+      result = 0;
+      break;
+    }
+  }
+
+  *pp = NULL;
+  fclose(fp);
+
+  return result;
+}
+
+int main()
+{
+  if (read()) {
+    /* debug */
+    for (contact * p = head; p != NULL; p = p->next)
+      printf("%s %s %s\n", p->name, p->number, p->birthday);
+  }
+
+  /* free resources */
+  while (head != NULL) {
+    contact * p = head;
+
+    head = head->next;
+    free(p);
+  }
+
+  return 0;
+}
+
+Compilation and execution:
+pi@raspberrypi:/tmp $ gcc -pedantic -Wextra -Wall l.c
+pi@raspberrypi:/tmp $ cat save_contacts.txt 
+bruno 007 19/02/1960 ;
+you 001 01/01/2010 ;
+bar 123 31/12/1999 End
+pi@raspberrypi:/tmp $ ./a.out
+bruno 007 19/02/1960
+you 001 01/01/2010
+bar 123 31/12/1999
+pi@raspberrypi:/tmp $ 
+
+Execution under valgrind :
+pi@raspberrypi:/tmp $ valgrind ./a.out
+==2334== Memcheck, a memory error detector
+==2334== Copyright (C) 2002-2017, and GNU GPL'd, by Julian Seward et al.
+==2334== Using Valgrind-3.13.0 and LibVEX; rerun with -h for copyright info
+==2334== Command: ./a.out
+==2334== 
+bruno 007 19/02/1960
+you 001 01/01/2010
+bar 123 31/12/1999
+==2334== 
+==2334== HEAP SUMMARY:
+==2334==     in use at exit: 0 bytes in 0 blocks
+==2334==   total heap usage: 6 allocs, 6 frees, 5,712 bytes allocated
+==2334== 
+==2334== All heap blocks were freed -- no leaks are possible
+==2334== 
+==2334== For counts of detected and suppressed errors, rerun with: -v
+==2334== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 6 from 3)
+pi@raspberrypi:/tmp $Why do Berkeley sockets require byte swapping?I understand that on the wire, most integers are in big endian format. 
+But why is it the burden of the application to do the byte swapping in structures like sockaddr_in and not the kernels, where all the low level work actually happens? It would make more sense if the userspace API was more platform agnostic and should not deal with this.
+Why was the Berkeley socket API designed like this?The reason is probably historical.
+The socket API was invented (in the 1980s) when Sun-3 (MC68030) and Sun-4 (Sparc) workstations were kings. The endianness of these (slow by today's standards) processors mattered.
+I forgot the details, and probably BSD sockets conventions have been invented for some PDP-11 or VAX-780.
+
+But why is it the burden of the application to do the byte swapping in structures like sockaddr_in and not the kernels
+
+Probably because in the 1980s you did not want the computer (a thousand times slower than your mobile phone) to spend too much (uninterruptible) time in kernel-land.
+That question should really be asked on https://retrocomputing.stackexchange.com/ (and its answer lies inside the source code of some 1980s era Unix kernel)The only technical advantage I can think of is that it allows the application to do the conversion once and cache it.
+Then, for myriad calls to say sendto() for UDP, or what have you, the re-ordered-if-necessary address is supplied to the OS which can copy it as-is directly into outgoing network packets.
+The alternative of doing it in the kernel would require every call to sendto() to take what the app knows as the same address over and over, and reconvert it every time.
+Since sendto() benefits from this, they have the rest of the API work the same way.Get difference of two address of array(use & operator)I want to get the address difference between two elements in an array.
+int vector[] = { 28, 41, 7 };
+
+printf("%d\n", &vector[2]); // 1703652
+printf("%d\n", &vector[1]); // 1703648
+printf("%d\n", &vector);    // 1703644
+
+printf("%d\n", &vector[1] - &vector); // 1
+
+The result I expect(Last Line) is 4 because the data type was int.
+Further, each result of address has 4 differences.
+But why is the result of
+&vector[1] - &vector
+
+1 and not 4?
+And how do I get 4 by using subtraction operator?pointer arithmetics in C language works on the type of the object. It does not matter how big the object is. The reference to the next object minus reference to the previous is always one object
+So if we add 5 to the pointer it will point 5 objects ahead. If we increment the pointer it will reference the next object. It helps indexing and iterating across the objects.
+When you printf the address (your format is wrong - you should use %p instead) it is printed in bytes. So the difference between the consecutive objects will be equal the size of the object (plus the optional padding).
+
+And How to I get 4 by using subtraction operator???
+
+Cast the pointers to the type which sizeof is one for example char.
+(char *)&vector[1] - (char *)&vectorYou can calculate the difference of pointers to byte-sized values by casting the pointers to char *:
+printf("%d\n", (char*)&vector[1] - (char*)vector);Xlib - Two issues with call to XMoveResizeWindowI am new to Xlib (in C) and am having two issues when calling the XMoveResizeWindow function.
+ex.
+XMoveResizeWindow(display, window_id, move_x, move_y, resize_x, resize_y);
+1) After the call, the window I move will reposition itself correctly, however, if I select the window with the pointer after the move, it will instantly revert back to the position it held prior to the move.  I assume I have to somehow 'update' the X11 server after it's moved with the windows new position?  
+2) Secondly, in regards to the resize of the window.  My window is essentially being truncated by the x and y values entered, instead of resized.  In other words, instead of the entire window shrinking down, the right and bottom sides of the window are cut off from view.  Is there a way to instead resize the entire window?
+--I am sorry I am unable to submit my complete code, however, I believe my issues are due solely to my lack of understanding of Xlib and this particular function's operations.  As such, I am not neccessarily looking for specific code as a solution, merely an explination or suggestion on how I should go about implementing a solution.
+Thank you.I believe there is something wrong with your code, since that code is not available i'll point to an example.
+Examples are given at readme itself.API to set the timestamps on files & directories in btrfsBTRFS files/directories contains the timestamps:
+
+Creation (otime)
+Modification (mtime)
+Attribute modification (ctime)
+Access (atime)
+
+Is there some API where I could set these all these timestamps for a file? I googled a bit but haven't found anything yet.
+Programming languages doesn't matter, I would expect there to be some C API, but python is fine too and would be nicer.From C, the mtime and atime can be set using utime(2) and its relatives.  utime(2) itself gives you seconds precision, utimes(2) has microseconds, and utimensat(2) gives you nanoseconds.  There are variants like futime if you have a file handle instead of a file name.
+Python can provide the same via the os.utime function.
+Traditionally it is not possible to arbitrarily modify the otime or ctime, other than by manually editing the raw filesystem.  I am not aware that Linux has provided any kernel API to modify them.  Of course, you can update the ctime to the current time by changing its status in some way, and you can update the otime to the current time by deleting and recreating the file.  In principle you can set them to a different time by changing the system clock first (if you are root), but this is likely to mess up lots of other stuff on the system and is probably a bad idea.Problem to pass argument from bash script to C program [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 2 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I have some problems passing argument from bash file to C program. 
+I'm using a bash script to compile C program like this:
+gcc -O0 filec1.c -lm -o fileoutput
+./fileoutput $1 $2 $3 $4 $5 $6 $7 $8 $9 $10 $11
+
+Now if I print each argument in bash file adding these lines:
+for i in $@; do
+    echo $i
+done
+
+each argument passed is correctly printed but if I print each argument in the c file that has just a main with the following lines:
+int main(int argc, char **argv){
+    for(int i=0; i<argc; i++){
+        printf("%s\n", argv[i]);
+    }
+}
+
+the output for the arguments after 9th are wrong or not printed.
+Someone can help me please?If you are referring to bash arguments inside a bash script, you can use "$@"
+instead of individual arguments, it expands to whatever arguments you pass to it.
+Edit
+https://stackoverflow.com/a/3898681/152016 refer to the bash man page, explaining the meaning of that special variable, there are other useful variables too like $# and $?.
+Added quotes around the variable thanks to @DanielPryden comment. See a very good explanation why, here: https://stackoverflow.com/a/3990540/152016How to represent a buffer as linked list in CI have preallocated buffer (array of chars) to which strings are being written, it looks like this:
+"This\0buffer\0contains\0strings\00000..."
+I want to be able to remove the last string, so I came up with the idea to represent each string in the buffer as a linked list node with pointers to its start and end, so I would just find the last node and fill the region it holds with zeros.
+struct node 
+{ 
+  char *str_start;
+  char *str_end;
+  struct node *next; 
+};
+
+It looks like a very common problem, however, I failed to find such implementations anywhere.
+The question is: Is there some data structure for my usecase I overlooked, or is there a better solution to do this?
+Note: This is to be used in the kernel module, so maybe it's already implemented in kernelYou could use a 2 dimensional array (considering the buffer is preallocated and you know of a maximum size for every string).
+That would make enforcing string sizes easier, hence your code more secure.While return si_addr with offset from sigwaitinfo function causing segmentation faultI am working on the signal handler to deal with reap signals, randomly I am getting the signal with offset when I call sigwaitinfo function. All the signal attributes are right, except for info.si_addr. This offset in info.si_addr is causing a segmentation fault.
+This offset seems to be the same - I have tried removing the offset and that works, but I need a correct solution to go forward.
+static void *signalHandler(void *vptr_args __attribute__((unused)))
+  {
+      sigset_t signal_set;
+      siginfo_t info;
+
+      sigemptyset(&signal_set);
+      sigaddset(&signal_set, SIG_REAP);
+      sigaddset(&signal_set, SIG_ISOC_CANCEL);
+      sigaddset(&signal_set, SIGTERM);
+      sigaddset(&signal_set, SIGPIPE);
+
+      while (true) {
+          int rc = sigwaitinfo(&signal_set, &info);
+          //...
+          if (rc > 0) 
+{
+            if(info.si_signo == SIG_REAP) 
+               {
+                 // Reap URBs after some simple checks
+                 if ((info.si_code != SI_ASYNCIO) &&
+                     (info.si_code != SI_KERNEL)) {
+                      printf("Bad si_code %d in SIG_REAP", info.si_code);                      
+                      continue;
+                 } 
+                   else {
+                      printf("OK si_code %d in SIG_REAP", info.si_code);
+                 }
+                   struct usbdevfs_urb *ioctl_urb = (struct usbdevfs_urb*)info.si_addres
+                  if (!ioctl_urb) {
+                     printf("SIG_REAP gave NULL ioctl_urb");
+                      continue;
+                  }
+                  UrbInfo *urbInfo = ioctl_urb->usercontext;
+                  if (!urbInfo) {
+                     printf("SIG_REAP gave NULL urbInfo");
+                      continue;
+}You are misusing si_addr.  It is available for only a limited number of signals, and those do not include any real-time signals.
+Per POSIX, si_addr is not applicable for signals other than SIGILL, SIGFPE, SIGSEGV, and SIGBUS. Linux also provides si_addr data for SIGTRAP:
+
+SIGILL, SIGFPE, SIGSEGV, SIGBUS, and SIGTRAP fill in si_addr with the address of the fault.
+
+No other signals provide a value for si_addr.
+The source code linux/kernel/signal.c that fills in si_addr clearly shows that si_addr is not used for any signals other than those listed.
+Note that per the Linux signal(7) man page:
+
+Real-time signals are distinguished by the following:
+
+Multiple instances of real-time signals can be queued.  By
+         contrast, if multiple instances of a standard signal are
+         delivered while that signal is currently blocked, then only one
+         instance is queued.
+If the signal is sent using sigqueue(3), an accompanying value
+         (either an integer or a pointer) can be sent with the signal.  If
+         the receiving process establishes a handler for this signal using
+         the SA_SIGINFO flag to sigaction(2), then it can obtain this data
+         via the si_value field of the siginfo_t structure passed as the
+         second argument to the handler.  Furthermore, the si_pid and
+         si_uid fields of this structure can be used to obtain the PID and
+         real user ID of the process sending the signal.
+
+...Recursively reverse linked listI am having hard time understanding how this recursive code works, I have made drawings and run the code through gdb.
+void RecursiveReverse(struct node** headRef) 
+{
+  struct node* first;
+  struct node* rest;
+
+  if (*headRef == NULL) return; // empty list base case
+
+  first = *headRef; // suppose first = {1, 2, 3}
+  rest = first->next; // rest = {2, 3}
+
+  if (rest == NULL) return; // empty rest base case
+
+  RecursiveReverse(&rest); // Recursively reverse the smaller {2, 3} case
+                           // after: rest = {3, 2}
+
+  first->next->next = first; // put the first element on the end of the list
+  first->next = NULL;
+
+  *headRef = rest; // fix the head pointer
+}
+
+I understand that while the recursion call stack is being built up and once the list contains only {3}, empty rest base case if (rest == NULL) is true for the first time.
+
+After this, the recursion call stack starts to break and hits first->next->next = first; for the first time, with {2, 3}, 
+Before this line is executed, output in gdb:
+(gdb)p *first
+{data = 2, next = 0x1003001f0}
+
+(gdb) p *rest
+{data = 3, next = 0x0} 
+
+After this line is executed,
+(gdb) p *rest
+{data = 3, next = 0x1003000a0}
+
+
+Continuing with code execution to hit first->next->next = first;, the second time:
+(gdb) p **head_ref
+{data = 1, next = 0x1003000a0}
+
+(gdb) p *rest
+{data = 3, next = 0x1003000a0} // expected p *rest to be 2
+
+Here I expected that the local pointer rest should point to node 2, because while building up recursion call stack, **headRef pointed to node 1 and after line rest = first->next;, got executed rest pointed to node 2.
+After *headRef = rest;, is executed, shouldn't headRef point to node 2?
+How come that local state is lost and rest points to node 3?Let's assume that you have a list and its rest part is already reversed.
+Before reversing the rest part the list had this structure
+first -> first_of_rest -> second_of_rest->...->nth_of_rest->nullptr
+
+After reversing the rest part you will get
+first -> nullptr <- first_of_rest <- second_of_rest <-...<-nth_of_rest
+         |                                                      |
+         ________________________________________________________
+                            the rest part of the list
+
+So the data member next of the node first points to first_of_rest while the data member next of the node first_of_rest "points" to nullptr.
+So what we need to do at this moment is to set the data member of the node first_of_rest to point to the node first 
+first->next->next = first;
+
+abd set the data member next of the node first to "point" to nullptr.
+first->next = NULL;
+
+Thus we have
+nullptr <-first <- first_of_rest <- second_of_rest <-...<-nth_of_restHere is simplified pseudo code. It basically work like this:
+RecursiveReverse(head):
+    if head is empty:
+        return
+    RecursiveReverse(head->next)
+
+    // When we come here, the whole list except the first
+    // element has been reversed. So all that's left to do
+    // is to reverse the final step
+
+    head->next->next = head
+    head->next = NULL
+
+The most important thing to realize here is that AFTER the recursive call, the whole list EXCEPT the first element has been reversed.The magic of STREAMS in Linux. When to finish?Today at 5am I read an article about read system call. And things become significantly clear for me. 
+
+ssize_t read(int fd, void *buf, size_t count);
+
+The construction of *nix like operation system become  amazing in it's simplicity. File interface for any entity, just ask to write some date from this fd interface into some memory by *buf pointer. All the same for network, files, streams.
+But some question appears. 
+How to distinguish two cases?: 
+1) Stream is empty need to wait for new data. 2) Stream is closed need to close program.
+Here is a scenario: 
+
+Reading data from STDIN in loop, this STDIN redirected by pipe.
+some text_data appears
+just read bite by bite until what EOF in memory, or 0 as result of read call?
+How program will understand: wait for a new input, or exit?
+
+This is unclear. In case of endless or continuous streams.
+UPD After speak with @Bailey Kocin and reading some docs I have this understanding.  Fix me if I'm wrong.
+
+read holds the program execution and waits for count amount of bites.
+When count amount of bites appears read writes it into buf and execution continues.
+When stream is closed read returns 0, and it is a signal that program may be finished.
+
+Question Do EOF appears in buf?
+UPD2 EOF is a constant that can be in the output of getc function
+ while (ch != EOF)     { 
+    /* display contents of file on screen */ 
+    putchar(ch);  
+
+    ch = getc(fp);   
+ }
+
+But in case of read the EOF value dose not appears in a buf. read system call signalize about file ending by returning 0. Instead of writing EOF constant into the data-area, as like ak in case of getc.
+EOF is a constant that vary in different systems. And it used for getc.Let's deal first with your original question.  Note that man 7 pipe should give some useful information on this.
+Say we have the standard input redirected to the input side of a descriptor created by a pipe call, as in:
+pipe(p);
+// ... fork a child to write to the output side of the pipe ...
+dup2(p[0], 0);  // redirect standard input to input side
+
+and we call:
+bytes = read(0, buf, 100);
+
+First, note that this behaves no differently than simply reading directly from p[0], so we could have just done:
+pipe(p);
+// fork child
+bytes = read(p[0], buf, 100);
+
+Then, there are essentially three cases:
+
+If there are bytes in the pipe (i.e., at least one byte has been written but not yet read), then the read call will return immediately, and it will return all bytes available up to a maximum of 100 bytes.  The return value will be the number of bytes read, and it will always be a positive number between 1 and 100.
+If the pipe is empty (no bytes) and the output side has been closed, the buffer won't be touched, and the call will return immediately with return value of 0.
+Otherwise, the read call will block until something is written to the pipe or the output side is closed, and then the read call will return immediately using the rules in cases 1 and 2.
+
+So, if a read() call returns 0, that means the end-of-file was reached, and no more bytes are expected.  Waiting for additional data happens automatically, and after the wait, you'll either get data (positive return value) or an end-of-file signal (zero return value).  In the special case that another process writes some bytes and then immediately closes (the output side of) the pipe, the next read() call will return a positive value up to the specified count.  Subsequent read() calls will continue to return positive values as long as there's more data to read.  When the data are exhausted, the read() call will return 0 (since the pipe is closed).
+On Linux, the above is always true for pipes and any positive count.  There can be differences for things other than pipes.  Also, if the count is 0, the read() call will always return immediately with return value 0.  Note that, if you are trying to write code that runs on platforms other than Linux, you may have to be more careful.  An implementation is allowed to return a non-zero number of bytes less than the number requested, even if more bytes are available in the pipe -- this might mean that there's an implementation-defined limit (so you never get more than 4096 bytes, no matter how many you request, for example) or that this implementation-defined limit changes from call to call (so if you request bytes over a page boundary in a kernel buffer, you only get the end of the page or something).  On Linux, there's no limit -- the read call will always return everything available up to count, no matter how big count is.
+Anyway, the idea is that something like the following code should reliably read all bytes from a pipe until the output side is closed, even on platforms other than Linux:
+#define _GNU_SOURCE 1
+#include <errno.h>
+#include <unistd.h>
+
+/* ... */
+
+    while ((count = TEMP_FAILURE_RETRY(read(fd, buffer, sizeof(buffer)))) > 0) {
+        // process "count" bytes in "buffer"
+    }
+    if (count == -1) {
+        // handle error
+    }
+    // otherwise, end of data reached
+
+If the pipe is never closed ("endless" or "continuous" stream), the while loop will run forever because read will block until it can return a non-zero byte count.
+Note that the pipe can also be put into a non-blocking mode which changes the behavior substantially, but the above is the default blocking mode behavior.
+With respect to your UPD questions:
+Yes, read holds the program execution until data is available, but NO, it doesn't necessarily wait for count bytes.  It will wait for a least one non-empty write to the pipe, and that will wake the process; when the process gets a chance to run, it will return whatever's available up to but not necessarily equal to count bytes.  Usually, this means that if another process writes 5 bytes, a blocked read(fd, buffer, 100) call will return 5 and execution will continue.  Yes, if read returns 0, it's a signal that there's no more data to be read and the write side of the pipe has been closed (so no more data will ever be available).  No, an EOF value does not appear in the buffer.  Only bytes read will appear there, and the buffer won't be touched when read() returns 0, so it'll contain whatever was there before the read() call.
+With respect to your UPD2 comment:
+Yes, on Linux, EOF is a constant equal to the integer -1.  (Technically, according to the C99 standard, it is an integer constant equal to a negative value; maybe someone knows of a platform where it's something other than -1.)  This constant is not used by the read() interface, and it is certainly not written into the buffer.  While read() returns -1 in case of error, it would be considered bad practice to compare the return value from read() with EOF instead of -1.  As you note, the EOF value is really only used for C library functions like getc() and getchar() to distinguish the end of file from a successfully read character.
