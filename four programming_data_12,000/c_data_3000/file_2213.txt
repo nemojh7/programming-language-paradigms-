@@ -1,0 +1,4210 @@
+C - where is constant located in a process's memory?From the similar question here I see that the constant variable must be in the program's process memory Text segment, and if I'm understanding everything correct - it's really is:
+int main() {
+
+    static const char somedata[8192] = "somedata";
+
+    while (1) {
+        printf("\tAddress of main: %p\n", main);
+        printf("\tMy process ID : %d\n", getpid());
+        printf("\tArray Some first address: %p\n", &somedata[1]);
+        sleep(10);
+    };
+
+    return 0;
+}
+
+This gives me result:
+
+Address of main: 0x4bc38b971a
+My process ID : 633
+Array Some first address: 0x4bc38b9881
+
+
+After running it - /proc/maps confirms it:
+
+$ cat /proc/633/maps 
+4bc38b9000-4bc38bc000 r-xp 00000000 fe:01 19664256
+
+
+0x4bc38b9881 is 325403252865 in dec, 0x4bc38b9000 - 0x4bc38bc000 is  325403250688-325403262976, and 325403252865 is between those borders, all looks correct.
+The size also tells it is in the text:
+
+$ size mem_lay_inc_text_print
+   text    data     bss     dec     hex filename
+  10097     608       8   10713    29d9 mem_lay_inc_text_print
+
+
+But this (and a lot of similar) topic says - constant is in the Initialized Data Segment instead on Code segment:
+
+Initialized data stores all global, static, constant,
+
+So - where the truth is? Or I'm just misunderstanding something? 
+Maybe 4bc38b9000-4bc38bc000 contains both Init. data and Text segments?
+No, it doesn't:
+...
+static int i = 100;
+
+while (1) {
+    printf("Address of main: %p\n", main);
+    printf("My process ID : %d\n", getpid());
+    printf("Array Some first address: %p\n", &somedata[1]);
+    printf("Int I address: %p\n", &i);
+...
+
+Now from size's results I see that data became bigger (data 612 instead of 608 from the first result), maps also says same:
+
+...
+Int I address: 0xea335af040
+...
+
+
+And maps:
+
+$ cat /proc/8859/maps
+ea333ac000-ea333af000 r-xp 00000000 fe:01 19664256
+ea335ae000-ea335af000 r--p 00002000 fe:01 19664256
+ea335af000-ea335b0000 rw-p 00003000 fe:01 19664256
+
+
+0xea335af040 is in the ea335af000-ea335b0000 with rw-p, which is data...
+Really confused here...
+
+$ gcc --version
+gcc (GCC) 7.1.1 20170630
+
+
+So the question is: where the constant is stored - in Initialized data, or Text segment? Or it depends on compiler/OS?I prefer to write an extended comment here rather than the comments because of space and formatting limitations.
+To begin with, the memory layout link in at https://developerinsider.co/memory-layout-representation-of-c-program/ is not wrong; it just fails to mention that it is attempting a fully generalized discussion over ALL OSes. The four layout concepts to come away with that are universal are: 1) Code, 2) Data allocated at build time (this gets messy), and the two flavors of dynamic data: 3) Stack and 4) Heap. As shown. It neglects to mention the many actual mechanics needed for a dynamically linked environment, such as the Global Offset Table (.got).
+One important distinction that I believe is fuzzy for the OP is executable file layout versus the running process memory layout. Executable file layout, such as ELF, is the latent bits on disk that contain the blueprint for a process. This is where it makes sense to talk of all the specific sections and where the objdump tool applies. objdump -h foo will in fact show 30 sections.
+The executable loader in the Linux kernel maps these many sections to just a few memory regions to minimize the complexity and overhead of managing memory.
+The next important distinction is between generalized Unix behavior versus the specifics of Linux where, at least in conception, performance on cheap hardware is at a premium over elegance and adherence to clean separations. Hence in the referenced link:
+
+For that reason, the .rodata section, which contains read-only
+  initialized data, is packed into the same segment that contains the
+  .text section.
+
+This is unfortunate, because read-only initialized data has totally unnecessary execute permissions attached. Almost certainly a hardened variation of Linux would not do this at the expense of slight memory or CPU wastage.
+Here's my code (I note you're using 1-based arrays -- oops, that's not how C works!) -- which tries to show read-only versus read-write mappings:
+#include <stdio.h> /* printf */
+#include <sys/types.h> /* getpid */
+#include <unistd.h> /* getpid */
+#include <sys/select.h>
+
+const char small_ro_global[  16] = "small ro global";
+char       small_rw_global[  16] = "small ro global";
+const char   big_ro_global[8192] = "  big ro global";
+char         big_rw_global[8192] = "  big rw global";
+
+int main(int argc, char *argv[]) {
+  /* small_ro_global[1] = 'b'; compile error */
+  small_rw_global[1] = 'c'; /* ensure writable */
+
+  printf("Address of main: %p\n", main);
+  printf("My process ID : %d\n", getpid());
+
+  printf("small_ro_global: %p big_ro_global: %p small_rw_global: %p big_rw_global: %p\n",
+         small_ro_global, big_ro_global, small_rw_global, big_rw_global);
+
+  /* waits forever */
+  select(0, NULL, NULL, NULL, NULL);
+
+  return 0;
+}
+
+GCC: v. 4.8.4  GNU/Linux distribution: Ubuntu 15.10 Hardware: Intel 64-bit
+Output:
+Address of main: 0x4005cd
+My process ID : 5788
+small_ro_global: 0x400700 big_ro_global: 0x400720 small_rw_global: 0x603060 big_rw_global: 0x603080
+
+/proc/5788/maps excerpt. Note what lands in 1st vs. 3rd section but nothing lands in 2nd section:
+00400000-00403000 r-xp 00000000 ca:01 1947                               /root/foo
+00602000-00603000 r--p 00002000 ca:01 1947                               /root/foo
+00603000-00606000 rw-p 00003000 ca:01 1947                               /root/foo
+
+Finally thanks to that link just learned about readelf -l which gives the below. In particular see segment 02 containing .text and .rodata sections.
+ Section to Segment mapping:
+  Segment Sections...
+   00     
+   01     .interp 
+   02     .interp .note.ABI-tag .note.gnu.build-id .gnu.hash .dynsym .dynstr .gnu.version .gnu.version_r .rela.dyn .rela.plt .init .plt .text .fini .rodata .eh_frame_hdr .eh_frame 
+   03     .init_array .fini_array .jcr .dynamic .got .got.plt .data .bss 
+   04     .dynamic 
+   05     .note.ABI-tag .note.gnu.build-id 
+   06     .eh_frame_hdr 
+   07     
+   08     .init_array .fini_array .jcr .dynamic .got 
+
+From the documentation on proc (5) we learn that the 2nd in memory segment (permission: read-only, not executable), and correlating that with objdump, is for process mechanics: dynamic linking and exception handling. It contains the sections: .eh_frame_hdr, .eh_frame, .init_array, .fini_array, .jcr, .dynamic, and .got.
+So, nothing you can point in your code will ever show in that region.Separating string and integer using delimiterGood day,
+So currently I have this file and contains: the actual file is like this    
+1,name A. lname2,Das F. Esd3,Frsas A. Casdfre4,Rsadna P. Tsdaas5,Asadla C. Toasdtino6,Aasdel P. Gasdla7,Masda Isable A. Milasdroso8,Niasdkie T. Niasdemus9,Evasdn A. Vasdueva10,Geasdlyn C. Iasdncio11,Aasdr Leasdma12,Neasdio A. Maasdbale
+
+I have trouble doing the output, here is my current code    
+printf("\nID\tName\n");    
+while(fscanf(load, "%[^,],%[^1-9]", faculty[counter].id, faculty[counter].name)!=EOF) {  
+    printf("%s\t%s", faculty[counter].id, faculty[counter].name);
+
+
+and the output goes like this:    
+ID  Name    
+1   asdasd    
+2   asdas   
+3   asdsad4     othername    
+5   asdsad   
+6   asdasda    
+7   sdfsdf    
+8   sadsad   
+9   asdsad       
+10  asdas    
+11  asdsad12    asdas       
+4,12 has invalid position.
+
+the output should be arange:
+1  ID   Name    
+1   asdasd    
+2   asdas   
+3   asdsad    
+4   othername    
+5   asdsad   
+6   asdasda    
+7   sdfsdf    
+8   sadsad   
+9   asdsad       
+10  asdas    
+11  asdsad    
+12  asdas    
+
+What could be the problem? This is my first time using such delimiter, and can you please explain what's the problem? Thanks!Change the format to this:
+printf("\nID\tName\n");    
+while (fscanf(load, " %[0-9], %[^0-9]", faculty[counter].id, faculty[counter].name) == 2) {  
+    printf("%s\t%s\n", faculty[counter].id, faculty[counter].name);
+    ...
+    counter++;
+}
+
+Note that you should also pass the maximum number of characters to store to the destination arrays to avoid potential buffer overflows.
+Note however that the sample output posted in the question is inconsistent with the code fragment: you do not output a newline in the printf format and confirm there is no newline in the data file, where do the newlines in the output come from?
+Can you make a test file with fake names that shows the problem? Also post the complete code that fails. The structure definitions are important too. It is difficult to set a diagnostic without precise data and code.This is one circumstance where reading with fscanf alone can work, but lacks the robustness you can achieve by reading the entire line at once and then parsing the line with either sscanf or simply walking a pair of character pointers down the line picking out the id and name pairs.
+To use fscanf on the line you have posted as input, you can use the format specifier of "%d,%[^0-9]" in repeated calls to fscanf. (you should provide a field-width modifier to prevent against overflow if name is longer than your array size). For example you could do something like the following to obtain each id and name pair (which are just output in the example below):
+#include <stdio.h>
+
+enum { MAXNM = 64 };   /* constant for max characters in name */
+
+int main (int argc, char **argv) {
+
+    int id;
+    char name[MAXNM] = "";
+    FILE *fp = argc > 1 ? fopen (argv[1], "r") : stdin;
+
+    if (!fp) {  /* validate file open for reading */
+        fprintf (stderr, "error: file open failed '%s'.\n", argv[1]);
+        return 1;
+    }
+
+    /* read each 'id,name' pair (name cannot include digits) */
+    while (fscanf (fp, "%d,%63[^0-9]", &id, name) == 2)
+            printf ("%3d    %s\n", id, name);
+
+    if (fp != stdin) fclose (fp);     /* close file if not stdin */
+
+    return 0;
+}
+
+Example Use/Output
+$ ./bin/rd_num_name <dat/num_names.txt
+  1    name A. lname
+  2    Das F. Esd
+  3    Frsas A. Casdfre
+  4    Rsadna P. Tsdaas
+  5    Asadla C. Toasdtino
+  6    Aasdel P. Gasdla
+  7    Masda Isable A. Milasdroso
+  8    Niasdkie T. Niasdemus
+  9    Evasdn A. Vasdueva
+ 10    Geasdlyn C. Iasdncio
+ 11    Aasdr Leasdma
+ 12    Neasdio A. Maasdbale
+
+If you want to use line-oriented input with fgets or getline to read the entire line and then parse each id and name from the buffer holding the entire line, you can do something like the following. The benefit of reading the entire line, and then parsing -- is that it decouples the read from the parse allowing you to validate both. Additionally, your read isn't subject to matching failures on slight variations of input format.
+Here, using sscanf and utilizing the %n format specifier to determine the number of characters consumed by each call to sscanf, you can walk a pointer down the line picking out id and name pairs, e.g.
+#include <stdio.h>
+
+enum { MAXNM = 64, MAXLN = 512 };   /* max name & line constants */
+
+int main (int argc, char **argv) {
+
+    int id;
+    char name[MAXNM] = "",
+        line[MAXLN] = "",
+        *p = line;          /* pointer to line to walk string */
+    FILE *fp = argc > 1 ? fopen (argv[1], "r") : stdin;
+
+    if (!fp) {  /* validate file open for reading */
+        fprintf (stderr, "error: file open failed '%s'.\n", argv[1]);
+        return 1;
+    }
+
+    while (fgets (line, sizeof line, fp))   /* read each line / validate */
+    {
+        int offset = 0;                     /* number of char processed  */
+        while (sscanf (p, "%d,%63[^0-9]%n", &id, name, &offset) == 2) {
+            printf ("%3d    %s\n", id, name);
+            p += offset;                    /* advance to next id,name */
+        }
+    }
+
+    if (fp != stdin) fclose (fp);     /* close file if not stdin */
+
+    return 0;
+}
+
+Note: the output is the same.MSVC: Error mapping a structure to an array of offsetofI am trying to fill-in an array with the offset of structure field, I am trying to do the following
+#define EXPAND_(X) X
+#define TYPE_ARG_N(_0, _1, _2, N, ...) N
+#define TYPE_OFFSET_1(S, _0) { sizeof(S), { offsetof(S, _0) } }
+#define TYPE_OFFSET_2(S, _0, _1) { sizeof(S), { offsetof(S, _0), offsetof(S, _1) } }
+#define TYPE_OFFSET_3(S, _0, _1, _2) { sizeof(S), { offsetof(S, _0), offsetof(S, _1), offsetof(S, _2) } }
+#define TYPE_OFFSET_LIST() TYPE_OFFSET_3, TYPE_OFFSET_2, TYPE_OFFSET_1
+#define TYPE_OFFSET_N_(...) EXPAND_(TYPE_ARG_N(__VA_ARGS__))
+#define TYPE_OFFSET_ARGS(...) EXPAND_(__VA_ARGS__)
+#define TYPE_OFFSET_SELECT(...) TYPE_OFFSET_N_(__VA_ARGS__, TYPE_OFFSET_LIST())
+#define TYPE_OFFSET(S, ...) TYPE_OFFSET_SELECT(__VA_ARGS__)(S, TYPE_OFFSET_ARGS(__VA_ARGS__))
+
+typedef struct {
+    size_t      size;
+    size_t*     offsets;
+} tTable;
+
+tTable t = TYPE_OFFSET(tTable, size, offsets);
+
+MSVC2017 fails with the following:
+error C4003: not enough actual parameters for macro 'TYPE_OFFSET_2'
+error C2065: 'offsets': undeclared identifier
+error C2102: '&' requires l-value
+
+Any idea on how to fix these macros ?For debugging things like this, try running things through just the preprocessor using the /EP flag.  Doing so with your code shows this output:
+typedef struct {
+    size_t      size;
+    size_t*     offsets;
+} tTable;
+
+tTable t = fxma.h(17) : warning C4003: not enough actual parameters for macro 'TYPE_OFFSET_2'
+{ sizeof(tTable), { offsetof(tTable, size, offsets), offsetof(tTable, ) } };
+
+The problem here is that Microsoft's preprocessor has this notion of a single macro argument having commas in it.  This happens when the commas are produced by the expansion of another macro.
+In particular, TYPE_OFFSET calls TYPE_OFFSET_2 with (tTable, size, offset), but size, offset together (being the expansion of TYPE_OFFSET_ARGS(__VA_ARGS__)) isn't actually two different arguments... it's only 1.  TYPE_OFFSET_2 then is getting only two arguments; in other words:
+
+S is tTable1
+_0 is size, offset
+_1 is missing
+
+(You can see this in the expansion; offsetof(tTable, size, offsets)).
+A fix is to add a level of indirection.  Replace your version of TYPE_OFFSET with this:
+#define TYPE_OFFSET_CALL(X, Y) X Y
+#define TYPE_OFFSET(S, ...) TYPE_OFFSET_CALL(TYPE_OFFSET_SELECT(__VA_ARGS__),(S, TYPE_OFFSET_ARGS(__VA_ARGS__)))Is it possible to rotate a 128-bit value in Altivec?I'm trying to port some ARM NEON code to AltiVec. Our NEON code has two LOAD's, one ROT, one XOR and a STORE so it seems like a simple test case. According to IBM's vec_rl documentation:
+
+Each element of the result is obtained by rotating the corresponding element of a left by the number of bits specified by the corresponding element of b.
+
+The docs go on to say vector unsigned int is the largest data type unless -qarch=power8, in which case vector unsigned long long applies.
+I'd like to perform a 128-bit rotate, and not 32-bit or 64-bit rotation of individual elements. The bit positions are 19, 31, 67, 97, and 109. They are not byte aligned. (The constants arise from the ARIA block cipher).
+Are 4x32 and 2x64 the largest AltiVec data arrangements? Is it possible to rotate a 128-bit value in Altivec?
+If the packed rotate is the only operation available, then is it a best practice to do the bit twiddling in C or in AltiVec?You can do a rotate by a multiple of 8 bits using vsld (vec_sld), then to handle any remaining rotation of < 8 bits you'll probably need to use vsl + vsr + vsel (vec_sll + vec_srl + vec_sel).Find function in a treeI have a problem with a function that should find all the nodes in a tree that have the same name and I have to save the path for every node found.
+I have implemented my function with an algorithm based on the Depth-First-Search but the problem is that the path saved is incomplete. For Example the node is in the path /dir0rid/dir0rid/dir1rid/file1 and the function save just the path /dir1rid/file1.
+This is my function:
+void find(node_t *Fs) {
+    int i = 0;
+
+    while (i < 1024) {
+        if (Fs->figli[i] != NULL) {
+            if (Fs->figli[i]->nome_file == NULL) {
+                i++;
+            } else {
+                if (strcmp(Fs->figli[i]->nome_file, "DELETED") != 0) {
+                    if (Fs->figli[i]->type == 1) {
+                        i++;
+                    } else {
+                        finded[j_index] = Fs->figli[i];
+                        j_index++;
+
+                        find(Fs->figli[i]);
+                        i++;
+                        j_index--;
+                        finded[j_index] = NULL;
+                    }
+                } else {
+                    i++;
+                }
+            }
+        } else {
+            i++;
+        }
+    }
+
+    if (hash_search(Fs, file_cercato) != NULL) {
+        int j = 0;
+        percorso[f_index][0] = '\0';
+
+        while (finded[j] != NULL) {
+            strcat(percorso[f_index], "/");
+            strcat(percorso[f_index], finded[j]->nome_file);
+            j++;
+        }
+
+        strcat(percorso[f_index], "/");
+        strcat(percorso[f_index], file_cercato);
+        f_index++;
+        percorso[f_index][0] = '\0';
+    }
+    return;
+}Simplified version of the loop(I omitted the hashstuff):
+
+void find2 (node_t* Fs){
+
+    int i ;
+
+    for(i=0; i < 1024; i++){
+        if (Fs->figli[i] == NULL) continue;
+        if(Fs->figli[i]->nome_file == NULL) continue;
+        if(!strcmp(Fs->figli[i]->nome_file,"DELETED")) continue;
+        if(Fs->figli[i]->type==1) continue;
+        finded[j_index]=Fs->figli[i];
+
+        j_index++;
+        find(Fs->figli[i]);
+        j_index--; // <<--
+
+        finded[j_index]=NULL; // <<--
+    }
+}
+
+
+Now, Idon't understand your logic, butI think the j_index--; is wrong. It should probably be placed after the finded[j_index]=NULL;There are some issues in your code:
+
+You should use for loops to simplify the index updates and make the code more readable.
+You should set finded[j_index] to NULL before calling find recursively or change the final loop to stop at j_index.
+
+Here is a modified version:
+void find(node_t *Fs) {
+    for (int i = 0; i < 1024; i++) {
+        if (Fs->figli[i] != NULL
+        &&  Fs->figli[i]->type != 1
+        &&  Fs->figli[i]->nome_file != NULL
+        &&  strcmp(Fs->figli[i]->nome_file, "DELETED") != 0) {
+            finded[j_index] = Fs->figli[i];
+            j_index++;
+            find(Fs->figli[i]);
+            j_index--;
+        }
+    }
+    if (hash_search(Fs, file_cercato) != NULL) {
+        percorso[f_index][0] = '\0';
+        for (j = 0; j < j_index; j++) {
+            strcat(percorso[f_index], "/");
+            strcat(percorso[f_index], finded[j]->nome_file);
+        }
+        strcat(percorso[f_index], "/");
+        strcat(percorso[f_index], file_cercato);
+        f_index++;
+        percorso[f_index][0] = '\0';
+    }
+}
+
+Note also that all these global variables used should be moved to a structure passed as an argument to find().C - How do I print out characters between double quotes in a string array?Suppose I have a character array as shown below:  
+char a[20] = "abc\"defg\"hij";  
+
+How do I get it print defg  ?      
+I thought of iterating through the array. When I find the first double quote, I begin printing the characters until another double quote is seen. It then breaks out of the loop. Is there a 'cleaner' way to achieve this?    
+Thanks for readingYou can use strchr(), like this
+const char *head = strchr(a, '"');
+if (head != NULL) {
+    const char *tail = strchr(head + 1, '"');
+    if (tail == NULL)
+        tail = strchr(head + 1, '\0');
+    fwrite(head + 1, 1, tail - head - 1, stdout);
+    fputc('\n', stdout);
+} 
+
+But this works for very simple cases, you did not specify whether you needed a general solution or just a solution for this very case.No, I think that your proposition is the cleanest. You could of course use strsep(), strchr() or regex.h but for your needs I think your solution is the cleanest. Everything else will result in a mess, there is no "one-liner" for this.
+If you want to clean up, you can put your idea in another function that will return the string between the "", that will at least a bit clean up your main function.You can use the strtok method in string.h, which breaks the given string in tokens, given a delimiter.
+In your example, you would use it like this:
+/* set the `"` delimiter for the string `a` */
+char *token;
+token = strtok(a,"\"");
+
+/* by printing out token now, you'd have `abc` as output */
+/* but we want the second token */
+token = strtok(NULL,"\"");
+
+/* while using strtok any other time, you have to put NULL instead of the string you want to tokenize, as it maintains an internal buffer - extremely thread unsafe! */
+
+printf("%s\n",token);
+/* the output will be: defg */Here is a simple way, that does not modify the source string:
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char a[20] = "abc\"defg\"hij";  
+    int n1 = strcspn(a, "\"");
+    int n2 = (a[n1] == '\"') ? strcspn(a + n1 + 1, "\"") : 0;
+    printf("%.*s\n", n2, a + n1);
+    return 0;
+}Rounding function in CSo i am trying to write a code which can allow me to round UP any number to 3 decimal places. My code for rounding up a number was like this :
+for (rowIndex = 0; rowIndex < MAX_ROWS; rowIndex++)
+{
+    for (columnIndex = 0; columnIndex < MAX_COLUMNS; columnIndex++)
+    {
+         printf("%.3f ", ceil(rawData[rowIndex][columnIndex] * 1000.0) / 1000.0);
+    }
+}
+
+But yesterday my teacher told us to use a code which has a structure like this:
+float roundValue(float value, int decimalPlaces)
+{
+      // Place rounding code here
+      return value;
+}
+
+i am not quite sure how to write the code in this format! I am a beginner in coding so this might be so silly.
+UPDATE:
+so i just read all the comments below and tried to write the code but still has a problem. my code is :
+double roundValue(double value, int decimalPlaces)
+{
+value = roundf( value * pow(10, decimalPlaces)) / pow(10, decimalPlaces);
+return value;
+}
+int main(void) 
+{
+int rowIndex = 0;
+int columnIndex = 0;
+double rawData[MAX_ROWS][MAX_COLUMNS]; // 2-dimensional array to store our 
+raw data
+double value = rawData[MAX_ROWS][MAX_COLUMNS];
+int decimalPlaces = 3;
+// Print out the roundup data array
+printf(" --- ROUNDED DATA ---\n");
+for (rowIndex = 0; rowIndex < MAX_ROWS; rowIndex++)
+{
+    for (columnIndex = 0; columnIndex < MAX_COLUMNS; columnIndex++)
+    {
+        printf("%.3f ", roundValue(value, 3));
+    }
+    printf("\n");
+   }
+   return 0;
+}
+
+it gives me only 0 for all the numbers.Based on this answer, you could use the roundf function found in math.h:
+#include <stdio.h>
+#include <math.h>
+
+/* function that rounds a float to the specified number of decimals */
+float roundValue(float value, int decimalPlaces)
+{
+    value = roundf(value * pow(10, decimalPlaces)) / pow(10, decimalPlaces);
+    return value;
+}
+
+
+/*to see the results: */
+int main()
+{
+    float value = 12.34567;
+    printf("%f", roundValue(value, 3));
+    return 0;
+}
+
+
+Compilation/run:
+
+$ gcc -lm main.c
+$ ./a.out
+12.346000He just told you to write your code in a function that you can call in the main() function.
+So instead of rewriting your code every time you need a round value you can use a function, you give it the number that you want to calculate the round value for, and it will give you the result so your code won't be repetitiveEssentially it can't be done. The problem is that 0.1, or 0.001, cannot be represented in floating point format exactly. So you can only round to the nearest representation rounded = floor(x * 1000 + 0.5)/1000.0. It's best to use the full accuracy of the double, then round at the last moment, for display.
+printf("%.3g", x);
+
+will achieve this for you. In combination with strtod it's also another technique for rounding... to round UP any number to 3 decimal places.
+  my teacher told us to use a code ... like float roundValue(float value, int decimalPlaces)
+
+Without going to higher precision, it is very difficult to meet OP's goal with the best answer for all value.
+
+Rounding a floating pointer value a) up or b) to the nearest representable 0.001 (or 10-n) is usually done in steps.
+1) Multiply by 10n
+2) Round a) up or b) to nearest
+3) Divide by 10n 
+float roundValue(float value, int decimalPlaces) {
+  // form the power of 10
+  assert(decimalPlaces >= 0 && decimalPlaces <= 9);
+  int power_of_10 = 1;
+  while (decimalPlaces-- > 0) power_of_10 *= 10;
+  double fpower_of_10 = power_of_10; // or just use `pow(10, decimalPlaces);
+
+Scaling by a power of 10 introduces imprecision.  This slight error is magnified in the rounding step.   A simple work-around it to use higher precision math.  Fortunately the coding goal started with a float value and double often has higher precision.
+Scaling by a power-of 10 can cause overflow, yet that is not likely when value is float and the product is double which has a wider range.
+  double y = value * fpower_of_10;
+
+  // round
+  double rounded_y = ceil(y);   // round up
+  // or
+  double rounded_y = round(y);  // round to nearest
+
+The quotient will rarely provide an exact multiple of 0.001 (or whatever power-of-10) but a floating point value that is near a multiple of 0.001.
+  y = rounded_y / fpower_of_10;
+
+  return y;
+}
+
+
+Usage follows.  Recall that unless your floating point types use a FLT_RADIX == 10 (very rare these days, usually 2), The result with only be near the desired "number to n decimal places.".  If done well, the result will be the nearest possible float/double.
+ printf("%f\n", roundValue(123.456789, 3));
+ printf("%.10f\n", roundValue(123.456789, 3)); // to see more 
+
+
+More: an easy way to avoid overflow issues if higher precision is not available or used is to recognize that great C floating-points values have no fractional part and need no rounding.
+float roundValue(float value, int decimalPlaces) {
+  float int_ptr;
+  float frac_part = modff(value, &int_ptr);
+  if (frac_part == 0) return value;
+
+  double pow10 = pow(10, decimalPlaces);
+  return round(value * pow10)/pow10;  // or ceil()
+}
+
+There are other small subtle issues not noted here. double rounding, NaN, rounding mode, round() vs. rint(), nearbyint().binn serialization - correct syntax for reading a binn object from a socketI am trying to read a binn object from a socket and can't get the data,
+for the example it's an int.
+binn is a binary serialization format.
+details can be found here: 
+https://github.com/liteserver/binn
+sending:
+binn * obj = binn_object();
+
+binn_object_set_int32(obj, (char*)"dst_enclave", 12345678);
+
+int socket = clSockFd;
+
+if (send(socket, binn_ptr(obj), binn_size(obj), 0) != binn_size(obj)) {
+    printf("SENDER -- failed to send msg1 to dest\n");
+    abort();
+}
+binn_free(obj);
+
+and trying to recieve:
+binn * obj = binn_object();
+
+if (recv(servSockFd, binn_ptr(obj), binn_size(obj), 0) < 0) {
+    printf("LISTENER -- failed to read msg1 from src\n");
+    abort();
+}
+
+int test = binn_object_int32(obj, (char*)"dst_enclave");
+
+after reading from the socket i get 0 value in test.
+I have read the documentation for binn, but they don't exactly specify how to recv..
+searched the web as well.
+btw the problem is not with the sockets, i'm getting other messages fine before that.WINAPI C - CreateFileMapping fails with error 8 - ERROR_NOT_ENOUGH_MEMORYI'm working with file mappings on Windows but having some troubles with them.
+First off, I have the necessity to partially map a file and setting the start and the end of it dynamically.
+My code is the following:
+long fiveMB = 5 * pow(2, 20);
+for(int i=0;i<parts;i++){
+    long start = (i)*fiveMB;
+    long end = (i + 1)*fiveMB;
+    long realEnd = end;
+    if (roundedDim<realEnd)
+        realEnd = dim;
+
+    long chunkDim = realEnd - start;
+    LARGE_INTEGER fileMapStart.QuadPart = (start/granularity)*granularity;
+    LARGE_INTEGER mapViewSize.QuadPart = (start%granularity) + chunkDim;
+    LARGE_INTEGER fileMapSize.QuadPart = start + chunkDim;
+    long offset = start - fileMapStart.QuadPart;
+
+    HANDLE fileMappingH= CreateFileMapping(fileH, NULL, PAGE_READONLY, fileMapSize.HighPart, fileMapSize.LowPart, NULL);
+
+    if(fileMappingH == INVALID_HANDLE_VALUE || fileMappingH == NULL){
+       printf("Error mapping file: %d\n",GetLastError());
+       CloseHandle(fileH);
+       return 1;
+    }
+
+    char *mapView = (char *)MapViewOfFile(fileMappingH, FILE_MAP_READ, fileMapStart.HighPart, fileMapStart.LowPart, mapViewSize.QuadPart);
+    if ((LPVOID)mapView == NULL) {
+        printf("Error mapView: %d\n", GetLastError());
+        CloseHandle(fileMappingH);
+        CloseHandle(file);
+        return 1;
+    }
+
+    mapView += offset;
+
+    /* doing all the stuff */
+
+    UnmapViewOfFile((LPVOID)mapView);
+    CloseHandle(fileMappingH);
+}
+
+As far as I know, only MapViewOfFile requires the starting byte to be aligned with the system granularity, so I didn't bother to fix the maximum file mapping size for that.
+I tried this code on a 1448 KB file (printing out dim I get 1482159 bytes) while calculating the available memory via GlobalMemoryStatusEx(&memstatus) and memstatus.ullAvailVirtual I get 2092208128 bytes but still stuck on having the CreateFileMapping call failed and with error code 8, ERROR_NOT_ENOUGH_MEMORY.
+I also tried calling CreateFileMapping(fileH, NULL, PAGE_READONLY, 0, 0, NULL) to memory map the whole file, but instead there were problems on MapViewOfFile, error 5, ERROR_ACCESS_DENIED.
+I don't understand what I'm doing wrong here, since I successfully did it with mmap on a Linux version of the same project.
+Thanks anyone who may help.
+
+EDITS:
+
+c was a leftover, I actually meant i
+added UnmapViewOfFile and CloseHandle callsAs far as I know, MapViewOfFile only requires the starting byte to be
+  aligned with the system granularity, so I didn't bother to fix the
+  maximum file mapping size for that.
+
+this is root of error - really from MapViewOfFile
+
+dwNumberOfBytesToMap [in]
+The number of bytes of a file mapping to map to the view. All bytes
+  must be within the maximum size specified by CreateFileMapping. If
+  this parameter is 0 (zero), the mapping extends from the specified
+  offset to the end of the file mapping.
+
+if we use 0 as MaximumSize in CreateFileMapping the maximum size of the file mapping object is equal to the current size of the file. and :
+
+if an application specifies a size for the file mapping object that is
+  larger than the size of the actual named file on disk and if the
+  page protection allows write access (that is, the flProtect
+  parameter specifies PAGE_READWRITE or PAGE_EXECUTE_READWRITE),
+  then the file on disk is increased to match the specified size of the
+  file mapping object.
+
+and about GetLastError and win32 errors at all. the errors in most case returned from kernel as NTSTATUS code. the win32 layer converts the specified NTSTATUS code to its equivalent system error code via RtlNtStatusToDosError. unfortunately this conversion not injective - the many different NTSTATUS code can convert to same win32 error and we lost sensitive info here.
+so in some case much more better call RtlGetLastNtStatus() instead of GetlastError() - this give to as much more info about error.
+
+CreateFileMapping call failed and with error code
+  ERROR_NOT_ENOUGH_MEMORY.
+
+based on error ERROR_NOT_ENOUGH_MEMORY we can think that not enough memory in system (STATUS_NO_MEMORY). but also another status - STATUS_SECTION_TOO_BIG converted to the ERROR_NOT_ENOUGH_MEMORY. the CreateFileMapping is thin shell over ZwCreateSection the STATUS_SECTION_TOO_BIG returned when:
+
+The value of MaximumSize is too big. This occurs when either
+  MaximumSize is greater than the system-defined maximum for sections, or if MaximumSize is greater than the specified file and the
+  section is not writable.
+
+and this is exactly your case: you use PAGE_READONLY in call CreateFileMapping - so section is not writable and fileMapSize is greater than the specified file (size for the file mapping object that is larger than the size of the actual file on disk)
+
+MapViewOfFile return ERROR_ACCESS_DENIED.
+
+again GetLastError() plays here with us a cruel joke. the initial status is not STATUS_ACCESS_DENIED how we can wait, but STATUS_INVALID_VIEW_SIZE. this status also converted to ERROR_ACCESS_DENIED. the MapViewOfFile got it when not all bytes within the maximum size specified by CreateFileMapping
+and call CreateFileMapping multiple time in loop - this is design error - need call this api only once, before loop. in loop only exist sense call MapViewOfFile. the test code can be:
+void TestMap(PCWSTR lpFileName, ULONG dwChunkSize)
+{
+    HANDLE hFile = CreateFileW(lpFileName, FILE_GENERIC_READ, FILE_SHARE_VALID_FLAGS, 0, OPEN_EXISTING, 0, 0);
+
+    if (hFile != INVALID_HANDLE_VALUE)
+    {
+        FILE_STANDARD_INFO fsi;
+        if (GetFileInformationByHandleEx(hFile, FileStandardInfo, &fsi, sizeof(fsi)))
+        {
+            if (HANDLE hSection = CreateFileMappingW(hFile, 0, PAGE_READONLY, 0, 0, 0))
+            {
+                if (ULONG n = (ULONG)((fsi.EndOfFile.QuadPart + (dwChunkSize - 1)) / dwChunkSize))
+                {
+                    LARGE_INTEGER ofs = {};
+                    do 
+                    {
+                        if (PVOID pv = MapViewOfFile(hSection, FILE_MAP_READ, ofs.HighPart, ofs.LowPart, --n ? dwChunkSize : 0))
+                        {
+                            UnmapViewOfFile(pv);
+                        }
+                        else
+                        {
+                            RtlGetLastNtStatus();
+                        }
+                    } while (ofs.QuadPart += dwChunkSize, n);
+                }
+
+                CloseHandle(hSection);
+            }
+            else
+            {
+                RtlGetLastNtStatus();
+            }
+        }
+        CloseHandle(hFile);
+    }
+    else
+    {
+        RtlGetLastNtStatus();
+    }
+}Memory Leak: Reading and returning line from fileI am trying to read a line from file and return the line. But, I keep getting a memory leak with 4000 bytes lost and one less free than allocs. I don't know why this is happening. Below is the function. 
+char *readLine(FILE *input, int lineNum) {
+
+    char *string = calloc(MAX_LEN, sizeof(char));
+    rewind(input);
+    char *check = fgets(string, MAX_LEN, input);
+
+    int stringLength = strlen(string);
+
+    if (stringLength > MAX_LEN) {
+        printf("Line too long to stdout.");
+        free(string);
+        return EXIT_SUCCESS;
+    } else
+    if (check == NULL) {
+        free(string);
+        return NULL;
+    }
+    return string;
+}
+
+I am calling it like this:
+char *line = readLine(input, 0);
+
+Note: ignore the lineNum thing, I will add it in after solving the memory leak.
+So, why and where is it memory leaking? A thorough explanation would be really helpful. Thanks all!
+EDIT: This is the function calling readLine():
+char *makeSummary(FILE *input, int summaryNum) {
+   char *line = readLine(input, 0); //Get first line
+   int lineLength = strlen(line);
+
+    if (summaryNum == 1) {
+        //Get the last line of file by looping till NULL
+        lineNum = 10; 
+
+        line = readLine(input, lineNum);
+        //Do more stuff with line
+   }
+   free(line);
+}Your function doesn't free(string) when it needs to return it (which makes sense), so unless some part of the code you haven't posted is free-ing it (and there's no way anyone here can tell, for obvious reasons), there's your leak.Thanks all, particulary @WhozCraig. Issue was with the function using readLine didn't free Line before actually reading the line number needed. Fixed this now, all working.There are some issues with your code:
+
+In function readLine, you compute the length of string before testing if check == NULL.  This is potentially incorrect.
+Furthermore, the length of string is by definition less than MAX_LEN, you test is always false.  You might want to check if the line end with a newline to detect truncation.
+You return EXIT_SUCCESS, but the function returns a char *. The compiler does not detect this discrepency because EXIT_SUCCESS is defined as 0 so return EXIT_SUCCESS; is the same as return NULL;.
+in the function makeSummary, you seem to overwrite line with the pointer returned by the next call to readLine().  You must call free(line); before line = readLine(input, 0).
+you call rewind() in readLine(), so you keep reading the same line from the input file, unless the file cannot be seeked (such as the terminal), if you are reading from a regular file, you will never reach the end.
+
+Here is a modified version that allocates fewer bytes:
+char *readLine(FILE *input, int lineNum) {
+    char buf[MAX_LEN];
+    size_t len;
+
+    if (!fgets(buf, sizeof(buf), input)) {
+        return NULL;
+    }
+    if ((len = strlen(buf)) == MAX_LEN - 1 && buf[len - 1] != '\n') {
+        printf("Line too long from file.");
+        return NULL;
+    }
+    return strdup(buf);
+}
+
+char *makeSummary(FILE *input, int summaryNum) {
+   char *line = readLine(input, 0); //Get first line
+   if (line == NULL)
+       return NULL;
+
+   int lineLength = strlen(line);
+
+    if (summaryNum == 1) {
+        //Get the last line of file by looping till NULL
+        lineNum = 10; 
+
+        free(line);
+        line = readLine(input, lineNum);
+        //Do more stuff with line
+   }
+   free(line);
+   return NULL;
+}
+
+Note that strdup() is not standard and may be unavailable on non Posix systems, but is easy to implement:
+#include <string.h>
+
+char *strdup(const char *s) {
+    size_t size = strlen(s) + 1;
+    char *p = malloc(size);
+    if (p != NULL) {
+        memcpy(p, s, size);
+    }
+    return p;
+}How to check the value of errno?I am using a system call and in case it fails, I need to do different things for different errnos.
+I need to write code that looks something like this:
+int res;
+res = systemCall();
+if (res == -1)
+{
+    if (errno == ENOMSG)
+    {
+        doSomething();
+    }
+    else
+    {
+        doSomethingElse();
+    }
+}
+
+perror doesn't help, because it only prints the value.
+As for strerro - if it is what I need, I am not suer how to use it, because here it says that the actual string is not the same as the error. Quote from the man page: "(For example, if errnum is EINVAL, the returned description will be "Invalid argument")".
+I am using Linux.
+System calls: msgsend and msgrcv (https://linux.die.net/man/2/msgrcv). I am not sure what C libraries you are asking about.
+I see I didn't explain myself well.
+Is the statement if (errno == ENOMSG) valid? Is there such a variable errno? Basically my question is: What should go in the if statement in order to test the errno?How to check the value of errno:
+
+You will need to #include <errno.h>.
+Yes, you can definitely say things like if(errno == ENOENT) { ... }, and that is the common and recommended way of doing it.
+In general, do not use errno to determine that an error has occurred.  Check the return value of the function, and if the return value indicates an error, then check errno to see what the error was. (More on this below.)
+errno looks like a variable, but it actually isn't.  This doesn't concern you as long as you just say things like if(errno == ENOENT) { ... }.  But you probably shouldn't try to do something like int errno_ptr = &errno;.
+You can use functions like perror() and strerror() to get human-readable error strings corresponding to errno values.  But, yes, the strings you get are generally things like "No such file or directory".  There is no good way that I know of to convert the errno value ENOENT to the string "ENOENT".
+
+To say a little more about #3.  Sometimes it's tempting to say something like
+errno = 0;
+printf("Hello, world!\n");
+if(errno != 0) {
+    fprintf(stderr, "printf failed!\n");
+}
+
+But don't do that.  Instead do
+errno = 0;
+int retval = printf("Hello, world!\n");
+if(retval < 0) {
+    fprintf(stderr, "printf failed!\n");
+}
+
+The reason is that, somewhere in the process of doing its job, printf might have done something that resulted in an error, something that set errno, but printf might have recovered from that error and gone on to complete successfully.
+There are a very few library functions that are guaranteed not to touch errno if there wasn't an error (I think one example might be atoi), but in general, this is something you have to be careful of.
+To say a little more about #4.  errno looks like a variable, and more specifically, it looks like a global variable.  But of course global variables are bad.  But errno has been around forever; there are tens of millions of lines of code that use it; it's still basically pretty convenient; it's too late to "fix" it.  So, instead, if you peek behind the curtain, you'll find that most implementations do something like
+extern int __errno_pointer;
+#define errno (*__errno_pointer)
+
+or
+extern int *__errno_pointer_function();
+#define errno (*__errno_function())
+
+In this way, they can arrange for errno to work reasonably properly even in, say, multithreaded code.I assume you are using Linux, and I suppose that you don't directly use the system call, but some of the (simple) wrappers (from your C library) listed in syscalls(2). Notice that some weird system calls are not wrapped by the C library (a well known example of unwrapped system call would be sigreturn(2) which you probably should never use). Quite often the C library is GNU glibc, but it might be musl-libc etc. Notice also that kernel raw system calls have different calling conventions than ordinary C function (so in practice a libc wrapper is required, and is in charge of dealing with errno). Notice also that errno(3) is generally a macro (almost behaving as some variable).
+The msgrcv(2) man page documents that errno  could be one of E2BIG, EACCES , EFAULT ... ENOMSG, ENOSYS  ... (refer to that man page to get the list of all possible errors).
+So you would code something like
+ssize_t siz = msgrcv(msqid, msgp, msgsz, msgtyp, msgflg);
+if (siz<0) { // msgrcv failed and has set errno
+  if (errno == ENOMSG) 
+    dosomething();
+  else if (errno == EAGAIN) 
+    dosomethingelse();
+  /// etc
+  else {  
+     syslog(LOG_DAEMON|LOG_ERR, "msgrcv failure with %s\n",
+            strerror(errno)); 
+     exit(EXIT_FAILURE); 
+  };
+};
+
+
+Is the statement if (errno == ENOMSG) .... valid? 
+
+Yes it is; you want to test errno  only after some system call failure (e.g. when siz<0).
+
+Is there such a variable errno?
+
+Not any more. Please read carefully  errno(3) documentation. You should not declare extern int errno; (this was possible in the 1980s, not in 21st century) but you should always #include <errno.h> and use errno  as if it was a variable, but it is almost always some macro (whose definition appears in /usr/include/bits/errno.h which is included by /usr/include/errno.h).
+BTW, SysV-style facilities tend to become obsolete and are not always available. I recommend using POSIX message queues facilities, read mq_overview(7).
+You might want to read the freely downloadable Advanced Linux Programming (an old book; you can buy something better & newer) and/or all the man pages reachable from intro(2) & syscalls(2) & intro(3).Include errno.h
+Some examples:
+// Error codes
+#define EPERM        1  /* Operation not permitted */
+#define ENOENT       2  /* No such file or directory */
+#define ESRCH        3  /* No such process */
+#define EINTR        4  /* Interrupted system call */
+#define EIO          5  /* I/O error */
+#define ENXIO        6  /* No such device or address */
+#define E2BIG        7  /* Argument list too long */
+#define ENOEXEC      8  /* Exec format error */
+#define EBADF        9  /* Bad file number */
+#define ECHILD      10  /* No child processes */
+#define EAGAIN      11  /* Try again */
+#define ENOMEM      12  /* Out of memory */
+#define EACCES      13  /* Permission denied */
+#define EFAULT      14  /* Bad address */
+#define ENOTBLK     15  /* Block device required */
+#define EBUSY       16  /* Device or resource busy */
+#define EEXIST      17  /* File exists */
+#define EXDEV       18  /* Cross-device link */
+#define ENODEV      19  /* No such device */
+#define ENOTDIR     20  /* Not a directory */
+#define EISDIR      21  /* Is a directory */
+#define EINVAL      22  /* Invalid argument */
+#define ENFILE      23  /* File table overflow */
+#define EMFILE      24  /* Too many open files */
+#define ENOTTY      25  /* Not a typewriter */
+#define ETXTBSY     26  /* Text file busy */
+#define EFBIG       27  /* File too large */
+#define ENOSPC      28  /* No space left on device */
+#define ESPIPE      29  /* Illegal seek */
+#define EROFS       30  /* Read-only file system */
+#define EMLINK      31  /* Too many links */
+#define EPIPE       32  /* Broken pipe */
+#define EDOM        33  /* Math argument out of domain of func */
+#define ERANGE      34  /* Math result not representable */
+
+Your implementation may have more errno includes, like for example /usr/include/asm-generic/errno.h.C strndup implicit declarationI'm trying to use strndup function, but I get the error 
+
+error: implicit declaration of function 'strndup'
+  [-Werror=implicit-function-declaration]
+
+I have searched around and found that it's not a standard function and therefore I have to compile with different flags. However, I receive same issue by compiling with the following:
+-std=gnu11
+-Wall
+-Wextra
+-Werror
+-Wmissing-declarations
+-Wmissing-prototypes
+-Werror-implicit-function-declaration
+-Wreturn-type
+-Wparentheses
+-Wunused
+-Wold-style-definition
+-Wundef
+-Wshadow
+-Wstrict-prototypes
+-Wswitch-default
+-Wunreachable-code
+-D_GNU_SOURCE
+
+I'm doing an assignment and therefore I have to use all these, but what I found is that I have to compile with '-D_GNU_SOURCE' for the error to go away, but it doesn't.
+EDIT:
+I have these included as well:
+#define __STDC_WANT_LIB_EXT2__ 1
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "list.h"
+
+Would very much appreciate help to fix this.The functions strdup and strndup are not yet part of Standard C.  They are standardized in Posix.1-2008 and declared in <string.h> on Posix systems. Did you include <string.h>?
+If your system does not provide these functions, you can define them yourself this way:
+#include <string.h>
+#include <stdlib.h>
+
+char *strdup(const char *s) {
+    size_t size = strlen(s) + 1;
+    char *p = malloc(size);
+    if (p != NULL) {
+        memcpy(p, s, size);
+    }
+    return p;
+}
+
+char *strndup(const char *s, size_t n) {
+    char *p;
+    size_t n1;
+
+    for (n1 = 0; n1 < n && s[n1] != '\0'; n1++)
+        continue;
+    p = malloc(n + 1);
+    if (p != NULL) {
+        memcpy(p, s, n1);
+        p[n1] = '\0';
+    }
+    return p;
+}Requesting POSIX functions
+You may find that you can 'activate' the declarations of strndup() et al by setting appropriate macros to request POSIX support:
+#define _XOPEN_SOURCE 700
+
+That strictly is for the X/Open SUS (Single Unix Specification), but that's usually what you want.  Strictly enabling only POSIX functionality would require:
+#define _POSIX_C_SOURCE 200809L
+
+The -std=gnu11 compiler option usually enables all these (and other special options) by default, so the fact that you're running into problems suggests you may not have the functions available regardless.
+If you don't have strndup() available even with the enabling macros set before you include any headers, you can write your own version of the function.  The tricky part is making the declaration available in a suitable header.  However, as a band-aid, you could make it static in the only source file that needs it.  It is also easiest to implement if you have strnlen() available.  If you don't have strnlen() either (a plausible problem), then you need to write that too, but the plain C version probably won't match the speed of an assembler version of strnlen() — or use memchr().
+strndup()
+char *strndup(const char *str, size_t len)
+{
+    size_t act = strnlen(str, len);
+    char *dst = malloc(act + 1);
+    if (dst != 0)
+    {
+        memmove(dst, str, act);
+        dst[act] = '\0';
+    }
+    return dst;
+}
+
+(I note that chqrlie shows a neat alternative using memchr() instead of strnlen().)
+strnlen()
+size_t strnlen(const char *str, size_t len)
+{
+    for (size_t size = 0; size < len; size++)
+    {
+        if (str[size] == '\0')
+            return size;
+    }
+    return len;
+}Without knowing your code, I guess that you forgot to include string.h.
+#include <string.h> 
+
+If you don't include the particular header, the declaration of the function strndup() isn't visible to the compiler. Hence the error message of strndup() not being declared.
+Put the above line at the top of your code and it should work.strdup & strndup are not a part of the C standard. They are POSIX functions. So you may not have them in your libraries. 
+char *mystrndup(const char *src, size_t size)
+{
+    char *duplicate = NULL;
+    size_t len;
+
+    if (src != NULL ) //for @chqrlie
+    {
+        len = strlen(src);
+        size = len > (size) ? size + 1 : (size = len + 1))
+        duplicate = calloc(sizeof(char), size);
+
+        if (duplicate != NULL)
+        {
+            strncpy(duplicate, src, size - 1);
+        }
+        else
+        {
+            errno = ENOMEM;
+        }
+    } 
+    else
+    {
+        errno = EINVAL;
+    }
+    return duplicate;
+}Float Fastpow OpenCLI'm trying to reduce the logic utilization for my FPGA and I can't find any good float fastpow online. By good I mean with a good reduction of logic utilized. If I use the double version I gain little improvement. If I use other float version that rely on log then again it's little. If I change the double version to float I gain a big reduction but then it doesn't work because results are quite bad. Is there anyone that knows a good approximation of pow for C code? (OpenCL)
+ThanksEventually I worked on the double version of fastPow and it works the same only using float data types just like this:
+float fastPow(float a, float b) {
+    union {
+        float d;
+        int x;
+    } u = { a };
+    u.x = (int)(b * (u.x - 1072632447) + 1072632447);
+    return u.d;
+}C code about pointersI've got this simple code that plays with pointers taken from Jon Eriksen's book that I'm trying to compile but gcc gives me warnings in compilation and segmentation fault (core dumped) when I run it. 
+#include<stdio.h>
+
+int main(){
+    int i;
+    int int_array[5] = {1, 2, 3, 4, 5};
+    char char_array[5] = {'a', 'b', 'c', 'd', 'e'};
+    unsigned int hacky_nonpointer;
+
+    hacky_nonpointer = (unsigned int)  int_array;   
+
+    for(i=0; i < 5; i++){
+        printf("[hacky_nonpointer] points to %p which contains the integer %d\n", hacky_nonpointer, *((int *) hacky_nonpointer));
+        hacky_nonpointer = hacky_nonpointer + sizeof(int); // hacky_nonpointer = (unsigned int) ((int *) hacky_nonpointer + 1);
+    }
+
+    printf("\n\n\n");
+
+    hacky_nonpointer = (unsigned int) char_array;
+
+    for(i=0; i < 5; i++){
+        printf("[hacky non_pointer] points to %p which contains the char %c\n", hacky_nonpointer, *((char *) hacky_nonpointer));
+        hacky_nonpointer = hacky_nonpointer + sizeof(char); // hacky_nonpointer = (unsigned int *) ((char *) hacky_nonpointer + 1);
+
+     }
+}
+
+Output:
+command line: "gcc -g -o pointer_types5  pointer_types5.c"
+
+pointer_types5.c: In function ‘main’:
+
+pointer_types5.c:16:24: warning: cast from pointer to integer of different size [-Wpointer-to-int-cast]
+     hacky_nonpointer = (unsigned int)  int_array;
+
+pointer_types5.c:20:103: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+  points to %p which contains the integer %d\n", hacky_nonpointer, *((int *) hacky_nonpointer));
+
+pointer_types5.c:20:47: warning: format ‘%p’ expects argument of type ‘void *’, but argument 2 has type ‘unsigned int’ [-Wformat=]
+         printf("[hacky_nonpointer] points to %p which contains the integer %d\n", hacky_nonpointer, *((int *) hacky_nonpointer));
+
+pointer_types5.c:29:24: warning: cast from pointer to integer of different size [-Wpointer-to-int-cast]
+     hacky_nonpointer = (unsigned int) char_array;
+
+pointer_types5.c:35:101: warning: cast to pointer from integer of different size [-Wint-to-pointer-cast]
+ er] points to %p which contains the char %c\n", hacky_nonpointer, *((char *) hacky_nonpointer));
+
+pointer_types5.c:35:48: warning: format ‘%p’ expects argument of type ‘void *’, but argument 2 has type ‘unsigned int’ [-Wformat=]
+         printf("[hacky non_pointer] points to %p which contains the char %c\n", hacky_nonpointer, *((char *) hacky_nonpointer));
+
+
+
+command line: "./pointer_types5"
+Segmentation fault (core dumped)
+
+some more info about my os: 
+uname -a : Linux PINGUIN 4.10.0-33-generic #37-Ubuntu SMP Fri Aug 11 10:55:28 UTC 2017 x86_64 x86_64 x86_64 GNU/LinuxThis program is wrong, and the advice given in the book is obviously wrong, too. A pointer can be converted to an integer type, but the result is implementation-defined. A pointer-to-void can be converted to intprt_t/uintptr_t, if they exist, and then back again to a pointer-to-void and you would get back the original pointer. This is the only guarantee given by the standard. Other things might work on one platform or another, but they wouldn't be portable at all - there is no reason why you'd use them in a large program.
+A %p requires a pointer-to-void as an argument. Passing an int has undefined behaviour.
+The things that are attempted in the program cannot be expressed portably in C at all, but possibly a more correct program would be
+#include <stdio.h>
+#include <inttypes.h>
+
+int main(void) {
+    int i;
+    int int_array[5] = {1, 2, 3, 4, 5};
+    char char_array[5] = {'a', 'b', 'c', 'd', 'e'};
+    uintptr_t hacky_nonpointer;
+
+    hacky_nonpointer = (uintptr_t)(void *)int_array;   
+
+    for(i=0; i < 5; i++){
+        printf("[hacky_nonpointer] points to %p which contains the integer %d\n", (void *)hacky_nonpointer, *((int *)(void *)hacky_nonpointer));
+        hacky_nonpointer = hacky_nonpointer + sizeof(int);
+    }
+
+    printf("\n\n\n");
+
+    hacky_nonpointer = (uintptr_t)(void *)char_array;
+
+    for(i=0; i < 5; i++){
+        printf("[hacky non_pointer] points to %p which contains the char %c\n", (void *)hacky_nonpointer, *((char *)(void *)hacky_nonpointer));
+        hacky_nonpointer = hacky_nonpointer + sizeof(char); // hacky_nonpointer = (unsigned int *) ((char *) hacky_nonpointer + 1);
+
+     }
+}
+
+however nothing guarantees that hacky_nonpointer = hacky_nonpointer + sizeof(int); would behave as author intended on every platform. It will however work on many ordinary systems, i.e. Raspberry Pi, ordinary ARM architectures, modern x86-32 and x86-64 and many more.
+
+This book doesn't teach you C, it teaches author flawed interpretation about what the C should be in his opinion.Your OS has a 64 bit architecture and the compiler is a 32 bit - based compiler !
+Due to this , there is a mismatch between the size of an integer and pointer (You can check using in-built sizeof() function ).
+
+Instead of using an integer , try it with some other data-type (for example a 64-bit long or long long , which is again compiler dependent ) and the warning(s) will be removed !The error messages are clear enough. The size of pointer can be greater than the size of int.
+If your compiler supports C99 and the type uintptr_t in the header <stdint.h> then the program can look like
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) 
+{
+    int i;
+
+    int int_array[5] = {1, 2, 3, 4, 5};
+
+    char char_array[5] = {'a', 'b', 'c', 'd', 'e'};
+
+    uintptr_t hacky_nonpointer;
+
+
+    hacky_nonpointer = ( uintptr_t )( void * )int_array;   
+
+    for ( i=0; i < sizeof( int_array ) / sizeof( *int_array ); i++  )
+    {
+        printf( "[hacky_nonpointer] points to %p which contains the integer %d\n", 
+            ( void * )hacky_nonpointer, *( int * ) ( void * )hacky_nonpointer );
+        hacky_nonpointer = hacky_nonpointer + sizeof (int ); // hacky_nonpointer = (unsigned int) ((int *) hacky_nonpointer + 1);
+    }
+
+    printf("\n\n\n");
+
+    hacky_nonpointer = ( uintptr_t ) ( void * )char_array;
+
+    for ( i=0; i < sizeof( char_array ) / sizeof( *char_array ); i++ )
+    {
+        printf("[hacky non_pointer] points to %p which contains the char %c\n", 
+            ( void * )hacky_nonpointer, *( char * )( void * ) hacky_nonpointer );
+        hacky_nonpointer = hacky_nonpointer + sizeof(char); // hacky_nonpointer = (unsigned int *) ((char *) hacky_nonpointer + 1);
+    }
+
+    return 0;
+}
+
+Its output might look like
+[hacky_nonpointer] points to 0x7fffffd96da0 which contains the integer 1
+[hacky_nonpointer] points to 0x7fffffd96da4 which contains the integer 2
+[hacky_nonpointer] points to 0x7fffffd96da8 which contains the integer 3
+[hacky_nonpointer] points to 0x7fffffd96dac which contains the integer 4
+[hacky_nonpointer] points to 0x7fffffd96db0 which contains the integer 5
+
+
+
+[hacky non_pointer] points to 0x7fffffd96d90 which contains the char a
+[hacky non_pointer] points to 0x7fffffd96d91 which contains the char b
+[hacky non_pointer] points to 0x7fffffd96d92 which contains the char c
+[hacky non_pointer] points to 0x7fffffd96d93 which contains the char d
+[hacky non_pointer] points to 0x7fffffd96d94 which contains the char e
+
+From the C Standard (7.20.1.4 Integer types capable of holding object pointers)
+
+The following type designates an unsigned integer type with the
+  property that any valid pointer to void can be converted to this type,
+  then converted back to pointer to void, and the result will compare
+  equal to the original pointer:
+
+uintptr_t
+
+Take into account that according to the C Standard the function main without parameters shall be declared like
+int main( void )Output of C code in which character is assigned an octal number#include<stdio.h>
+int main(void)
+{ 
+  char a = 01212;
+  printf("%d",a);
+  return 0;
+}
+
+On compiling i get a warning and output -118 how? I know any number starting with 0 in c is considered as octal. The octal equivalent of 01212 is 650 then why the output is -118?The assignment char a = 01212; on most of the systems is out of range and implementation dependent. A system with 8-bit char that implement 2's complement will print -118.  
+For detail, please read below explanation. 
+Unlike integer a char is not signed by default; there are three different char types in C.
+char, 
+signed char
+and 
+unsigned char
+A char has a range from CHAR_MIN to CHAR_MAX. For a particular compiler, the char will use either an underlying signed or unsigned representation. You can check this value in limits.h of your system.
+Here is the text from C99 standard point number 15
+
+6.2.5 Types
+The three types char, signed char, and unsigned char are collectively called
+  the character types. The implementation shall define char to have the same range,
+  representation, and behavior as either signed char or unsigned char.35)
+
+And again note 35 says
+
+35) CHAR_MIN, defined in , will have one of the values 0 or SCHAR_MIN, and this can be
+  used to distinguish the two options. Irrespective of the choice made, char is a separate type from the
+  other two and is not compatible with either.
+
+Having said this char a = 01212; is larger than 8 bit. The C standard allows char size more than 8 bit but I think almost all computers in today's world implement 8 Bit char.
+So if char is implemented as unsigned char and the value is more than CHAR_MAX the value will be converted according to Modulo CHAR_MAX+1. 
+In 8 bit system, the converted value is 650 modulo 256 which is 650-512 = 138
+If char is implemented as signed char the conversion is implementation dependent. If it's an 8-bit char system and it implements 2's complement the value will be -118 as you have seen in your result. Note that in this system the Range for char will be from -128 to +127.The value of 650 is most likely out-of-range for your char type. In C the behavior is implementation-defined in such cases as out-of-range integer conversions. I.e. it is clear that you will not get 650 in your char, and what exactly you will get depends on your compiler. Consult your compiler documentation to figure out why you got -118.Char is only occupying one byte, or 8 bits, so the maximum number a unsigned char can hold is 2^8 - 1, which is 255, and a signed char has a maximum of 127. When assigned a number that's greater than that, it would cause undefined behavior, in which a negative number may appear.malloc global array in functionsSOLVED
+Why is mallocing W[51] in load51() messing with W[50] contents?
+typedef struct qword { short chap, chapPos, Sentence, nbLetters, gVal; char *L;} qword;
+
+qword *W[73];
+
+main() { load50(); load51(); }
+load50() {    // This function is generated by a script that reads a txt file
+  qword w;
+  short chap = 50, p = 0;
+  W[chap] = (qword *) malloc(376*sizeof(qword));
+
+  // Fill every single qword in W[50]:
+  //* (sentence 0, word 1)
+  w.Sentence = 0; w.chapPos = ++p;
+  { char B[] = {1, 12, 12}; w.L = B; }; w.nbLetters = 3; w.gVal = 21; W[chap][p] = w;
+  // //* (sentence 0, word 2) ... 
+}
+load51() { 
+  W[51] = (qword *) malloc(365*sizeof(qword)); 
+  // Then fill every single qword in W[51], like in load50()
+}
+
+load50() works just fine, and everything is as expected, and W[50] is perfect.
+printfing W[50][375].L shows it is altered after load51() is called. Notice that W[51] is ~10 qwords smaller than W[50].
+W is a global variable, so I don't see the need to pass a ***qword to load functions and call load(&W).
+Same problem under Cygwin (GCC) & Visual Studio.
+
+Solution
+Don't use a limited scope B, malloc instead
+w.L = malloc(3); w.L[0] = 1; w.L[1] = 12; w.L[2] = 12;Consider this block in your function:
+{ char B[] = {1, 12, 12}; w.L = B; }
+
+Here the variable B is local inside the block. Once the block ends (with the }) the variable goes out of scope and cease to exist, leaving you with a stray pointer.
+Dereferencing this stray pointer leads to undefined behavior.
+Perhaps you should be allocating memory for w.L dynamically, and the copy the contents of B into the allocated memory (remembering to free the memory when you free the structure).
+
+On an unrelated note, I recommend you use char for actual characters only. If you want small signed integers I suggest you use int8_t instead. It's just an alias for unsigned char but it tells the readers of your code that you're just storing small integers instead of characters. Such semantic information makes programs easier to maintain in the future.How to know what part of CPython is implemented in C?Parts of the standard library of CPython that were written in C are faster than the parts that implemented in Python. To optimize the code, it would be good if one uses the functions which are implemented in C. My question is how can you determine or know the parts of the standard library is implemented in C?Parts of the standard library of CPython that were written in C are faster than the parts that implemented in Python. To optimise your code, it good if you use the functions and implemented in C.
+
+While that's correct it's only half of the story. All builtins are implemented in C, a lot of standard-library modules are completely or partly implemented in C. So everything already uses C functions.
+For example collections.Counter is a pure-Python class but the collections._count_elements function (Python 3) is implemented in C and used by Counter so that it can "count faster". But makes that Counter a C function?
+So it's not a clear-cut thing and you shouldn't expect a Python part to be necessarily (much) slower than if it were implemented in C. Also "written in C" or "written in Python" is kind of an implementation detail. So what's written in Python now could be re-implemented as C functions in a future version (probably also vise-versa but that happens less frequently or not at all).
+
+how can you determine or know the parts of the standard library that were implemented in C?
+
+You have to investigate that yourself. Some modules are available with a C implementation and a Python implementation (for example StringIO vs. cStringIO (python 2)) and other modules are completely implemented in C (for example itertools), others are partly implemented in C (for example collections).
+Fortunately the CPython source code is available at GitHub but it still requires to look at the Lib folder to check if there's a Python implementation. If there is no Python implementation it's almost certainly completely written in C but if there's a .py file (or in a subfolder) you still need to check what's imported there. For example collections imports (and overrides) a lot of things from _collections which is implemented in C.My question is how can you determine or know the parts of the standard library that were implemented in C?
+
+You can read the sources of the standard library.
+Python Modules
+C modules
+Or, what you should probably do, is measure the performance of your code, and then act based on that.Array type has incomplete element type , could not pass struct array to the function#include <stdio.h>
+#include <stdlib.h>
+
+int main()
+{
+    int n;
+    printf("how many students:\n");
+    scanf("%d",&n);
+   struct std
+    {
+        int rollNo;
+        char FirstName[15];
+        char SecondName[15];
+        char fatherName[20];
+        char motherName[20];
+        char institute [50];
+        char deptt[20];
+        int sem;
+        float cgpa;
+        float sgpa;
+        float height;
+        float weight;
+        char citizenship[10];
+        char lang1[15];
+        char lang2[15];
+        int no_siblings;
+        char sub1[15];
+        char sub2[15];
+        char sub3[15];
+        float marks_12;
+
+    }Array[n],*s;
+    writes(&s,n,Array);
+    return 0;
+}
+
+void writes(struct std *s,int n,struct std Array[n])
+{   int i;
+
+    for(i=0;i<n;i++)
+    {
+        printf("serially enter \n roll-no,\n first name,\n second name,\n father's name,\n mother's name,\n institute name,\n department,\n semester,\n cgpa,\n sgpa,\n height,\n weight,\n citizenship,\n lang1,\n lang2,\n no of siblings,\n sub1,\n sub2,\n sub3,\n class 12 board's %age marks scored\n");
+        scanf("%d",Array[i].rollNo);
+        gets(Array[i].FirstName);
+        gets(Array[i].SecondName);
+        gets(Array[i].fatherName);
+        gets(Array[i].motherName);
+        gets(Array[i].institute);
+        gets(Array[i].deptt);
+    }
+
+}
+
+i am starting to write a code where i can pass an array of the structure std to a function to take inputs but I am getting an error saying "Array type has incomplete element type", 
+i am beginner, i tried a lot but could not solve it. Please help.the following proposed code
+
+cleanly compiles
+uses presently available functions, rather than deleted functions
+respects the width of the terminal
+properly uses a format parameter in the call to printf()
+properly checks for error indications from system functions (fgets(), scanf() )
+properly defines the struct so the definition is visible throughout the code
+eliminates 'magic' numbers
+uses appropriate horizontal and vertical spacing
+clears the array before setting values
+demonstrates how long strings can be broken into short strings
+removes unused parameters from call to writes()
+properly provides a prototype for the writes() function
+keeps data local to where it is used
+
+And now, the proposed code example
+#include <stdio.h>   // printf(), scanf(), perror()
+#include <stdlib.h>  // exit(), EXIT_FAILURE
+#include <string.h>  // memset()
+
+#define LEN_FIRSTNAME   15
+#define LEN_SECONDNAME  15
+#define LEN_FATHERNAME  20
+#define LEN_MOTHERNAME  20
+#define LEN_INSTITUTE   50
+#define LEN_DEPTT       20
+#define LEN_CITIZENSHIP 10
+#define LEN_LANG1       15
+#define LEN_LANG2       15
+#define LEN_SUB1        15
+#define LEN_SUB2        15
+#define LEN_SUB3        15
+
+struct std
+{
+    int rollNo;
+    char FirstName[ LEN_FIRSTNAME ];
+    char SecondName[ LEN_SECONDNAME ];
+    char fatherName[ LEN_FATHERNAME ];
+    char motherName[ LEN_MOTHERNAME ];
+    char institute [ LEN_INSTITUTE ];
+    char deptt[ LEN_DEPTT ];
+    int sem;
+    float cgpa;
+    float sgpa;
+    float height;
+    float weight;
+    char citizenship[ LEN_CITIZENSHIP ];
+    char lang1[ LEN_LANG1 ];
+    char lang2[ LEN_LANG2 ];
+    int no_siblings;
+    char sub1[ LEN_SUB1 ];
+    char sub2[ LEN_SUB2 ];
+    char sub3[ LEN_SUB3 ];
+    float marks_12;
+};
+
+
+// prototypes
+void writes( int n, struct std Array[n] );
+
+
+int main( void )
+{
+
+    int n;
+    printf("how many students:\n");
+    if( 1 != scanf("%d",&n) )
+    {
+        perror( "scanf for number of students failed" );
+        exit( EXIT_FAILURE );
+    }
+
+
+    // implied else, scanf successful
+
+    struct std Array[n];
+    memset( Array, '\0', sizeof(Array) );
+
+    writes( n, Array );
+    return 0;
+}
+
+
+void writes( int n, struct std Array[n] )
+{
+    for( int i=0; i<n; i++ )
+    {
+        printf( "%s",
+                "serially enter \n"
+                "roll-no,\n"
+                "first name,\n"
+                "second name,\n"
+                "father's name,\n"
+                "mother's name,\n"
+                "institute name,\n"
+                "department,\n" );
+                // semester,\n cgpa,\n sgpa,\n height,\n weight,\n citizenship,\n lang1,\n lang2,\n no of siblings,\n sub1,\n sub2,\n sub3,\n class 12 board's %age marks scored\n");
+
+        if( 1 != scanf("%d", &(Array[i].rollNo)) )
+        {
+            perror( "scanf for roll-no failed" );
+            exit( EXIT_FAILURE );
+        }
+
+        // implied else, scanf for roll-no successful
+
+        if( !fgets( Array[i].FirstName, sizeof( Array[i].FirstName), stdin ) )
+        {
+            perror( "fgets for FirstName failed" );
+            exit( EXIT_FAILURE );
+        }
+
+        // implied else, fgets for FirstName successful
+
+        // remove possible trailing newline
+        char *newline = NULL;
+        if( (newline = strchr( Array[i].FirstName, '\n' ) ) )
+        {
+            *newline = '\0';
+        }
+
+        //---etc---
+    }
+}Function about the product between 2 Matrix in CI have a problem in running my code because the function that I made to have the multiplication between two matrices is still not working even if I have tried different solutions, probably I am missing something important about pointers in the function.
+Because the code stops running near the call of the function itself, excuse me if this post is not all correctly done or written but it is my first post on this site.
+Here's my code I hope someone could help me.
+#include <stdio.h>
+#include <stdlib.h>
+
+#define MAXR 50
+#define MAXC 50
+
+void printmatrix(int **matrix, int r, int c) {
+    int i, j;
+    for (i = 0; i < r; i++) {
+        printf("\n");
+        for (j = 0; j < c; j++) {
+            printf("-%d-", matrix[i][j]);
+        }
+    }
+}
+
+void matrixprod(int **matrix3, int matrix1[][MAXC], int matrix2[][MAXC], int r1, int c1, int r2, int c2) {
+    int i, h, k;
+    h = k = 0;
+
+    matrix3[h][k]=0;
+    for (i = 0; i < c1; i++) {
+        matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+    }
+    k++;
+    while (k < c2) {
+        matrix3[h][k] = 0;
+        for (i = 0; i < c1; i++) {
+            matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+        }
+        k++;
+    }
+    while (h < r1) {
+        h++;
+        k = 0;
+        matrix3[h][k] = 0;
+        for (i = 0; i < c1; i++) {
+            matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+        }
+        k++;
+        while (k < c2) {
+            matrix3[h][k] = 0;
+            for (i = 0; i < c1; i++) {
+                matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+            }
+            k++;
+        }
+    }
+}
+
+int main() {
+    int i, j, h, k;
+    int r1, r2, c1, c2;
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    scanf("%d%d", &r1, &c1);
+    int matrix1[r1][c1];
+    printf("\n**RIEMPIRE LA MATRICE 1 **\n");
+    for (i = 0; i < r1; i++) {
+        for (j = 0; j < c1; j++) {
+            scanf("%d", &matrix1[i][j]);
+        }
+    }
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    scanf("%d%d", &r2, &c2);
+    int matrix2[r2][c2];
+    printf("\n**RIEMPIRE LA MATRICE 2 **\n");
+    for (i = 0; i < r2; i++) {
+        for (j = 0; j < c2; j++) {
+            scanf("%d", &matrix2[i][j]);
+        }
+    }
+    int **matrix3;
+    matrix3 = malloc(r1 * sizeof(*matrix3));
+    for (i = 0; i < r1; i++) {
+        matrix3[i] = malloc(c2 * sizeof(*matrix3[i]));
+    }
+    if (r1 != c2) {
+        printf("PROD NON ESEGUIBILE");
+        exit(1);
+    }
+    printf("\n****PROD MATRIX*****\n");
+    matrixprod(matrix3, matrix1, matrix2, r1, c1, r2, c2);
+    printmatrix(matrix3, r1, c2);
+    return 0;
+}There are actually various problems that you would need to solve.
+Firstly, when declaring arrays like int a[size] in C, size must be a constant can cannot be a variable because the compiler needs to know its size at compile time. To declare int matrix1[r1][c1], you must either use dynamic allocation or use int matrix1[MAXR][MAXC]
+Secondly, put h++ at the end of the loop, or h will be equal to r1 at the last execution of the loop.
+Thirdly, indentation is very important to make the code readable and maintainable. For other languages such as python, a bad indentation won't work. So indent properly.
+Corrected code as follows:
+#include <stdio.h>
+#include <stdlib.h>
+#define MAXR 50
+#define MAXC 50
+
+void printmatrix(int** matrix, int r, int c) {
+    int i, j;
+    for (i = 0; i<r; i++) {
+        printf("\n");
+        for (j = 0; j<c; j++) {
+            printf("-%d-", matrix[i][j]);
+        }
+    }
+}
+
+void matrixprod(int** matrix3, int ** matrix1, int ** matrix2, int r1, int c1, int r2, int c2) {
+    int i, h, k;
+    h = k = 0;
+    matrix3[h][k] = 0;
+    for (i = 0; i<c1; i++) {
+        matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+    }
+    k++;
+    while (k<c2) {
+        matrix3[h][k] = 0;
+        for (i = 0; i<c1; i++) {
+            matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+        }
+        k++;
+    }
+    while (h<r1) {
+        k = 0;
+        matrix3[h][k] = 0;
+        for (i = 0; i<c1; i++) {
+            matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+        }
+        k++;
+        while (k<c2) {
+            matrix3[h][k] = 0;
+            for (i = 0; i<c1; i++) {
+                matrix3[h][k] += (matrix1[h][i] * matrix2[i][k]);
+            }
+            k++;
+        }
+
+        h++;
+    }
+
+}
+
+int main() {
+    int i, j, h, k;
+    int r1, r2, c1, c2;
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    scanf("%d%d", &r1, &c1);
+    int ** matrix1 = (int **)malloc(r1 * sizeof(int*));
+    printf("\n**RIEMPIRE LA MATRICE 1 **\n");
+    for (i = 0; i<r1; i++) {
+        matrix1[i] = (int *)malloc(c1 * sizeof(int));
+        for (j = 0; j<c1; j++) {
+            scanf("%d", &matrix1[i][j]);
+        }
+    }
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    scanf("%d%d", &r2, &c2);
+    int ** matrix2 = (int **)malloc(r2 * sizeof(int*));
+    printf("\n**RIEMPIRE LA MATRICE 2 **\n");
+    for (i = 0; i<r2; i++) {
+        matrix2[i] = (int *)malloc(c2 * sizeof(int));
+        for (j = 0; j<c2; j++) {
+            scanf("%d", &matrix2[i][j]);
+        }
+    }
+    int** matrix3;
+    matrix3 = (int **)malloc(r1 * sizeof(int*));
+    for (i = 0; i<r1; i++) {
+        matrix3[i] = (int *)malloc(c2 * sizeof(int));
+    }
+    if (r1 != c2) {
+        printf("PROD NON ESEGUIBILE");
+        exit(1);
+    }
+    printf("\n****PROD MATRIX*****\n");
+    matrixprod(matrix3, matrix1, matrix2, r1, c1, r2, c2);
+    printmatrix(matrix3, r1, c2);
+    return 0;
+}
+
+The free functions are omitted.There are multiple problems in your code:
+
+The 2D matrix sizes are inconsistent between the definition in the main function and the declaration in the matrixprod function.  You should define the source matrices matrix1 and matrix2 as int matrix1[r2][MAXC]; or int matrix1[MAXR][MAXC];
+You can simplify the code: the first row does not need special casing, and using classic for loops is less error prone than while loops.
+
+Here is a modified version:
+#include <stdio.h>
+#include <stdlib.h>
+
+#define MAXR 50
+#define MAXC 50
+
+void printmatrix(int **matrix, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            printf(" %d", matrix[i][j]);
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+void matrixprod(int **matrix3, int matrix1[][MAXC], int matrix2[][MAXC],
+                int r1, int c1, int r2, int c2) {
+    if (c1 != r2) {
+        printf("matrix geometries are incompatible\n");
+        return;
+    }
+    for (int i = 0; i < r1; i++) {
+        for (int j = 0; j < c2; j++) {
+            int p = 0;
+            for (int k = 0; k < c1; k++) {
+                 p += matrix1[i][k] * matrix2[k][j];
+            }
+            matrix3[i][j] = p;
+        }
+    }
+}
+
+int main(void) {
+    int r1, r2, c1, c2;
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    if (scanf("%d%d", &r1, &c1) != 2 || r1 <= 0 || c1 <= 0 || r1 > MAXR || c1 > MAXC) {
+        printf("invalid matrix size\n");
+        return 1;
+    }
+    int matrix1[MAXR][MAXC];
+    printf("\n**RIEMPIRE LA MATRICE 1 **\n");
+    for (int i = 0; i < r1; i++) {
+        for (int j = 0; j < c1; j++) {
+            if (scanf("%d", &matrix1[i][j]) != 1)
+                return 1;
+        }
+    }
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    if (scanf("%d%d", &r2, &c2) != 2 || r2 <= 0 || c2 <= 0 || r2 > MAXR || c2 > MAXC) {
+        printf("invalid matrix size\n");
+        return 1;
+    }
+    int matrix2[MAXR][MAXC];
+    printf("\n**RIEMPIRE LA MATRICE 2 **\n");
+    for (int i = 0; i < r2; i++) {
+        for (int j = 0; j < c2; j++) {
+            if (scanf("%d", &matrix2[i][j]) != 1)
+                return 1;
+        }
+    }
+    if (c1 != r2) {
+        printf("PROD NON ESEGUIBILE");
+        exit(1);
+    }
+    int **matrix3 = malloc(r1 * sizeof(*matrix3));
+    if (matrix3 == NULL)
+        return 1;
+    for (int i = 0; i < r1; i++) {
+        matrix3[i] = malloc(c2 * sizeof(*matrix3[i]));
+        if (matrix3[i] == NULL)
+            return 1;
+    }
+    printf("\n****PROD MATRIX*****\n");
+    matrixprod(matrix3, matrix1, matrix2, r1, c1, r2, c2);
+    printmatrix(matrix3, r1, c2);
+    return 0;
+}
+
+Note that you could allocate indirect matrices for all 3 operands, thus removing the MAXC and MAXR constraints:
+#include <stdio.h>
+#include <stdlib.h>
+
+void free_matrix(int **matrix, int rows) {
+    /* free a dynamic matrix */
+    if (matrix != NULL) {
+        for (int i = 0; i < rows; i++) {
+            free(matrix[i]);
+        }
+        free(matrix);
+    }
+}
+
+int **new_matrix(int rows, int cols) {
+    /* allocate a dynamic matrix initialized to 0 */
+    int **matrix = malloc(rows * sizeof(*matrix));
+    if (matrix != NULL) {
+        for (int i = 0; i < rows; i++) {
+            matrix[i] = calloc(cols, sizeof(*matrix[i]));
+            if (matrix[i] == NULL) {
+                free_matrix(matrix, i);
+                return NULL;
+            }
+        }
+    }
+    return matrix;
+}
+
+int **read_matrix(int *rows, int *cols) {
+    int **matrix;
+    printf("Inserire la dimensione R delle righe e C delle colonne:\n");
+    if (scanf("%d%d", rows, cols) != 2 || *rows <= 0 || *cols <= 0) {
+        printf("invalid matrix size\n");
+        return NULL;
+    }
+    matrix = new_matrix(*rows, *cols);
+    if (matrix) {
+        printf("\n**RIEMPIRE LA MATRICE**\n");
+        for (int i = 0; i < *rows; i++) {
+            for (int j = 0; j < *cols; j++) {
+                if (scanf("%d", &matrix[i][j]) != 1) {
+                    free_matrix(matrix, i);
+                    return NULL;
+                }
+            }
+        }
+    }
+    return matrix;
+}
+
+void printmatrix(int **matrix, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            printf(" %d", matrix[i][j]);
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+int **matrixprod(int **matrix1, int **matrix2, int r1, int c1, int r2, int c2) {
+    if (c1 != r2) {
+        printf("matrix geometries are incompatible\n");
+        return NULL;
+    }
+    int **matrix3 = new_matrix(r1, c2);
+    if (matrix3) {
+        for (int i = 0; i < r1; i++) {
+            for (int j = 0; j < c2; j++) {
+                int p = 0;
+                for (int k = 0; k < c1; k++) {
+                    p += matrix1[i][k] * matrix2[k][j];
+                }
+                matrix3[i][j] = p;
+            }
+        }
+    }
+    return matrix3;
+}
+
+int main(void) {
+    int r1, r2, c1, c2;
+    int **matrix1, **matrix2, **matrix3;
+    if (!(matrix1 = read_matrix(&r1, &c1)) || !(matrix2 = read_matrix(&r2, &c2)))
+        return 1;
+    if (c1 != r2) {
+        printf("PROD NON ESEGUIBILE");
+        exit(1);
+    }
+    printf("\n****PROD MATRIX*****\n");
+    matrix3 = matrixprod(matrix1, matrix2, r1, c1, r2, c2);
+    if (matrix3) {
+        printmatrix(matrix3, r1, c2);
+        free_matrix(matrix3, r1);
+    }
+    free_matrix(matrix2, r2);
+    free_matrix(matrix1, r1);
+    return 0;
+}I did this exercise too. I can add comments, if you are needed.
+#include <stdio.h>
+#include <stdlib.h>
+#define MAXR 50
+#define MAXC 50
+typedef struct mtrx {
+    int **values;
+    int rows;   
+    int cols;   
+} mtrx;
+
+void free_values_memory(mtrx *matrix); 
+void error_exit(char *message); 
+void allocate_memory_for_values(mtrx *matrix); 
+mtrx multiply_mtrxs(mtrx *matrix_1, mtrx *matrix_2); 
+void read_mtrx(mtrx *matrix); 
+void print_mtrx(mtrx *matrix); 
+
+int main() {
+    mtrx matrix_1;
+    mtrx matrix_2;
+
+    read_mtrx(&matrix_1);
+    read_mtrx(&matrix_2);
+
+    if(matrix_1.cols != matrix_2.rows)
+        error_exit("the number of columns of the 1st matrix must equal the number "
+        "of rows of the 2nd matrix.");
+
+    mtrx matrix_product = multiply_mtrxs(&matrix_1, &matrix_2);
+    print_mtrx(&matrix_product);
+
+    free_values_memory(&matrix_1);
+    free_values_memory(&matrix_2);
+    free_values_memory(&matrix_product);
+    return 0;
+}
+
+void error_exit(char *message) {
+    printf("\033[1;31mInput is incorrect:\033[0;0m %s\n", message);
+    exit(EXIT_FAILURE);
+}
+
+void read_mtrx(mtrx *matrix) {
+    if(scanf("%d %d\n", &matrix->rows, &matrix->cols) != 2)
+        error_exit("not enough values");
+    else if(matrix->rows > MAXR || matrix->cols > MAXC)
+        error_exit("the size of matrix too large");
+
+    allocate_memory_for_values(matrix);
+
+    int i, j;
+    for(i = 0; i < matrix->rows; i++) {
+        for(j = 0; j < matrix->cols; j++) {
+            scanf("%d", &matrix->values[i][j]);
+        }
+    }
+}
+
+void allocate_memory_for_values(mtrx *matrix) {
+    matrix->values = malloc(matrix->rows * sizeof(matrix->rows));
+    int i;
+    for(i = 0; i < matrix->rows; i++) {
+        matrix->values[i] = malloc(matrix->cols * sizeof(matrix->cols));
+    }
+}
+void free_values_memory(mtrx *matrix) {
+    int i;
+    for(i = 0; i < matrix->rows; i++) {
+        free(matrix->values[i]);
+    }
+    free(matrix->values);
+}
+
+mtrx multiply_mtrxs(mtrx *matrix_1, mtrx *matrix_2) {
+    mtrx matrix_product;
+    matrix_product.rows = matrix_1->rows;
+    matrix_product.cols = matrix_2->cols;
+    allocate_memory_for_values(&matrix_product);
+
+    int i, j, k, product;
+    for(i = 0; i < matrix_1->rows; i++) {
+        for(j = 0; j < matrix_1->cols; j++) {
+            for(k = 0; k < matrix_2->cols; k++) {
+                product = matrix_1->values[i][j] * matrix_2->values[j][k];
+                matrix_product.values[i][k] += product;
+            }
+        }
+    }
+    return matrix_product;
+}
+
+void print_mtrx(mtrx *matrix) {
+    int i, j;
+    for(i = 0; i < matrix->rows; i++) {
+        for(j = 0; j < matrix->cols; j++) {
+            printf("%d ", matrix->values[i][j]);
+        }
+        puts("");
+    }
+}
+
+It was tested with following inputs:
+1 1
+2
+1 2
+2 3
+### Answer: ###
+4 6
+######
+
+2 2
+1 2
+3 4
+2 2
+5 6
+7 8
+### Answer: ###
+19 22 
+43 50
+######
+
+1 3
+3 4 2 
+3 4
+13 9 7 15
+8 7 4 6 
+6 4 0 3 
+### Answer: ###
+83 63 37 75
+######
+
+2 4
+1 2 3 
+4 5 6 
+3 2
+7 8
+9 10
+11 12
+### Answer: ###
+58 64 
+139 154
+######dynamic semantic errors checking [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 4 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I read that dynamic semantic errors cannot be detected by the C compiler as semantic analysis phase catches only static semantic errors.
+Then which component of C compiler does the checking of dynamic semantic errors?which component of C compiler does the checking of dynamic semantic errors?
+
+No phase. They are detected at runtime, if at all, by definition.
+
+By dynamic semantic error, I mean accessing an index of array (out of bounds).
+
+There is no such check in C.
+
+I read somewhere that compiler generates code for checking dynamic semantic errors.
+
+Not in C.
+
+I am not sure what it meant.
+
+Nothing in the case of C. Possibly you were reading about some other language. In any case the dynamic semantic check is still executed at runtime, not by any compiler phase.As for my understanding the dynamic semantic errors can be discovered only during the runtime. C does not have any mechanisms for it, as C does not allow any dynamic semantics at all :) It is not an interpreted or JIT comiled language. 
+If you provide a real example of the dynamic semantic error in C, it will clarify what you actually meanHow can I compute the o/p of the code with memory model Diagram ? Why this is giving segmentation fault?int main()
+{
+    char a[2][3][3] = {'g','a','t','e','s','q','u','i','z','a','w'};
+    printf("%s ", ***a);
+    return 0;
+}
+
+This code gives Seg Fault on ***a. Kindly explain with Memory diagram how this array is stored in memory. Correct me if I am wrong 2 arrays of 3 row and 3 height. Also tell if the empty spaces store '/0' or garbage Value.Because   printf("%s ", ***a); converts the char 'g' into a pointer which is invalid for the obvious reasons - as char conversion to the pointer is the UB
+See the difference in this function (mind the zero at the end as well)
+int zz()
+{
+    char a[2][3][3] = { 'g','a','t','e','s','q','u','i','z','a','w',0 };
+    printf("%s ", &***a);
+    return 0;
+}
+
+or
+int yyy()
+{
+    char a[2][3][3] = { 'g','a','t','e','s','q','u','i','z','a','w',0 };
+    char *ptr = **a;
+    while (*ptr) printf("%c", *ptr++);
+    return 0;
+}If your goal was to demonstrate that a multidimensional array in C is just a single block of memory and in fact the a variable is just the address of its first byte then you could do it this way:
+char a[2][3][3] = {'g','a','t','e','s','q','u','i','z','a','w'};
+
+// Print all chars, this is ok because you've initialized your
+// 12-element array by 11 chars and the last one is automatically set to 0
+printf("%s\n", (char *)a);
+
+// Print the first char
+printf("%c\n", *(char *)a);CMAKE ERROR with CLionI am a beginner in programming with C and I get this error code if i start a project on CLion:
+C:\Program Files\JetBrains\CLion 2017.2.2\bin\cmake\bin\cmake.exe" -DCMAKE_BUILD_TYPE=Debug -G "CodeBlocks - MinGW Makefiles" C:\Users\danie\CLionProjects\untitled2
+-- The C compiler identification is GNU 5.3.0
+-- The CXX compiler identification is unknown
+-- Check for working C compiler: C:/MinGW/bin/gcc.exe
+-- Check for working C compiler: C:/MinGW/bin/gcc.exe -- works
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compile features
+-- Detecting C compile features - done
+CMake Error at CMakeLists.txt:2 (project):
+  The CMAKE_CXX_COMPILER:
+
+g++.exe
+
+is not a full path and was not found in the PATH.
+
+Tell CMake where to find the compiler by setting either the environment
+  variable "CXX" or the CMake cache entry CMAKE_CXX_COMPILER to the full path
+  to the compiler, or to the compiler name if it is in the PATH.
+-- Configuring incomplete, errors occurred!
+See also "C:/Users/danie/CLionProjects/untitled2/cmake-build-debug/CMakeFiles/CMakeOutput.log".
+See also "C:/Users/danie/CLionProjects/untitled2/cmake-build-debug/CMakeFiles/CMakeError.log".
+
+[Finished]
+What can I do to get it working?
+Thank you for your help.By default, CMake expects that project needs support for both C and C++. If your project needs only C, specify that in project() call:
+project(<project-name> C)Use configure file to generate makefileI use ./configure command to generate a makefile. My compiler is arm-fsl-linux-gnueabi toochain. When I ran ./configure, I got the following problem: 
+
+tl@tl-virtual-machine:~/Desktop/mvux_camera/demo/sampli_save_demo$ ./configure --host=/home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++
+  configure: WARNING: if you wanted to set the --build type, don't use --host.
+      If a cross compiler is detected then cross compile mode will be used
+  checking for a BSD-compatible install... /usr/bin/install -c
+  checking whether build environment is sane... yes
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-strip... no
+  checking for strip... strip
+  checking for a thread-safe mkdir -p... /bin/mkdir -p
+  checking for gawk... no
+  checking for mawk... mawk
+  checking whether make sets $(MAKE)... yes
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-g++... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-c++... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-gpp... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-aCC... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-CC... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-cxx... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-cc++... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-cl.exe... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-FCC... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-KCC... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-RCC... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-xlC_r... no
+  checking for /home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-xlC... no
+  checking for g++... no
+  checking for c++... no
+  checking for gpp... no
+  checking for aCC... no
+  checking for CC... no
+  checking for cxx... no
+  checking for cc++... no
+  checking for cl.exe... no
+  checking for FCC... no
+  checking for KCC... no
+  checking for RCC... no
+  checking for xlC_r... no
+  checking for xlC... no
+  checking whether the C++ compiler works... no
+  configure: error: in '/home/tl/Desktop/mvux_camera/demo/sampli_save_demo':
+  configure: error: C++ compiler cannot create executables
+  See 'config.log' for more details
+
+My toolchain was sourced, when typing arm-fsl-linux-gnueabi-gcc -v, the command line shows it works.
+
+tl@tl-virtual-machine:~/Desktop/mvux_camera/demo/sampli_save_demo$ arm-fsl-linux-gnueabi-gcc -v
+  Using built-in specs.
+  COLLECT_GCC=arm-fsl-linux-gnueabi-gcc
+  COLLECT_LTO_WRAPPER=/home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/../libexec/gcc/arm-fsl-linux-gnueabi/4.6.2/lto-wrapper
+  Target: arm-fsl-linux-gnueabi
+  Configured with: /work/build/.build/src/gcc-linaro-4.6-2011.06-0/configure --build=i686-build_pc-linux-gnu --host=i686-build_pc-linux-gnu --target=arm-fsl-linux-gnueabi --prefix=/work/fsl-linaro-toolchain-2.13 --with-sysroot=/work/fsl-linaro-toolchain-2.13/arm-fsl-linux-gnueabi/multi-libs --enable-languages=c,c++ --with-pkgversion='Freescale MAD -- Linaro 2011.07 -- Built at 2011/08/10 09:20' --enable-__cxa_atexit --disable-libmudflap --disable-libgomp --disable-libssp --with-gmp=/work/build/.build/arm-fsl-linux-gnueabi/build/static --with-mpfr=/work/build/.build/arm-fsl-linux-gnueabi/build/static --with-mpc=/work/build/.build/arm-fsl-linux-gnueabi/build/static --with-ppl=/work/build/.build/arm-fsl-linux-gnueabi/build/static --with-cloog=/work/build/.build/arm-fsl-linux-gnueabi/build/static --with-libelf=/work/build/.build/arm-fsl-linux-gnueabi/build/static --with-host-libstdcxx='-static-libgcc -Wl,-Bstatic,-lstdc++,-Bdynamic -lm -L/work/build/.build/arm-fsl-linux-gnueabi/build/static/lib -lpwl' --enable-threads=posix --enable-target-optspace --enable-plugin --enable-multilib --with-local-prefix=/work/fsl-linaro-toolchain-2.13/arm-fsl-linux-gnueabi/multi-libs --disable-nls --enable-c99 --enable-long-long --with-system-zlib
+  Thread model: posix
+  gcc version 4.6.2 20110630 (prerelease) (Freescale MAD -- Linaro 2011.07 -- Built at 2011/08/10 09:20)Look at the output of ./configure --help, especially:
+System types:
+  --build=BUILD     configure for building on BUILD [guessed]
+  --host=HOST       cross-compile to build programs to run on HOST [BUILD]
+
+HOST should be the identity of the system on which you want your cross-compiled
+program to run. But you have set it to the absolute filename of your C++ compiler:
+./configure --host=/home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++
+
+which results in your ./configure script attempting and failing to locate a cross-compiler
+with such nonsense names as:
+/home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-g++
+/home/tl/Desktop/opt/Embedsky/gcc-4.6.2-glibc-2.13-linaro-multilib-2011.12/tq-linaro-toolchain/bin/arm-fsl-linux-gnueabi-g++-c++
+
+Look at the output of arm-fsl-linux-gnueabi-gcc -v, specifically:
+Target: arm-fsl-linux-gnueabi 
+
+This tells you that your cross-compiler was built to cross-compile programs
+for arm-fsl-linux-gnueabi systems. Therefore, when you want to ./configure
+a project to use that cross-compiler, HOST = arm-fsl-linux-gnueabiNo performance gain with transpose of large 2d Matrix using Loop tilingTransposing global 2D Square Matrix/Array of size 1 gb with tiling approach(Cache Aware) has no performance gain in single threaded execution over Normal transpose method. Not discussing the transpose speed up using AVX,SSE(SIMD) or  any other cache oblivious transpose algorithm(http://supertech.csail.mit.edu/papers/FrigoLePr12.pdf) 
+#include <stdio.h>
+#include <sys/time.h>
+#define SIZE 16384
+float a[SIZE][SIZE], b[SIZE][SIZE];
+
+void testNormalTranspose() {
+int i, j, k, l;
+b[0][9999] = 1.0;
+for (i=0; i<SIZE; i++)
+    for (j=0; j<SIZE; j++)
+      a[i][j] = b[j][i];
+}
+
+void testTiledTranspose(){
+    int i, j, k, l;
+    b[0][9999] = 1.0;
+    int blocksize = 16;
+    for (i=0; i<SIZE; i+= blocksize) {
+        for (j=0; j<SIZE; j+=blocksize) {
+            for (int ii = i;ii <i + blocksize; ++ii) {
+                for (int jj = j; jj < j + blocksize; ++jj) {
+                    a[ii][jj] = b[jj][ii];
+                }
+
+            }
+        }   
+    }  
+}
+
+int main()
+{
+    struct timeval t1, t2;
+    /*
+      gettimeofday(&t1, NULL);
+      testNormalTranspose();
+      gettimeofday(&t2, NULL);
+      printf("Time for the Normal transpose  is %ld milliseconds\n",
+             (t2.tv_sec - t1.tv_sec)*1000 + 
+             (t2.tv_usec - t1.tv_usec) / 1000);
+    */
+      gettimeofday(&t1, NULL);
+      testTiledTranspose();
+      gettimeofday(&t2, NULL);
+      printf("Time for the Tiled transpose  is %ld milliseconds\n",
+             (t2.tv_sec - t1.tv_sec)*1000 + 
+             (t2.tv_usec - t1.tv_usec) / 1000);
+      printf("%f\n", a[9999][0]);
+}Loop tiling helps in case the data is being reused. If you use an element SIZE times, you better use it SIZE times and only then proceed to a next element.
+Unfortunately, transposing 2D matrix you are not reusing any elements neither of matrix a, nor b. Even more, since in the loop you mix rows and cols access (i.e. a[i][j] = b[j][i]), you will never get unit-stride memory access on both a and b arrays at the same time, but only on one of them.
+So, in this case tiling is not that efficient, but still you might have some performance improvements even with "random" memory access if:
+
+the element you are accessing now is on the same cache line with an element you were accessing previously AND
+that cache line is still available.
+
+So, to see any improvements the memory footprint of this "random" accesses must fit into the cache of your system. Basically this means you have to carefully chose the blocksize and 16 you have chosen in the example might work better on one system and worse on the other.
+Here are the results from my computer for different power of 2 block sizes and SIZE 4096:
+---------------------------------------------------------------
+Benchmark                        Time           CPU Iterations
+---------------------------------------------------------------
+transpose_2d              32052765 ns   32051761 ns         21
+tiled_transpose_2d/2      22246701 ns   22245867 ns         31
+tiled_transpose_2d/4      16912984 ns   16912487 ns         41
+tiled_transpose_2d/8      16284471 ns   16283974 ns         43
+tiled_transpose_2d/16     16604652 ns   16604149 ns         42
+tiled_transpose_2d/32     23661431 ns   23660226 ns         29
+tiled_transpose_2d/64     32260575 ns   32259564 ns         22
+tiled_transpose_2d/128    32107778 ns   32106793 ns         22
+fixed_tile_transpose_2d   16735583 ns   16729876 ns         41
+
+As you can see the version with blocksize 8 works the best for me and it almost double the performance.
+Here are the results for SIZE 4131 and power of 3 block sizes:
+---------------------------------------------------------------
+Benchmark                        Time           CPU Iterations
+---------------------------------------------------------------
+transpose_2d              29875351 ns   29874381 ns         23
+tiled_transpose_2d/3      30077471 ns   30076517 ns         23
+tiled_transpose_2d/9      20420423 ns   20419499 ns         35
+tiled_transpose_2d/27     13470242 ns   13468992 ns         51
+tiled_transpose_2d/81     11318953 ns   11318646 ns         61
+tiled_transpose_2d/243    10229250 ns   10228884 ns         65
+fixed_tile_transpose_2d   10217339 ns   10217066 ns         67
+
+Regarding 16384 size issue. I can not reproduce it, i.e. I still see the same gain for big matrix. Just please note, that 16384 * 16384 * sizeof(float) makes 4GB, which might expose some system issues...this is a program to find prime numbers from 2 to 100 in C [closed]Closed. This question needs to be more focused. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it focuses on one problem only by editing this post.
+                
+Closed 4 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I am unable to understand how is it working. Can somebody explain me this code?
+#include <stdio.h>
+
+int main () {
+    /* local variable definition */
+    int i, j;
+
+    for(i = 2; i<100; i++) {
+        for(j = 2; j <= (i/j); j++) {
+            if(!(i%j)) break; // if factor found, not prime
+        }
+        if(j > (i/j)) printf("%d is prime", i);
+    }
+
+    return 0;
+}1.#include <stdio.h> is a header that defines three variable types, several macros, and various functions for performing input and output. In other words, it's basically a C-Library being referenced to add some other externally defined logic, besides the code below, like the size_t variable, which is the result of the sizeof keyword for example. That's just one example of what the the stdio.h header does but you can see more info here: https://www.tutorialspoint.com/c_standard_library/stdio_h.htm
+2.int main() is an integer function (int) that uses a deprecated declaration style main(), meaning you shouldn't it anymore because it's outdated by other functions, and the main() function in particular is a function that takes an unspecified number of arguments (integers in this case) and then runs some operations with those integers. 
+
+Next, the curly braces are what contain all the logic inside of the int main() function.  Then inside of it, on the line int i, j; , two local variables are declared (i and j) to be later used as placeholders for some integers that will be plugged into the function.
+Below that, for(i = 2; i<100; i++) indicates there is a loop that sets the i variable to 2, then after the semi-colon i<100 means that the loop will continue to execute again and again as long as the variable i is less than 100. After yet another semi-colon, i++ means that each time that the loop runs, the variable i will increment by 1. So it starts at 2, then 3, then 4, etc, until i reaches 100 and the loop stops executing.
+Next, for(j = 2; j <= (i/j); j++) is another loop inside of the first loop, but this time the loop is using the variable j as a placeholder/counter instead of the variable i (the variable used by the previous loop), which surrounds this loop starting with "for(j..." . This loop also setsj to 2 (the same way the surrounding loop set i to 2); as long as j is less than or equal to (i divided by j) the loop will continue to execute; and j will increment (increase) by one each time that the loop is run, the same way that i does in the loop that surrounds this one. 
+if(!(i%j)) break; // if factor found, not prime this line means that the loop will also stop executing (break) if the remainder of i divided by j does not equal zero. 
+if(j > (i/j)) printf("%d is prime", i); This line means that if j is greater than i divided by j that the loop will write/output the text to stdout (std out is the standard output device, a pointer to a FILE stream that represents the default output device for the application).
+Lastly, the last return 0; line indicates a return from the function and the final curly brace encloses the functions logic/code. The main function also should return 0(also EXIT_SUCCESS) to identify that the program has executed successfully and -1 otherwise (also EXIT_FAILURE).
+
+Additional Note - Loops in every programming language I've seen personally tend to have a few things in common:
+i. An init counter, a value where the loop will initialize (start counting), inside the loop's parentheses and before the first semi-colon.
+ii. A test counter, which will be evaluated each time that the loop continues, and if it evaluates to TRUE the loop will continue usually but if it evaluates to false then the loop will end. This is the part of the loop after the first semi-colon but before the second semi-colon.
+iii. An increment/decrement counter, which increases or decreases the loop by some value each time that the loop is run. This is the part of the loop inside the parentheses, after the second semi-colon. If there is no increment counter or test counter that causes the loop to exit/break at some point, then this is known as an infinite loop. This is a very bad thing in programming because it will cause just about any computer program to crash since it will execute and consume computing resources indefinitely. Not good :)
+Disclaimer: I don't actually code in C but the language has so many similarities with programming languages I do use, that I'm guessing this answer is very close if not 100% correct. Curious to hear some input from an expert C programmer though!#include <stdio.h>
+
+int main () {
+    /* local variable definition */
+    int i, j;
+
+    // Loop from 2 to 99; i will hold the number we are checking to
+    // see if it is prime
+    for(i = 2; i<100; i++) {
+        // now loop through the numbers checking each one to see if
+        // it is a factor of i (if it is, then i isn't prime).  This
+        // loop stops when j^2 is greater than or equal to the number
+        // we are checking
+        for(j = 2; j <= (i/j); j++) {
+            // i % j (i modulus j) is 0 iff j is a factor of i.  This
+            // if test relies on the fact that 0 is false in C (and 
+            // all nonzero values are true)
+            if(!(i%j)) break; // if factor found, not prime
+        }
+        // this tests to see if we exited the above loop by failing
+        // the test in the for() statement, or whether we exited the
+        // loop via the break statement.  If we made it through all
+        // iterations of the loop, then we found no factors, and the
+        // number is prime.
+        // 
+        // note that a \n is missing at the end of the printf format
+        // string.  The output will be "2 is prime3 is prime5..."
+        if(j > (i/j)) printf("%d is prime", i);
+    }
+
+    // returns from main() with a value of 0, which will result in
+    // the program exiting with an exit code of 0.  An explicit 
+    // exit(0) is better form here, but this is not incorrect.
+    return 0;
+}Your code is looping over all integers from 2 to 99, holding the actual number in i.
+for(i = 2; i<100; i++)
+
+Then, for every number i, the code is looping again over all integers from 2 to (i/j).
+for(j = 2; j <= (i/j); j++)
+
+Your loop's finishing condition is mathematically equivalent to j being smaller than the square root of i, since any larger integer j would already contain itself a smaller factor of i.
+(To check this, get a paper and rewrite the inequality so hat i is the sole part of the right hand side of your condition.)
+Then it checks whether or not j divides i.
+(i%j)
+
+If j is a factor of i, then i modulo j is zero and hence 
+if (!(i%j))
+
+evaluates to true (since 0 is evualted as false and ! negotiates this) and you can break out of the loop since i has a divisor not being 1 or i, hence i is not a prime.
+On the other hand, if the inner loop is finished, you have found a prime since it has only 1 and i as divisor.
+Needles to say that this bruteforce approach is very slow for large integers (you won't crack RSA with that), but does this clarify your questions?Shake sort using MACROShake sort of vector:
+program works, but:
+I was trying to use the same function for bubble up and bubble down for shake sort (bubble up to get the MAX value to the right and bubble down to get the min value to the left). In order to do it I was trying to use the following MACRO which does not compile:
+sign is '+' and oper is '>' for bubble
+sign is '-' and oper is '<' for bubble down
+for bubble up - 
+start is iterator i (iterated the Vector indices)
+end is n-1-i; 
+for bubble down - 
+swap start and end values
+#define bubble_up_down(var_t, pVector, _Is_swp, start, end, sign, oper)\
+{\
+    var_t current_index;\
+    var_t current_val;\
+    var_t next_val;\              
+    for (current_index = *(start) ; current_index (oper) *(end) ; (sign)(sign)current_index){\
+    {\
+        VectorGet((pVector), current_index, &current_val);\
+        VectorGet((pVector), current_index(sign)1, &next_val);\
+        if(current_val (oper) next_val)\
+        {\
+            VectorSet((pVector), current_index, next_val);\
+            VectorSet((pVector), current_index(sign)1, current_val);\
+            *(_Is_swp) = 1;\
+        }\
+    }\
+}
+
+Need your advice to fix this macro.It is not really clear why you want to use a macro here. Do you want to avoid duplicaing code? Or do you want to make your sorting routine type independent?
+Anyway, your macro has several errors:
+
+You've probably read that you should guard macro arguments with parentheses. That is usually good advice, because macros are text replacements; for example infamous SQ(x + 1) will resolve to x + 1*x + 1. In your case, the advice is wrong-headed. You will get syntactically wrong "operators" such as (-) and (<) in your code. Just use sign and oper.
+Even so, sign sign will resolve to - - or + +, which is not what you want. You could rewrite i++ to the equally valid i = i + 1 or you could use the token-pasting operator, sign##sign, which would produce -- or ++.
+Macros aren't functions. You are probably going to invoke your macro inside a function. All local variables that are in scope hen you invoke the macro are also in scope for the macro. That means there is probably no need to define all these pointers.
+Why do you pass the array element type, var_t? I reckon that SetVector and GetVector aren't macros, so the type independence falls flat.
+If var_t is the type of your array elements, your index isn't necessarily of the same type; it should be an integer type. (Your elements must be comparable with the < operator, so it is one of the arithmetic types, but image what happens if you have an array of char that is longer than 256 elements?)
+If your elements are of arithmetic type, there's probably no need for the GetValue and SetValue calls. You can just assign values with the = operator .
+
+All this makes me think that you don't really know what you're doing. That plus the known pitfalls and shortcomings of macros are a good reason not to use any macros here.
+
+Addendum   In comments, The PO has said that the macro should achieve two things: It should avoid repeated code and it should make the sorting independent of the types of the array elements. These are two different things.
+Writing short local macros to avoid repeating code can be a useful technique, especially, if the code needs to keep variables in sync in several places. Is it useful in your situation?
+So you've got your upward-bubbling code:
+int done = 0;
+
+while (!done) {
+    done = 1;
+
+    for (int i = 1; i < n; i++) {
+        if (a[i - 1] > a[i]) {
+            swap(a, i - 1, i);
+            done = 0;
+        }
+    }
+}
+
+(This uses a swap function to swap two array elements. It is more straightforward than your version, because it doesn't use get/set accessor functions.) Now you write the downward-bubbling counterpart:
+while (!done) {
+    done = 1;
+
+    for (int i = n - 1; i > 0; i--) {
+        if (a[i - 1] > a[i]) {
+            swap(a, i - 1, i);
+            done = 0;
+        }
+    }
+}
+
+These two snippets differ only in the loop control. Both visit all indices from 1 to n - 1. So your macro needs to pass the start and end values. But it also needs to know which way the comparison goes – less than or greater than – and whether to increment or to decrement the index. That's four pieces of data for a simple loop.
+You could try to get rid of the comparison and use != for both directions. But then your loops will fail if the array is empty.
+The above backwards loop will already fail on empty arrays when you use an unsigned integer as index. Forward and backward lops are asymmetric an C, because the lower and upper bounds are asymmetric, too: Lower bound are always inclusive, upper bound are always exclusive. This forward loop:
+for (unsigned int i = 0; i < n; i++) ...
+
+Has the following backward equivalent:
+for (unsigned int i = n; i-- > 0; ) ...
+
+Here, the decrement occurs in the condition and the update part is empty. The advantage is that it uses exactly the same bounds, 0 and n, verbatim, but by decrementing before entering the loop body, the same valid range of numbers, 0 to n - 1 are visited. And it works with unsigned ints, which are a natural choice for looping variables.
+To cut a long story short: Forward and backward loops are asymmetric in C, so it is not easy to write a macro for them. C's  for syntax is more verbose than for i = 1 to n, but that's how it is. Embrace it and alleviate the typing pain by chosing appropriate index names: it's i, not current_index.
+Can you make the code less redundant without macros? Of course: You can write two functions for bubbling up and down once:
+static int bubble_up(int a[], int n)
+{
+    int done = 1;
+
+    for (int i = 1; i < n; i++) {
+        if (a[i - 1] > a[i]) {
+            swap(a, i - 1, i);
+            done = 0;
+        }
+    }
+
+    return done;
+}
+
+static int bubble_down(int a[], int n)
+{
+    int done = 1;
+
+    for (int i = n; i-- > 1; ) {
+        if (a[i - 1] > a[i]) {
+            swap(a, i - 1, i);
+            done = 0;
+        }
+    }
+
+    return done;
+}
+
+(These functions are static, i.e. private to the current compilation unit.) Now your actual sorting functions look like this:
+void sort_bubble_up(int a[], int n)
+{
+    int done = 0;
+
+    while (!done) {
+        done = bubble_down(a, n);
+    }
+}
+
+void sort_bubble_down(int a[], int n)
+{
+    int done = 0;
+
+    while (!done) {
+        done = bubble_down(a, n);
+    }
+}
+
+void sort_shaker(int a[], int n)
+{
+    int done = 0;
+
+    while (!done) {
+        done = bubble_up(a, n) || bubble_down(a, n);
+    }
+}
+
+If you are not afraid of empty loop bodies, you can even get them down to:
+void sort_bubble_up(int a[], int n)
+{
+    while (bubble_down(a, n)) { }
+}
+
+void sort_bubble_down(int a[], int n)
+{
+    while (bubble_down(a, n)) { }
+}
+
+void sort_shaker(int a[], int n)
+{
+    while (bubble_up(a, n) || bubble_down(a, n)) { }
+}
+
+All this code works only for int arrays, though. The standard library's way of approaching type independence is to work on the byte level via void * pointers and user-defined comparison functions. The sorting function qsort does this, for example.
+C++ and other languages have templates, where you can write an algorithm for several types. When you "instantiate" a template, the compiler creates a function for just this type, which is then called.
+You could emulate this with macros. If you just want to call your macro in the function body, you could define:
+#define BUBBLE_SORT(ARRAY, N, TYPE) do {         \
+        int done = 0;                            \
+        int i;                                   \
+                                                 \
+        while (!done) {                          \
+            done = 1;                            \
+                                                 \
+            for (i = 1; i < N; i++) {            \
+                if (ARRAY[i - 1] > ARRAY[i]) {   \
+                    TYPE sawp = ARRAY[i];        \
+                                                 \
+                    ARRAY[i] = ARRAY[i - 1];     \
+                    ARRAY[i - 1] = swap;         \
+                    done = 0;                    \
+                }                                \
+            }                                    \
+        }                                        \
+    } while (0)
+
+and then use the macro like so:
+char c[] = "Mississippi";
+
+BUBBLE_SORT(c, strlen(c), char);
+
+(That do { ... } while (0) thing around thze macro makes the macro behave like a function call, sort of. The new scope of the loop body allows for local variables.)
+The problem here is that such multi-line macros are hard to debug. When there is an error in the body, you just get the number of the line where the macro is invoked in an error message. (But you can use -E with most compilers to see how the preprocessor resolves that macro.)
+Conclusion:
+
+Macros can be useful, but you have to know what you are doing. In general, try to avoid them, because they are hard to debug and often hard to understand for others. (And this other person might be you half a year later.)
+If you must use macros, try to make then look as natural as possible. Passing operators like > or + should make you wary.
+Use functions, not macros, for common code.
+Embrace C's way to deal with different types. It will be more useful (if less fun) to learn how qsort works than to fiddle with macros for a bubble sort implementation.
+If you really need to write a lot of type-independent code, you probably shouldn't use C.Showing all decimal numbers in CSo I'm trying to print my my data from a file that was already given to me. In our data most of the numbers have 9 decimal places. A starter code was given to me by my teacher and when I try to print the data it only prints up to 6 decimal places. So the last 3 digits don't show up in the output. Also I have tried to write the number of decimal places like %.9f but surprisingly the last three digits are  different. For example the number in my data is 1.900195512 while the printed number (set to 9 decimal places) is 1.900195479.
+My code is:
+#define _CRT_SECURE_NO_DEPRECATE
+#include <stdio.h>
+#include <stdlib.h>
+// Declare constants
+
+// Name of file that stores our raw data
+#define FILE_NAME "data_1.csv"
+
+// Data size
+#define MAX_ROWS 20
+#define MAX_COLUMNS 20
+
+// Main entry point for the program
+int main(void) {
+    // Decalred variables
+    int rowIndex = 0;
+    int columnIndex = 0;
+    float rawData[MAX_ROWS][MAX_COLUMNS]; // 2-dimensional array to store our 
+    raw data
+    // Misc variables used for reading the data from the file
+    float tempfloat = 0.0F;
+    float tmp = 0.0F;
+    char newline = ' ';
+
+    // ----------------------------------------------------------------------
+    // Open the file for reading 
+    FILE *infp;
+    infp = fopen(FILE_NAME, "r");
+
+    // Check for errors and exit if found
+    if (infp == NULL) {
+        printf("Error: failed to open %s for reading\n", FILE_NAME);
+        return(1);
+    }
+
+    // Read the file into the data structure
+    for (rowIndex = 0; rowIndex < MAX_ROWS; rowIndex++) {
+        // Read up until the last value
+        for (columnIndex = 0; columnIndex < MAX_COLUMNS - 1; columnIndex++) {
+            if (fscanf_s(infp, "%f,", &tempfloat) != EOF) {
+                rawData[rowIndex][columnIndex] = tempfloat;
+            } else {
+                printf("Error: incorrect file format at row %d, col %d.\n", rowIndex + 1, columnIndex + 1);
+                return(1);
+            }
+        }
+
+        // Read the last value and the newline char
+        if (fscanf_s(infp, "%f%c", &tempfloat, &newline) != EOF) {
+            // Check if the last character in the line was a \n otherwise an error occured.
+            //Xiao: I have added newline != '\n'
+            if (newline != '\0' && newline != '\r' && newline != '\n') {
+                printf("Error: incorrect file format at line %d. did not find a newline.\n", rowIndex + 1);
+                return(1);
+            } else {
+                rawData[rowIndex][columnIndex] = tempfloat;
+            }
+
+            // Reset the character before the next read. 
+            newline = ' ';
+        }
+    }
+    // ----------------------------------------------------------------------
+    // Print out the rawdata array
+    printf(" --- RAW DATA ---\n");
+    for (rowIndex = 0; rowIndex < MAX_ROWS; rowIndex++) {
+        // Read up until the last value
+        for (columnIndex = 0; columnIndex < MAX_COLUMNS; columnIndex++) {
+            printf("%.9f ", rawData[rowIndex][columnIndex]);
+        }
+        printf("\n");
+    }
+
+    // Exit
+    return (0);
+}The float type does not have enough precision for 9 accurate decimal places. You should use the double type, which you can scan with %lf.
+Also do not compare the return value of fscanf() to EOF to detect failure, invalid input may cause 0 to be returned.  Just verify the number of successful conversions returned by fscanf().
+Here is a modified version:
+#define _CRT_SECURE_NO_DEPRECATE
+#include <stdio.h>
+#include <stdlib.h>
+// Declare constants
+
+// Name of file that stores our raw data
+#define FILE_NAME "data_1.csv"
+
+// Data size
+#define MAX_ROWS 20
+#define MAX_COLUMNS 20
+
+// Main entry point for the program
+int main(void) {
+    // Decalred variables
+    int rowIndex = 0;
+    int columnIndex = 0;
+    double rawData[MAX_ROWS][MAX_COLUMNS]; // 2-dimensional array to store our 
+    raw data
+    // Misc variables used for reading the data from the file
+    double tempfloat = 0.0;
+    double tmp = 0.0;
+    char newline;
+
+    // ----------------------------------------------------------------------
+    // Open the file for reading 
+    FILE *infp;
+    infp = fopen(FILE_NAME, "r");
+
+    // Check for errors and exit if found
+    if (infp == NULL) {
+        printf("Error: failed to open %s for reading\n", FILE_NAME);
+        return(1);
+    }
+
+    // Read the file into the data structure
+    for (rowIndex = 0; rowIndex < MAX_ROWS; rowIndex++) {
+        // Read up until the last value
+        for (columnIndex = 0; columnIndex < MAX_COLUMNS - 1; columnIndex++) {
+            if (fscanf_s(infp, "%lf,", &tempfloat) == 1) {
+                rawData[rowIndex][columnIndex] = tempfloat;
+            } else {
+                printf("Error: incorrect file format at row %d, col %d.\n", rowIndex + 1, columnIndex + 1);
+                return 1;
+            }
+        }
+
+        // Read the last value and the newline char
+        if (fscanf_s(infp, "%lf%c", &tempfloat, &newline) == 2) {
+            // Check if the last character in the line was a \n otherwise an error occured.
+            //Xiao: I have added newline != '\n'
+            if (newline != '\r' && newline != '\n') {
+                printf("Error: incorrect file format at line %d. did not find a newline.\n", rowIndex + 1);
+                return 1;
+            } else {
+                rawData[rowIndex][columnIndex] = tempfloat;
+            }
+        }
+    }
+    // ----------------------------------------------------------------------
+    // Print out the rawdata array
+    printf(" --- RAW DATA ---\n");
+    for (rowIndex = 0; rowIndex < MAX_ROWS; rowIndex++) {
+        // Read up until the last value
+        for (columnIndex = 0; columnIndex < MAX_COLUMNS; columnIndex++) {
+            printf("%.9f ", rawData[rowIndex][columnIndex]);
+        }
+        printf("\n");
+    }
+
+    // Exit
+    return 0;
+}You can break your problem down into a much more concise example to help isolate the problem. You are attempting to get 9-digit precision out of a type float, that is only good for 6-7. To improve your accuracy, you need to use type double instead.
+When you read any user input always, always validate the return of the function used, and any constraints on the value (none in you case).
+A short implementation correcting the issue could be:
+#include <stdio.h>
+
+int main (void) {
+
+    double d = 0.0;
+
+    printf ("Enter value: ");
+    if (scanf ("%lf", &d) == 1)
+        printf ("Your value : %.9f\n", d);
+
+    return 0;
+}
+
+Example Use/Output
+$ ./bin/scanf_double
+Enter value: 1.900195512
+Your value : 1.900195512
+
+Look over the answers and comments and let me know if you have further questions.float is not accurate after 7 places. Use double instead
+#include <stdio.h>
+
+int main() 
+{
+    float f;
+    double d;
+    scanf("%f",&f);
+    scanf("%lf",&d);
+    printf("%.9f\n",f);
+    printf("%.9lf\n",d);
+    return 0;
+}
+
+
+Input:
+0.123456789      // float variable i.e. f
+0.123456789      // double variable i.e. d
+
+Output:
+0.123456791     //  float precision
+0.123456789     //  double precisionProgram not terminating loop in recursion after base condition is metWhy is the control returning to the top of the program after the base condition is met? It should just execute the line present after the recursive call. {output 54322233} shows that control is returning back to the top of the code:
+    void print(int a)
+    {while(a!=1)
+    {
+    printf("%d",a);
+    a--;
+    print(a);
+    }}Your code is implementing both recursion and iteration!  Let's separate out the two:
+Iteration:
+void print(int a)
+{
+    while (a >= 1)
+    {
+        printf("%d\n", a);
+        a--;
+    }
+}
+
+Recursion:
+void print(int a)
+{
+    if (a >= 1)
+    {
+        printf("%d\n", a);
+        print(a - 1);
+    }
+}#include<iostream>
+using namespace std;
+
+void print(int a);
+
+int main() {
+
+int a = 10;
+print(10);
+
+}
+     void print(int a)
+    {
+        while(a != 5)
+a--;
+cout << a << endl;
+}
+
+//The value of a should be greater than 5
+//So the recursion will stop at 5Which loop is better? [closed]Closed. This question is opinion-based. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it can be answered with facts and citations by editing this post.
+                
+Closed 4 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+Am a beginner at C here; Would like to ask which of the following 2 code is better for printing odd integers between 1 and given number?
+// Precond: n > 0
+void print_odd_integers(int n)  {
+    int i;
+    for (i=1; i<=n; i+=2)
+        printf("%d ", i);
+    printf("\n");
+}
+
+// Precond: n > 0
+void print_odd_integers(int n)  {
+    int i;
+    for (i=1; i<=n; i++)
+        if (i%2 != 0)
+            printf("%d ", i);
+    printf("\n");
+}
+
+If neither can be said to be clearly "better", what are the different trade-offs between the versions?Use the First Loop if n is not the extreme case like INT_MAX and also when i starts from an odd integer, Since it already skips half the number iterations.
+Else use the Second Loop because the first will become infinite loop if n = INT_MAX.Absolutely the first one. 
+Reasons: 
+
+- less lines of code
+
+- branching statements (if, if else, switch cases, ...) are mainly avoided if there is other ways of handling the situation.
+
+- time complexity of both algorithms are the same O(n). So this is mainly a matter of which code is more beatifull. And always remember, a code that is more readable is prettier.
+EDIT
+
+the fact that on the edge the first solution has undefined behavior is obvious. but these input validations must be checked outside the algorithm part. and it's much recommended that you DO NOT mix validation codes with your logic. easily you can check for i at first of the function and print INT_MAX if i==INT_MAX-1 or i==INT_MAXFunctionally, they are the same, so it really doesn't matter all that much unless you really need max performance.
+However, the solution where you skip the if statement would be a lot efficient. You're skipping half the numbers and don't need to check a condition with modulus.Both loops have undefined behavior if n == INT_MAX because of arithmetic overflow.
+
+The first loop will potentially give you better performance
+The second loop is potentially more readable (for a beginner) and less error prone if you later change the code to start from an arbitrary value.
+I would use braces around the for body as it is not a simple one line statement and spaces around binary operators to improve readability:
+void print_odd_integers(int n)  {
+    int i;
+    for (i = 1; i <= n; i++) {
+        if (i % 2 != 0)
+            printf("%d ", i);
+    }
+    printf("\n");
+}
+
+
+Note also that both loops will output a space after the last number before the newline, which may be incorrect.
+You can address both issues with one extra test:
+void print_odd_integers(int n)  {
+    for (int i = 1; i <= n; i += 2) {
+        printf("%d", i);
+        if (i == n)
+           break;
+    }
+    printf("\n");
+}The second solution is the "professional" way.
+One thing you could change would be the Layout:
+void print_odd_integers(int n)  
+{
+    int i;
+    for (i=1; i<=n; i++)
+    {
+        if (i%2 != 0)
+        {
+            printf("%d\n", i);
+         }
+    }
+    printf("End.\n");
+    system("Pause"); //So you can see what you did :)
+}
+
+Have fun :)!'static volatile' vs. 'static' vs. 'volatile' in CWhat's the difference between using the variable specifiers static volatile combined? Or using one alone; like static or volatile in microcontroller programming?static - in this case makes the variable visible only inside the current file
+volatile - it is information for the compiler that the object can be changed by something outside the normal execution path (for example, the interrupt routine) and guarantees that the variable will be read before any use and written after every change.  volatile (which is a very common misunderstanding) does not guarantee anything else - no atomicity, no cache coherency, etc., etc.For the keywords static and volatile there is written enough...
+See for example:
+
+Why is volatile needed in C?
+What does "static" mean in C?
+
+In the concern of the TWI interface, volatile is needed, because functions which modify these variables could be called from different interrupt service handlers. If volatile would be removed, the compiler will optimize code, not knowing that code can be interrupted. That may lead to failures.static:
+A static variable refers to a class variable that's shared among all instances.
+volatile:
+Volatile variables are those which are read and written to main memory. They aren't stored in local cache and are always fetched from main memory.
+For example, two threads use, say, private volatile int x;. If thread A write(x) and thread B read(x) then, both the times it will write and read from main memory, without using the threads' local cache.
+static volatile:
+Even if the static variables are shared variables, but in different thread there can be different values for a static variable in the local cache of a thread. To make it consistent for all threads, just declare it as static volatile. So each time it will fetch from main memory.Building/Compiling C-code on another machine via bsubWe have a server that we use to build our software and sometimes it is overloaded. I was told that our servers network configured in such a way that I could build/compile our source code on another machine that might be not so overloaded at that time via bsub.
+So from the directory where my Makefile (/home/username/workspace) is, I enter:
+$ bsub make clean
+
+It seems that this command successfully send 'make clean' to another machine because a few minutes later I got notification via email. However, it seems that 'make clean' has failed. This is what the email says:
+  Job <make clean> was submitted from host <myserver> by user <username> in cluster <Cluster_Name>.
+  Job was executed on host(s) <hostname>, in queue <long>, as user <username> in cluster <Cluster_Name>.
+  ...
+  ...
+  </home/username> was used as the home directory.
+  </tmp> was used as the working directory.
+  ...
+  ...
+  make: *** No rule to make target `clean'.  Stop.
+
+So, it appears that /tmp was used as the working directory instead of my /home/username/workspace where the Makefile is.
+Now the questions are:
+
+How do I make my workspace as the working directory? OR 
+How do I copy all the necessary files to the /tmp? OR 
+Maybe I'm doing this all wrong?
+
+I don't have any background at all on distributed computing or related fields, so I might not be asking the right questions.
+Thanks in advance!How to perform operation on last node returned by some function?I have a doubly linked list below. Consider two functions some_function1 and some_function2. They both return a pointer to some node. Now, there is another function do_something which either does something (if some_condition = 1) or nothing (if some_condition = 0). If some_condition = 1, then I want it to do some operation on the last node returned by either some_function1 or some_function2, whichever was last called by the main function. How to achieve this? Thanks
+EDIT: What I really want to do is delete the last node that was returned by some_function1 or some_function2.
+typedef struct Node {
+
+    int item; 
+    struct Node *next; 
+    struct Node *prev; 
+
+} Node;
+
+typedef struct List {
+
+    Node *current_node;  
+
+} List;
+
+
+
+int some_condition = 0; 
+
+
+
+int some_function1(List L){
+    if (something){
+        //do stuff
+        some_condition = 1; 
+    }
+    else{
+        //do stuff
+        some_condition = 0; 
+    }
+
+    return *pointer to some node
+}
+
+int some_function2(List L){
+    if(something){
+        //do stuff
+        some_condition = 1;
+    }
+    else{
+        //do stuff
+        some_condition = 0; 
+    }
+
+    return *pointer to some node 
+}
+
+//returns 1 or 0 based on success
+int do_something(List L){
+    if(some_condition == 1){
+        //HERE, I WANT TO DO SOMETHING ON THE NODE THAT WAS LAST RETURNED BY EITHER some_function1 OR some_function2 
+        return 1; 
+
+    }
+    else{
+        return 0; 
+    }
+    some_condition = 0; 
+}If I understand you correctly, you want to have the do_something function perform an action using the most recently used node returned by either of the two functions some_function1 or some_function2.
+You can achieve this using a static pointer with module scope, to cache the one value:
+static struct Node * MRU_node;
+
+int some_function1(List L){
+    if (something){
+        //do stuff
+        some_condition = 1; 
+    }
+    else{
+        //do stuff
+        some_condition = 0; 
+    }
+
+    MRU_node = *pointer to some node    // HERE
+    return MRU_node;
+}
+
+Then add code in the do_something function to reference this cache:
+//returns 1 or 0 based on success
+int do_something(List L){
+    if (some_condition == 1){
+        ... MRU_node ... ; // reference the cached pointer
+        return 1; 
+
+    }
+    else{
+        return 0; 
+    }
+    some_condition = 0; 
+}C Program to find hypotenuse, hypotenuse found too bigThis is my first program in C. When I run this the hypotenuse it finds is huge. I enter side A and B as 2 and the output is 130899047838401965660347085857614698509581032940206478883553280.000000. What did I do wrong?
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+int die(const char *msg);
+double hypotenuse(double side0, double side1);
+
+int main()
+{
+    double a, b, c;
+    printf("Enter side A: ");
+    if (scanf_s("%1f", &a) != 1)
+        die("input failure");
+    printf("Enter side B: ");
+    if (scanf_s("%1f", &b) != 1)
+        die("input failure");
+    c = hypotenuse(a, b);
+    printf("The hypotenuse is %f\n ", c);
+}
+
+int die(const char *msg)
+{
+    printf("Fatal Error: %s\n", msg);
+    exit(1);
+}
+
+double hypotenuse(double side0, double side1)
+{
+    return sqrt((side0 * side0) + (side1 * side1));
+}There is a typo in your scanf() conversion specifier: %1f should be %lf with an ell instead of a one.
+These 2 characters look deceptively similar. For this reason, it is also recommended to avoid naming variables l or ll, l1 etc.
+The specifier %1f attempts to convert at most 1 byte from the stream as a floating point number and store the result into a float whose address is passed.  You pass the address of a double, so the behavior is undefined.
+You can prevent this kind of silly mistake by increasing the warning level:
+
+gcc -Wall -Wextra -Werror
+clang -Weverything -Werror
+cl /W3 or cl /W4 or cl /WallHow do I figure out the size of struct members and paddings?Say if I have a struct as: 
+struct simple_struct_1
+{
+  long long a;
+  char b;
+  long c;
+};
+
+Address of a is: 0x7ffd415c8b20
+Address of b is: 0x7ffd415c8b28
+Address of c is: 0x7ffd415c8b30
+size of simple_struct_1 is 24
+I have printed the address of each member and the size of the struct, how do I show how this struct is laid down in memory? Like if in the simple_struct_1, a occupies 111 bytes and has 222 padding bytes after which b occupies 333 bytes with 0 padding bytes after it, and c occupies 444 bytes with 555 bytes of padding after it.You can use offsetof and sizeof to get details on each individual field and the size of the structure as a whole, such as with:
+printf ("a      is %d@%d\n", sizeof(simple_struct_1.a), offsetof(simple_struct_1, a));
+printf ("b      is %d@%d\n", sizeof(simple_struct_1.b), offsetof(simple_struct_1, b));
+printf ("c      is %d@%d\n", sizeof(simple_struct_1.c), offsetof(simple_struct_1, c));
+printf ("struct is %d@0\n",  sizeof(simple_struct_1));
+
+That should enable you to work out:
+
+the offsets and sizes of all fields;
+the gaps between the fields; and
+the gap after the last field (combine its offset and size with the size of the entire structure.
+
+Don't worry about padding before the first field, the ISO standard forbids that.
+For example, let's say you see the following output on the left, the sizes and gaps are shown on the right:
+a      is 16@0        16 bytes for a long long
+                      no gap (0 + 16 = 16, next at 16)
+b      is 1@16         1 byte  for a char
+                       7 bytes gap (16 + 1 = 17, next at 24)
+c      is 8@24         8 bytes for a long
+struct is 32@0        no gap at end (24 + 8 = 32, next at 32)You can use the offsetof() macro to find the offset in bytes of each field from the first member (which must have the same address as the struct since no padding is allowed to precede the first member).
+Combining this information with the sizes of the various members (and the size of the whole struct to find the number of trailing padding bytes), obtained using the sizeof operator, allows one to deduce where the padding bytes are. Here is a program that prints out member addresses and offsets. It also prints a graphic representation of member bytes and padding bytes; dashes indicate padding bytes.
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+
+struct simple_struct_1 {
+    long long a;
+    char b;
+    long c;
+};
+
+char * graph_member(char *ptr, size_t member_sz, size_t padding_sz);
+
+int main(void)
+{
+    struct simple_struct_1 my_struct;
+
+    printf("sizeof (struct simple_struct_1) = %zu\n",
+           sizeof (struct simple_struct_1));
+    putchar('\n');
+
+    void *ptra = &(my_struct.a);
+    void *ptrb = &(my_struct.b);
+    void *ptrc = &(my_struct.c);
+
+    size_t offset_a = offsetof(struct simple_struct_1, a);
+    size_t offset_b = offsetof(struct simple_struct_1, b);
+    size_t offset_c = offsetof(struct simple_struct_1, c);
+
+    /* Allocate memory for struct padding visualization */
+    char *graph = malloc(sizeof my_struct + 1);
+
+    if (graph == NULL) {
+        perror("Virtual memory exhausted");
+        exit(EXIT_FAILURE);
+    }
+
+    char *ptr = graph;
+
+    printf("&(my_struct.a) = %p\n", ptra);
+    printf("sizeof my_struct.a = %zu\n", sizeof my_struct.a);
+    putchar('\n');
+    ptr = graph_member(ptr,
+                       sizeof my_struct.a,
+                       offset_b - sizeof my_struct.a);
+
+    printf("&(my_struct.b) = %p\n", ptrb);
+    printf("sizeof my_struct.b = %zu\n", sizeof my_struct.b);
+    printf("&(my_struct.b) - &(my_struct.a) = %zu\n", offset_b - offset_a);
+    putchar('\n');
+    ptr = graph_member(ptr,
+                       sizeof my_struct.b,
+                       offset_c - offset_b - sizeof my_struct.b);
+
+    printf("&(my_struct.c) = %p\n", ptrc);
+    printf("sizeof my_struct.c = %zu\n", sizeof my_struct.c);
+    printf("&(my_struct.c) - &(my_struct.b) = %zu\n", offset_c - offset_b);
+    putchar('\n');
+    ptr = graph_member(ptr,
+                       sizeof my_struct.c,
+                       sizeof my_struct - offset_c - sizeof my_struct.c);
+
+    /* Null-terminate graph string and display */
+    ptr = '\0';
+    puts(graph);
+
+    free(graph);
+
+    return 0;
+}
+
+char * graph_member(char *ptr, size_t member_sz, size_t padding_sz)
+{
+    /* Indicate member */
+    for (size_t i = 0; i < member_sz; i++) {
+        *ptr = '*';
+        ++ptr;
+    }
+
+    /* Indicate padding */
+    for (size_t i = 0; i < padding_sz; i++) {
+        *ptr = '-';
+        ++ptr;
+    }
+
+    return ptr;
+}
+
+Sample program output:
+sizeof (struct simple_struct_1) = 24
+
+&(my_struct.a) = 0x7ffee4af4610
+sizeof my_struct.a = 8
+
+&(my_struct.b) = 0x7ffee4af4618
+sizeof my_struct.b = 1
+&(my_struct.b) - &(my_struct.a) = 8
+
+&(my_struct.c) = 0x7ffee4af4620
+sizeof my_struct.c = 8
+&(my_struct.c) - &(my_struct.b) = 8
+
+*********-------********You can try to use pahole (poke -a -hole). This will help exactly how you need it.
+Here is a reference to it. paholeUsing multiple integers with one operand in a C conditional statement possible?Is it possible in C to write something like?  and if so how is it done?
+if ( x != 1, 2, 7, 8, 90)You can't compare multiple values that way.  You need to check each individually combined with the proper logical operator:
+if ((x != 1) && (x != 2) && (x != 7) && (x != 8) && (x != 90)
+
+What you wrote is something entirely different.  This:
+if ( x != 1, 2, 7, 8, 90)
+
+Is a single comparison operator followed by several instances of the comma operator.  The comma operator evaluates the left operand, discards the value, then evaluates the right operand and takes its value.
+So that expression first evaluates x != 1 which will result in either 0 or 1.  That value is discarded and the value 2 is evaluated.  That value is in turn discarded and the next value (7) is evaluated.  Then 8 is evaluated and discarded, then 90 is evaluated which becomes the value of the entire expression.No you can't do that. You need to write it like this :
+if (x != 1 && x != 2 && x!= 3)
+
+The comma operator has another effects, I let you looking for it :)My answer is paradoxical, but strictly correct.
+
+Is it possible in C to write something like? and if so how is it done?
+
+a) Yes, it is possible. 
+b) How is done? Here is comma operator, yes, C has comma operator. 
+Final value is last element, 90 here
+c) The question author didn't ask about comparison
+So this if has sense if(90). Interesting is that sub-expression x!=1 is evaluated, but result is lost, and has no effect on final
+if ( x != 1, 2, 7, 8, 90)
+{
+  here, true
+}
+else
+{
+  not here, false
+}
+
+Adan didn't ask how to compare, but the question posed above.
+Appendix: fully working code from MSVC. Everything I say, anyone can debug.
+#include "stdafx.h"
+
+
+int main()
+{
+    int x = 2;
+    int k = (x != 1, 2, 7, 8, 90);
+    if (x != 1, 2, 7, 8, 90)
+    {
+        int k1 = 1;
+    }
+    else
+    {
+        int k2 = 2;
+    }
+    return 0;
+}Is the `alignof` of a struct always the maximum `alignof` of its constituents?I've noticed from playing around with simple examples that alignof(struct_name) is always the alignof of the maximum alignof of its struct constituents. Is this always (or almost always) the case?Is the alignof of a struct always the maximum alignof of its constituents?
+
+The alignof macro expands to the _Alignof operator, which computes the alignment requirement of its operand.  Most aspects of how alignment requirements are determined are implementation-defined, so in that sense it is not safe to assume that your proposition always or even usually holds.
+The pattern you observed is nevertheless common, however.  In order for an implementation to ensure that every member of every instance of a given structure type is aligned according to the alignment requirement of that member's type, the implementation must choose an alignment requirement for the overall structure type that is at least as large as the maximum alignment requirement of any of its members.  On the other hand, choosing the smallest possible alignment requirement  contributes to efficient use of memory.  The combination of those leads to the alignment behavior you observed.
+I reiterate, however, that alignment requirements are for the most part implementation-defined.  Even excluding from consideration the effects of the _Alignas operator, implementations are not obligated to choose structure alignment requirements according to your pattern.  For instance, an implementation could choose to assign (at least) the maximum fundamental alignment to every structure type, regardless of its member types.
+Ultimately, however, one has to wonder why you care.  It is rare, albeit not unheard-of, that you need to know or should depend on the alignment requirements of your types.  Where you do want a specific alignment requirement, you are much better off declaring it directly than trying to use members' types to influence it.when visual studio 2017 build from github source, c1083 error [closed]Closed. This question needs debugging details. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it's on-topic for Stack Overflow.
+                
+Closed 4 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+i am new at visual studio. so i don`t know anyting.
+i am :
+using Visual studio 2017 
+source code from https://github.com/Bionus/imgbrd-grabber
+what i do :
+open File-> New -> Project from existing code -> Visual c++ -> select extracted imgbrd-grabber source -> Finish 
+what happen :
+when i build solution,
+`Severity   Code    Description Project File    Line    Suppression State
+Error   C1083   Cannot open include file: 'QtTest': No such file or directory   grabber c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\tests\src\test-suite.h 4
+-5.5.0\lib\src\downloader\download-query-group.h    4
+Error   C1083   Cannot open include file: 'QString': No such file or directory  grabber c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\lib\src\danbooru-downloader-importer.h 4
+Error   C1083   Cannot open include file: 'QNetworkAccessManager': No such file or directory    grabber c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\lib\src\custom-network-access-manager.h    4
+Error   C1083   Cannot open include file: 'QtSql/QSqlDatabase': No such file or directory   grabber C:\Users\sin\Downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\lib\src\commands\sql-worker.cpp    1
+Error   C1083   Cannot open include file: 'QString': No such file or directory  grabber c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\lib\src\commands\commands.h    4
+Error   C1083   Cannot open include file: 'QtGui': No such file or directory    grabber c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\viewer\zoomwindow.h    4
+.
+output
+1>------ Build started: Project: grabber, Configuration: Debug Win32 ------
+1>C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\Common7\IDE\VC\VCTargets\Microsoft.CppBuild.targets(387,5): warning MSB8028: The intermediate directory (Debug) contains files shared from another project (ll.vcxproj).  This can lead to incorrect clean and rebuild behavior.
+1>C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\Common7\IDE\VC\VCTargets\Microsoft.CppBuild.targets(937,5): warning MSB8027: Two or more files with the name of main.cpp will produce outputs to the same location. This can lead to an incorrect build result.  The files involved are cli\src\main.cpp, crashreporter\main.cpp, gui\src\main\main.cpp, tests\src\main.cpp.
+1>updater-test.cpp
+1>tests\src\updater\updater-test.cpp(1): fatal error C1083: Cannot open include file: 'QtTest': No such file or directory
+1>source-updater-test.cpp
+1>tests\src\updater\source-updater-test.cpp(1): fatal error C1083: Cannot open include file: 'QtTest': No such file or directory
+1>test-suite.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\tests\src\test-suite.h(4): fatal error C1083: Cannot open include file: 'QtTest': No such file or directory
+1>tag-test.cpp
+ file: 'QSettings': No such file or directory
+1>update-dialog.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\updater\update-dialog.h(4): fatal error C1083: Cannot open include file: 'QDialog': No such file or directory
+1>verticalscrollarea.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\ui\verticalscrollarea.h(4): fatal error C1083: Cannot open include file: 'QScrollArea': No such file or directory
+1>textedit.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\ui\textedit.h(4): fatal error C1083: Cannot open include file: 'QTextEdit': No such file or directory
+1>qclosabletabwidget.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\ui\qclosabletabwidget.h(4): fatal error C1083: Cannot open include file: 'QTabWidget': No such file or directory
+1>QBouton.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\ui\QBouton.h(4): fatal error C1083: Cannot open include file: 'QPushButton': No such file or directory
+1>QAffiche.cpp
+1>c:\users\sin\downloads\imgbrd-grabber-5.5.0\imgbrd-grabber-5.5.0\gui\src\ui\QAffiche.h(4): fatal error C1083: Cannot open include file: 'QLabel': No such file or directory
+1>fixed-size-grid-layout.cpp
+...
+1>main.cpp
+1>cli\src\main.cpp(1): fatal error C1083: Cannot open include file: 'QCoreApplication': No such file or directory
+1>Generating Code...
+1>Done building project "grabber.vcxproj" -- FAILED.
+========== Build: 0 succeeded, 1 failed, 0 up-to-date, 0 skipped ==========`
+what should i do?You can't just install Qt, you have to put it in your Include and Library dependencies under properties. Make sure your library included is the same of that which you're compiling (x86 vs x64)
+example of DXSDK in dependenciesLLDB "step in" and "finish" to get return value of standard functionsIs there a way to step into standard functions like printf() or atof(), and then execute finish to get back to the main program to get the return value?
+With GDB I can do it like this:
+(gdb) step
+14          float di = atof(argv[1]);
+(gdb) step
+atof (nptr=0x7fffffffe0c6 "5.8") at atof.c:27
+27      atof.c: No such file or directory.
+(gdb) finish
+Run till exit from #0  atof (nptr=0x7fffffffe0c6 "5.8") at 
+atof.c:27
+0x00005555555547d1 in main (argc=2, argv=0x7fffffffdd18) at 
+circumf.c:14
+14          float di = atof(argv[1]);
+Value returned is $1 = 5.7999999999999998
+
+But when I try this with LLDB it steps "over" all standard function. It works with functions inside the program, those I can step into, but not with standard functions. I guess this is a feature, but is there a way around it? I use step with LLDB also.
+Is there maybe some other way to get the return value from standard functions inside LLDB?Like gdb, lldb will step into any function that you have debug information for.  It will skip over any function that does not have debug information.  The difference in behavior that you're describing sounds more like lldb doesn't have/hasn't found debug information for your standard library solibs.Generate uniformly distributed random number in Nginx?Nginx seems to have a built-in function called ngx_random that's used in various places of the source code. But it seems just to be defined as:#define ngx_random random
+If I'm understanding this correctly, that means all the places Nginx calling ngx_random() it's just calling (on Linux platform) random(). From the doc it isn't clear to me that it is guaranteed uniform distribution with a given range in any way, and I'm suspecting that similar to rand(), it's not uniform at all, and will only be uniform if range n is divisible by RAND_MAX.
+But the nice thing of using ngx_random is I believe the system takes care of the seeding automatically, during startup time. Whereas if I want to use something truly uniform with my range, like drand48, I believe will have to add a new line after the following in ngx_posix_init.c?
+srandom(((unsigned) ngx_pid << 16) ^ tp->sec ^ tp->msec);
+srand48(((unsigned) ngx_pid << 16) ^ tp->sec ^ tp->msec); //Added so that I can use drand48
+
+So is my assumption on ngx_random correct? And if I want to use drand48 in any place of the various modules, is the above the only way doing it?I never tried it myself with nginx, so consider it just an idea. On Linux (or similar ELF based systems, e.g. Solaris) you could, using LD_LIBRARY_PRELOAD trick, to replace and/or intercept weak symbols from standard C library. It is often used to intercept and/or replace malloc, but might work for you as well
+Code sample (untested, not compiled, just to demonstrate an idea)
+#define _GNU_SOURCE
+
+#include <stdlib.h>
+#include <dlfcn.h>
+
+static void (*real_srandom)(uint32_t) = NULL;
+
+static void srandom_init(void) {
+    real_srandom = dlsym(RTLD_NEXT, "srandom");
+    if (NULL == real_srandom) {
+        fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
+    }
+}
+
+void srandom(uint32_t seed) {
+    if(real_srandom == NULL) {
+        srandom_init();
+    }
+
+    real_srandom(seed);
+    srand48(seed);
+}
+
+You could write SO to replace calls to random(3) as well, replacing it with your own implementation. The only thing you cannot replace is RAND_MAX, as it is compiled in constant.
+I would be happy to hear if this trick works for you or notreverse a string in c error subscripted value is neither array nor pointer nor vectorim trying to reverse a string but im running into a problem where it says "subscripted value is neither array nor pointer nor vector" pointing to char holder = input[i]; can someone help explain that to me
+myreverse(input, rev, len)
+{
+  int i = 0;
+  int j= len -1;
+  char string[len];
+
+  while(i<j)
+  {
+      char holder = input[i];
+      string[i]= string[j];
+      string[j] = holder;
+      i++;
+      j--;
+  }
+}
+
+
+int main(int argc, char* argv[]) {
+  if (argc < 2) {
+    printf("Usage: %s <word to reverse>\n", argv[0]);
+    exit(1);
+  }
+  char* input = argv[1];
+  int len = strlen(input);
+  char rev[len + 1]; // Adding one for the null terminator
+  myreverse(input, rev, len);
+  printf("Rev string is %s\n", rev);
+}Parameter types default to int in C, so you need to specify them explicitly for your function since they're char pointers:
+void myreverse(const char* input, char* rev, int len)
+
+Also, your function should write its result in rev, not in its local variable string.You code is almost fine.  But myreverse() doesn't do anything useful, since it reverses a local (uninitialized) string.  Probably an oversight on your part.
+I don't really agree with the way you allocate the reversed string in main. Using strdup(), then freeing the memory would be better, and more portable. But if your compiler allows it...  
+Why don't you reverse the string in place ?
+You should consider this:
+void myreverse(char* s)
+{
+  int j;
+  int i = 0;
+  if (s == NULL)
+      return;
+
+  j = strlen(s) - 1;
+  while(i < j)
+  {
+      char t = s[i];
+      s[i]= s[j];
+      s[j] = t;
+      i++;
+      j--;
+  }
+}You should find a bit more up to date C book first. This function definitions are from the K&R era. Here you have the reverse string function. You do need to provide size, as all C strings are zero terminated
+char *reverse(char *str)
+{
+    char tmp;
+    int len;
+
+    if (str != NULL)
+    {
+        len = strlen(str);
+        for (int i = 0; i < len / 2; i++)
+        {
+            tmp = *(str + i);
+            *(str + i) = *(str + len - i - 1);
+            *(str + len - i - 1) = tmp;
+
+        }
+    }
+    return str;
+}
+
+
+Or a different version
+char *reversendup(consr char *srcstr, char *rev, size_t bufsize)
+{
+    int len;
+    char *wrk;
+
+    if (str != NULL)
+    {
+        len = strlen(str);
+        if ((wrk = calloc(sizeof(char), len + 1)) != NULL)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                *(wrk + i) = *(srcstr + len - i - 1);
+            }
+            strncpy(rev, wrk, bufsize);
+            free(wrk);
+        }
+    }
+    return rev;
+}How to figure out forward coordinate in xyz plane of player?I am currently making a mod for a game and I am able to get the XYZ coordinates of the player as well as the direction they're facing (a value between 0 and 360 degrees). I need to use this information to figure out what coordinates would be in front of the character according to which way they are facing. 
+For example: if x = 0, y = 0, z = 0 and the character were facing 0 degrees, South. And assuming the z-axis runs North to South, then if the character walked forward one unit, their new coordinate would be x = 0, y = 0, z = -1.I'm assuming that North is +Z and East is +X. Also, direction 0 is South and 90 is West.
+vec3 DegreeToDirection (float degs) {
+    float rads = 3.1415926535f / 180 * degs;
+    float s = sinf(rads), c = cosf(rads);
+    vec3 ret = {-s, 0, -c};
+    return ret;
+}
+
+Now just add this to your current position.
+EDIT: Here's the modified code from the comment that actually worked for the OP: (Note the lack of negation on the X return value, which probably means my assumption about the X axis was wrong.)
+void DegreeToDirection (float degs, float out [3]) {
+    float rads = 3.1415926535f / 180 * degs;
+    out[0] = sinf(rads);
+    out[1] = 0.0f;
+    out[2] = -cosf(rads);
+}so say your character has coordinates (A, B, C), you want to create a direction vector equal to one unit (lets call it R). I am assuming the player only travels in the x, y plane for this example so you would create a direction vector:
+V = (R * cos(angle), R * sin(angle))
+and you would add this vector to your players coordinates, so for a vector (x, y) the new player coordinates would be (A + x, B + y, C)Compiler error using AVR Atmel Studio library config files// Created by lenovo on 8/27/2017.
+//
+
+#ifndef UART_UART_CFG_H
+#define UART_UART_CFG_H
+
+#define UART_BaudRate     1200   //9600UL
+#define CLK               16
+#define UART_Parity       NONE
+#define UART_TX           EN_TX
+#define UART_RX           EN_RX
+#define UART_STARTBITS      1
+#define UART_STOPBITS       1
+#define UART_DATABITS   EightBits
+
+#endif //UART_UART_CFG_H
+
+
+This is the error "called object is not a function or pointer"
+and this my private file that have all word's addresses inside the config file. The first file:
+//
+// Created by lenovo on 8/27/2017.
+//
+
+#ifndef UART_UART_PRIV_H
+#define UART_UART_PRIV_H
+
+/* Main PINS */
+#define UCSRA *((volatile u8 *)0x2B)
+#define UCSRB *((volatile u8 *)0x2A)
+#define UCSRC *((volatile u8 *)0x40)
+#define UBRRL *((volatile u8 *)0x29)
+#define UBRRH *((volatile u8 *)0x40)
+#define UDR   *((volatile u8 *)0x2C)
+/* END Main PINS */
+#define NONE        0x00
+#define twoBit      0x08
+#define oneBit      0x00
+/* Bits */
+#define fiveBits    0x00
+#define SixBits     0x02
+#define SevenBits   0x04
+#define EightBits   0x06
+/* End Bits */
+#define DIS         0  // Disable
+#define EN          1  // Enable
+
+#define UART_9600   9600UL
+#endif //UART_UART_PRIV_H
+
+Private file that have some addresses for my Microcontroller ATmega16. Moreover, my config file is reference to private file; which have keys that defined in private. For example, in UART_Partit I wrote NONE and NONE address defined in private but it shows errorYou need to include your file with declarations.
+#ifndef UART_UART_CFG_H
+#define UART_UART_CFG_H
+
+#include "uart_priv.h"
+
+#define UART_BaudRate     1200   //9600UL
+#define CLK               16
+#define UART_Parity       NONE
+#define UART_TX           EN_TX
+#define UART_RX           EN_RX
+#define UART_STARTBITS      1
+#define UART_STOPBITS       1
+#define UART_DATABITS   EightBits
+
+#endif //UART_UART_CFG_H
+
+and there are no EN_TX or EN_RX defines for these constants in your second file.If you include something in the .h file Do you have to include the same thing again?So I am just wondering if you #include something in a for example header.h file:
+For example this is called header.h:
+#include <vector>
+#include <iostream>
+#include <somethingElse>
+
+So if for example I make a file called something.cpp Do I need to put all those include statements again?
+#include "header.h"
+// If I include #header.h in this file. Do the #include carry over to this file. Or do they not
+
+I am wondering because whenever I include <vector> something in my .h file the #include statements that I used previously in the .h file always turn grey which means they are not used. Is it because I used it in the .h file? Its not a problem or anything I am just curious.You don't need to include those headers again because your compiler can find those headers. You can also try to read and understand the makefile (or CMakeList) which will help.Try always to avoid "Multiple file inclusion" via using inclusion guard or #pragma once in order to prevent the multiple file inclusion.
+To include file means that the content of the file will be added to the very place you wrote include.
+Here's an example:
+// header.h
+const int vlaue = 10;
+const int value2 = 0;
+
+// main.cpp
+
+#include "header.h"
+#include "header.h"
+
+Above the content of "header.h" is added twice to main.cpp.
+Do you know what is the result? It's a compile-time error complaining of redefinition of value and value2.
+In the above example I think green programmers don't get trapped by it but it is just an explanation, So what I talk about is when a huge program where many header files and many source files and some files include others then it'll be so difficult to track the right file inclusion.
+The workaround that is to use inclusion guards or pragma once eg:
+Let's modify our header.h to look like:
+// header.h
+
+#ifndef MY_HEADER_H
+#define MY_HEADER_H
+
+const int vlaue  = 10;
+const int value2 = 0;
+
+#endif
+
+Now in main.cpp:
+#include "header.h"
+#include "header.h"
+#include "header.h"
+
+The code above works fine and no duplicate of header content is added to main.cpp. Do you know why? It's the magic of Macro there. So at first time the pre-processor checks whether a macro has been already defined with the name MY_HEADER_H or not and for sure for the first time it is not defined so the content is added. The second and so on the condition fails because the macro is already defined thus the content of header.h will not be added to where it is called.
+The draw back of inclusion guard is if you have a macro with same name as the inclusion guard thus it is already defined so the content will never be added (empty content). Thus you get a compile-time error:
+value, `value2` undeclared identifiers.
+
+The second solution is using pragma eg:
+Let's modify our header.h file:
+// header.h
+#pragma once
+
+const int vlaue = 10;
+const int value2 = 0;
+
+// main.cpp
+
+#include "header.h"
+#include "header.h"
+
+The code above works correctly so no multiple inclusion of header.h That is because of the magic of pragma once: which is a non-standard but widely supported pre-processor directive designed to cause the current source file to be included only once in a single compilation. Thus, #pragma once serves the same purpose as include guards, but with several advantages, including: less code, avoidance of name clashes, and sometimes improvement in compilation speed.
+
+Finally you should include header wherever their content is used eg:
+// Shape.h
+
+class Shape{
+    // some code here
+};
+
+// Cube.h
+
+#include "Shape.h"
+
+class Cube : public Shape{
+     // some code here
+};
+
+// Cuboid.h
+
+// #include "Shape.h" 
+#include "Cube.h" // So here the Shape.h is added to Cube.h and Cube.h is added here.
+
+class Cuboid : public Cube{
+   // some code here
+};
+
+As you can see above the content of Shape.h is added to Cuboid.h indirectly because it is added to Cube.h and cuboid.h includes Cube.h so it is added to it. So without inclusion guards or pragma once if you include the two headers in one source file you get duplicate content there.How to correctly cast a pointer-to-struct to pointer-to-other-struct in modern C++ when calling legacy C API?When calling a legacy C API such as getnameinfo, what's the right way in modern C++ to correctly cast a pointer-to-struct argument to a pointer-to-another-struct, which has similar layout, but which isn't related to the class hierarchy of the original struct?
+For example, getnameinfo accepts for its first parameter a const struct sockaddr *, but it should also work when handing it a const struct sockaddr_storage *. However, AFAIK simply reinterpret_cast-ing the pointer is considered UB by the C++ standard.
+In the above example, given a sockaddr_storage object, what's the right way to pass a pointer to it to getnameinfo?I may be misreading the standard, but since those types are standard layout types, it's not UB if you access their common initial sub-sequence. I believe [class.mem/23] is why:
+
+In a standard-layout union with an active member of struct type T1, it is permitted to read a non-static data member m of another union member of struct type T2 provided m is part of the common initial sequence of T1 and T2; the behavior is as if the corresponding member of T1 were nominated.
+
+This is an explicit permission for unions, that theoretically could simply be accomplished with compiler magic. But in effect I believe it means that for standard layout classes, the common initial sequence has the same layout in memory.
+Now let's consider [basic.lval/8.6]:
+
+If a program attempts to access the stored value of an object through
+  a glvalue of other than one of the following types the behavior is
+  undefined:
+
+...
+an aggregate or union type that includes one of the aforementioned types among its elements or non-static data members (including,
+  recursively, an element or non-static data member of a subaggregate or
+  contained union),
+...
+
+
+When you dereference the reinterpreted pointer, you obtain a glvalue of an aggregate that includes the type of the member you access. Since that member belongs to the common initial sequence, all should be well.
+I doubt there's a sane implementation where this will not work across a library boundary.connection error in unix domain socket implemented in c (gcc) centos 7In implementing a UNIX domain socket the connection is always refused:
+Part of Server Code:
+    if ((my_sock=socket(AF_LOCAL,SOCK_STREAM,0))<0){
+      syslog(LOG_USER|LOG_ERR,"Could not create tsdmd socket!!");
+      printf("Couldn't create socket \n");
+      exit(-1);
+      }
+      printf("Socket created \n");
+
+        /* Name the socket  */
+
+    memset(&s_addr, 0,sizeof(struct sockaddr_un)); 
+    s_addr.sun_family = AF_LOCAL;
+    strncpy(s_addr.sun_path,"/tmp/dsock",strlen("/tmp/dsock")+1);
+    s_addr_size=(offsetof(struct sockaddr_un, sun_path)
+                +strlen(s_addr.sun_path)+1);
+
+    unlink("/tmp/dsock");
+    if(bind(my_sock,(struct sockaddr *)&s_addr, s_addr_size)<0)
+      { printf("BIND ERROR  \n");
+         close(my_sock);
+          exit(1);
+         }
+        printf("Bind successful to the socket !! \n");
+
+    if(listen(my_sock,16)==-1)
+      { perror("Listen error !! \n");
+         exit(-1);
+        }
+     printf("Listening to socket \n");
+
+    if(connect(my_sock,(struct sockaddr *) &s_addr,s_addr_size)==-1)
+    {
+    syslog(LOG_USER|LOG_ERR,"Could not connect, will try later");
+    perror("connect()");
+    printf("Couldn't connect to socket... will try later  \n");
+    close(my_sock);
+    my_sock=-1;
+
+     }
+    else
+     {
+     FD_SET(my_sock,&active_fd_set);
+     printf(" Socket connected \n");
+     }
+      printf("Trying again \n\n\n");
+   }
+   --------------------------------------------------------------------
+
+Upon running the server code following output is obtained repeatedly :
+  Socket created
+  Bind successful to the socket !!
+  Listening to socket
+  Couldn't connect to socket... will try later
+  Trying again 
+
+  Socket created
+  Bind successful to the socket !!
+  Listening to socket
+  Couldn't connect to socket... will try later
+  Trying again 
+  .
+  .
+  .
+
+I have checked the path "/tmp/dsock" and the socket file "dsock" is there but looking inside the file shows:
+    "dsock" [Permission Denied] 
+
+A "stat dsock" of the file shows:
+      File: ‘dsock’
+      Size: 0       Blocks: 0        IO Block: 4096   socket
+      Device: 801h/2049d    Inode: 1572866     Links: 1
+      Access: (0777/srwxrwxrwx)  Uid: ( 7418/user) Gid: (25/group)
+      Access: 2017-08-31 17:16:29.569038461 -0600
+      Modify: 2017-08-31 17:16:29.569038461 -0600
+      Change: 2017-09-01 13:28:07.162071494 -0600
+      Birth: -
+
+Can't find what the error is. The client side also shows similar connection error. Is it due to the UNIX domain socket file permission issues?You cannot call connect on a listening socket. Once you have bound and listened, the only thing you should do with a listening socket is call accept (or close or use its descriptor in a select). 
+So the server should create the socket, bind its address, listen on it and then the server should be sitting ("blocked") in the accept function. That is, it's waiting for a connection, usually in a loop.
+Then (after the server has been started and is waiting) your client needs to create its own socket and call connect on it -- specifying the same address that the server used when it called bind. This will cause the accept call in the server to return a new socket descriptor for a socket that is actually connected to the client. This is the one that you will use send and recv on for communication. (And the client's socket will also be connected.)
+At this point, the listening socket in the server will still be available to accept additional connections (each of which would return its own new unique socket descriptor).
+Although possible, it doesn't really make sense for the server to connect to its own listening socket endpoint anyway. What would be the point?Now, I have implemented the server and client code appropriately as suggested by Gil Hamilton:
+Server code:
+        int main(int argc, char *argv[])
+         {
+         /* Variable Definition */
+         int sockfd=-1, rem_addr_size;
+         struct sockaddr_un remote_addr;
+          chdir("/");
+          umask(0111);
+       /* Get the Socket file descriptor */
+         memset(&remote_addr, 0, sizeof(struct sockaddr_un));
+         if ((sockfd = socket(AF_LOCAL,SOCK_STREAM,0)) < 0)
+           {
+    printf("ERROR: Failed to obtain Socket Descriptor ! \n");
+        exit(1);
+        }
+     printf("Socket created \n");
+
+      /* Fill the socket address struct */
+       remote_addr.sun_family = AF_LOCAL;
+      strncpy(remote_addr.sun_path,"/tmp/dsock", strlen("/tmp/dsock")+1);
+       rem_addr_size=(offsetof(struct sockaddr_un, sun_path)
+                +strlen(remote_addr.sun_path)+1);
+
+       unlink(remote_addr.sun_path);
+
+       if(bind(sockfd ,(struct sockaddr *)&remote_addr,rem_addr_size)<0)
+        { printf("BIND ERROR  \n");
+          close(sockfd );
+          exit(1);
+        }
+          printf("Bind successful to socket !! \n");
+
+
+
+        if(listen(sockfd,16)==-1)
+          { perror("Listen error !! \n");
+            printf("Listening error \n");
+            exit(-1);
+          }
+          printf("Listening to the socket \n");
+
+          int msgsock;
+          msgsock=accept(sockfd,0,0);
+          char* fs_name = "ts_data.dat";
+          char sdbuf[LENGTH];
+            printf("[Client] Sending %s to the Server... ", fs_name);
+            FILE *fs = fopen(fs_name, "r");
+            if(fs == NULL)
+            {
+                    printf("ERROR: File %s not found.\n", fs_name);
+                    exit(1);
+            }
+            printf("Success file found !! \n");
+            bzero(sdbuf, LENGTH);
+            int fs_block_sz;
+         if (msgsock == -1)
+                    perror("Error in accepting socket connection \n");
+         else 
+        while((fs_block_sz = fread(sdbuf, sizeof(char), LENGTH, fs)) > 0)
+            {
+                if(send(sockfd, sdbuf, fs_block_sz, 0) < 0)
+                {
+              fprintf(stderr, "ERROR: Failed to send file %s. (errno =  
+               %d)\n", fs_name, errno);
+                    break;
+                }
+                bzero(sdbuf, LENGTH);
+            }
+            printf(" File %s to  the client  was Sent!\n", fs_name);
+           //}
+
+
+           close (sockfd);
+           printf("[Client] Connection lost.\n");
+           return (0);
+            }
+
+Upon running the server code following output is seen:
+            Socket created 
+            Bind successful to socket !! 
+            Listening to the socket
+
+Client code:
+            if(sock<0){
+             if ((sock=socket(AF_LOCAL,SOCK_STREAM,0))<0){
+             syslog(LOG_USER|LOG_ERR,"Could not create  socket!!");
+             printf("Couldn't create socket \n");
+             exit(-1);
+              }
+             else
+             {
+            printf("Socket created \n");
+                }
+
+           /* Name the socket  */
+             s_addr.sun_family = AF_LOCAL;
+         strncpy(s_addr.sun_path,sock_path,strlen(sock_path)+1);
+         s_addr_size=(offsetof(struct sockaddr_un, sun_path)
+                +strlen(s_addr.sun_path)+1);
+
+                   /***************/
+
+
+  if(connect( sock,(struct sockaddr *) &s_addr,s_addr_size)==-1)
+    {
+    syslog(LOG_USER|LOG_ERR,"Could not connect, will try later");
+    printf("Error %d: %s\n", errno, strerror(errno));
+    printf("Couldn't connect to socket... will try later  \n");
+    close(sock);
+    sock=-1;
+    }
+  else
+    {
+    FD_SET(sock,&active_fd_set);
+    printf("Socket connected \n");
+    }
+    printf("Trying again \n\n\n");
+}
+
+client gives the output:
+         Socket created 
+         Couldn't connect to  socket... will try later  
+         Trying again 
+
+netstat -l shows the server in listening mode :
+   Active UNIX domain sockets (only servers)
+   Proto RefCnt Flags   Type   State    I-Node       Path
+   unix  2     [ ACC ] STREAM LISTENING  3294124420 /tmp/dsock
+   unix  2     [ ACC ] STREAM LISTENING  3294124858 /tmp/dsock
+   unix  2     [ ACC ] STREAM LISTENING  32778    /var/run/nslcd/socket
+   unix  2     [ ACC ] STREAM LISTENING  14365    /run/systemd/journal/stdout
+   unix  2     [ ACC ] STREAM LISTENING  612      /var/lib/gssproxy/default.sock
+
+Have added the error logs  in the codes as well, but the client doesn't connect to the socket.C fopen to a specific directorySo i'm trying to create a program that will change the file directory of the fopen() function depending on if the system is Windows or linux.
+in my main function i determine the operating system via 
+#ifdef __unix
+    printf("linux machine \n");
+    windows = false;
+    linux = true;
+#endif
+
+#ifdef _WIN32   
+    printf("windows machine \n");
+    windows = true;
+    linux = false;
+#endif
+
+and then in my function where i open the file i do
+FILE *fp, *fpo;
+    if ((windows == true) && (linux == false)) 
+    {
+        fp = fopen("/temp/coursein/p1-in.txt", "r");
+        fpo = fopen("/temp/courseout/p1-out.txt", "w");
+    }
+    else
+    {
+        fp = fopen("~/temp/coursein/p1-in.txt", "r");
+        fpo = fopen("~/temp/coursein/p1-in.txt", "w");
+    }
+
+i've tried every variation of "/" "//" "\" "\" i can think of and on linux i get a seg fault and in visual studio i get a Debug Assertion Failed.
+Expression: stream != nullptrYou are getting a crash in the linux version most likely because the stream pointers are not checked for NULL before they are passed to stream functions.
+It is poor programming practice to assume fopen() always succeeds. Always check the return value of fopen() and many other library functions.
+There seems to be a typo in the linux version: fpo = fopen("~/temp/coursein/p1-in.txt", "w"); should probably be fpo = fopen("~/temp/courseout/p1-out.txt", "w");
+Furthermore, fopen does not expand the initial ~/ to the home directory of the user, the shell does this on command line words, not the Standard C library. In unix, you can use getenv("HOME") to retrieve the user's home directory and snprintf to compose the filename to open. You could write a wrapper function for fopen that would handle system specific behavior and return the stream handle.
+There is a simpler fix: you can make the paths relative to the current directory:
+    fp = fopen("temp/coursein/p1-in.txt", "r");
+    fpo = fopen("temp/courseout/p1-out.txtt", "w");
+
+or
+    fp = fopen("coursein/p1-in.txt", "r");
+    fpo = fopen("courseout/p1-out.txt", "w");
+
+It would work in both linux and windows as long as you run the program from an appropriate directory or use chdir to change the current directory in the startup function where you test which OS you run on.There are a number of ways to go about this, but the key boils down to getting the base directory you need using getenv. It will work on both windows and unix. You simply need to check and find the proper name for the environment variable needed under each OS.
+For example to begin building a path from the users home directory, you can use the environment variable HOME on Linux or USERPROFILE on windows.
+To set your code up to automatically use the appropriate directory, you will generally use a preprocessor check to check for the OS and then set a define identifying the OS to use throughout the remainder of your code. (you could of course use the same test over and over, but standard practice simply defines an identifier for the OS, like HAVEWIN on windows, or HAVEUNIX on the various Unix flavors.
+I generally break it out into two parts, but you are free to do it all at once, e.g. 
+#if defined (_WIN32) || defined (_WIN64)
+ #define HAVEWIN 1
+#elif defined (__unix__)
+ #define HAVEUNIX 1
+#endif
+
+#ifdef HAVEWIN
+ #define HOMEENV "USERPROFILE"
+#elif HAVEUNIX
+ #define HOMEENV "HOME"
+#endif
+
+For your pathname separators, windows will allow you to use the POSIX pathname separator '/' to separate your path components, but it can get finicky (technical term) when the path includes spaces. Windows pathname resolution behaves better in that case using the normal DOS backslash (which you must escape when building your path).
+For example, let's say we are interesting in a file named testfile.txt on both windows and Linux that resides in the user's home directory (e.g. C:\Users\username on windows and /home/username on Linux), e.g. 
+On windoze:
+C:\users\david>type testfile.txt
+hello windows
+
+On Linux:
+$ cat ~/testfile.txt
+hello unix
+
+You can build the path to reach each using sprintf and a buffer sufficient to hold the components. #include <limits.h> provides a PATH_MAX constant to insure you have sufficient space for the filename (generally 4096 chars). To build the path you could do something like the following:
+#include <limits.h>
+...
+int main (void) {
+
+    char *home = getenv (HOMEENV);
+    char filename[PATH_MAX] = "";
+    char buf[BUFSIZ] = "";
+    FILE *fp;
+
+    if (!home) {
+        fprintf (stderr, "user home environment not found.\n");
+        return 1;
+    }
+
+#ifdef HAVEWIN
+    sprintf (filename, "%s\\%s", home, FILENAME);
+#elif HAVEUNIX
+    sprintf (filename, "%s/%s", home, FILENAME);
+#endif
+...
+
+That pretty much provides basics for doing (in short form) what you are attempting to do with both input and output files. Putting all the pieces together, you could do something like the following:
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+
+#define FILENAME "testfile.txt"
+
+#if defined (_WIN32) || defined (_WIN64)
+ #define HAVEWIN 1
+#elif defined (__unix__)
+ #define HAVEUNIX 1
+#endif
+
+#ifdef HAVEWIN
+ #define HOMEENV "USERPROFILE"
+#elif HAVEUNIX
+ #define HOMEENV "HOME"
+#endif
+
+int main (void) {
+
+    char *home = getenv (HOMEENV);
+    char filename[PATH_MAX] = "";
+    char buf[BUFSIZ] = "";
+    FILE *fp;
+
+    if (!home) {
+        fprintf (stderr, "user home environment not found.\n");
+        return 1;
+    }
+
+#ifdef HAVEWIN
+    sprintf (filename, "%s\\%s", home, FILENAME);
+#elif HAVEUNIX
+    sprintf (filename, "%s/%s", home, FILENAME);
+#endif
+
+    if (!(fp = fopen (filename, "r"))) {
+        fprintf (stderr, "error: file not found '%s'\n", filename);
+        return 1;
+    }
+
+    if (fgets (buf, sizeof buf, fp))
+        puts (buf);
+
+    return 0;
+}
+
+Example Use/Output
+On windoze:
+C:\users\david>Documents\src-c\bin\getenv_testfile.exe
+hello windows
+
+On Linux:
+$ ./src-c/bin/getenv_testfile
+hello unix
+
+As mentioned at the beginning, there are a number of ways to put all the pieces together. You may find it cleaner to put all your varying windows/unix defines up at the top so that you do not have any preprocessor conditional in main(), e.g.
+...
+#ifdef HAVEWIN
+ #define HOMEENV "USERPROFILE"
+ #define PATHFMT "%s\\%s"
+#elif HAVEUNIX
+ #define HOMEENV "HOME"
+ #define PATHFMT "%s/%s"
+#endif
+
+int main (void) {
+
+    char *home = getenv (HOMEENV);
+    char filename[PATH_MAX] = "";
+    char buf[BUFSIZ] = "";
+    FILE *fp;
+
+    if (!home) {
+        fprintf (stderr, "user home environment not found.\n");
+        return 1;
+    }
+
+    sprintf (filename, PATHFMT, home, FILENAME);
+
+    if (!(fp = fopen (filename, "r"))) {
+        fprintf (stderr, "error: file not found '%s'\n", filename);
+        return 1;
+    }
+
+    if (fgets (buf, sizeof buf, fp))
+        puts (buf);
+
+    return 0;
+}
+
+(note: while this may look a bit cleaner, but this is largely impractical in larger code)
+Look over all the answers and comments, and let me know if you have any additional questions.Let's assume you are running in your home directory, aka ~
+fopen's path is from your current working directory. Thus the tilde is wrong (as mentioned because it is a shell oddity).
+fp = fopen("temp/coursein/p1-in.txt", "r");
+If you need to move to a particular directory consider chdir (man 2 chdir on Linux). Don't forget the other advice regarding testing fp before you open the output file.The crash, in both cases, will be because the fopen() calls are failing and returning NULL, and subsequent code is using them without checking (e.g. to read or write).
+The problem under unix is that ~ in a path is expanded by the shell (e.g. in paths typed on the command line) not by the C library.   What you need to do is expand the path yourself.
+Fortunately, there are ways to do what you want, but they are typically slightly different under windows and linux.   I won't write the code, but I'll point you at things you can use.
+
+getenv() in <stdlib.h> can be used to get expand environment variables.  For example, getenv("XXX") will return a pointer (to the first character) of a string that is the expansion of the environment variable named XXX, under both windows and unix.   It will return a NULL pointer if the environment variable XXX does not exist.
+Under Unix, the environment variable named HOME typically expands to the user's home directory.
+Under windows, you may get lucky and have a HOME environment variable defined.   That's not always true though.  If it's not true, there is usually an environment variable named HOMEDRIVE that expands to the home drive (e.g. "C:" if the home directory is on the C drive) and another variable named HOMEPATH that expands to the users home directory without the drive named appended.
+Under unix, paths may be constructed by adding a '/' character and sub-directory name.  e.g.   "/user/home".
+Under windows, paths may be constructed the same way, except windows API functions (which are called by fopen()) accept both '/' and '\\' as path separators.
+
+Also bear in mind that fopen() will not construct directories.  For fopen("/temp/x.dat", "w") to succeed, the directory /temp must already exist, and fopen() will only try to create x.dat within it.
+Note, however, that using environment variables is not considered a particularly good way to obtain the user's home directory - particularly under windows - since the user can change environment variables.    Other means of getting the home directory will be more robust, but also typically be specific to unix or windows (e.g. OS specific API functions, rather than using getenv()).   I'll leave finding those function as an exercise.
+Regardless of how well you construct your paths, it is still a good idea to check that fopen() succeeds before passing the handle it returns to other functions that read and write.libdispatch-dev SIGILL, Illegal Instruction in dispatch_releaseI have a program that utilizes libdispatch in Ubuntu linux. At the end of my main function, I have the dispatch_main() to keep the main thread hanging. The rest of my program runs as expected but for some reason once dispatch_main is called at the end, it exits with SIGILL. Running GDB, here is the output below. Backtrace at the end shows it's failing at dispatch_release.
+program:
+int main(int argc, const char *argv[]) {
+    char *error_message = NULL;
+
+    // Process command line args.
+    int option;
+    while ((option = getopt_long(argc, (char * const *)argv, "i:", longopts, NULL)) != -1) {
+        switch (option) {
+            case 'i':
+                device_path = optarg;
+                break;
+        }
+    }       
+
+    // prompt has its own "read" function, so instead of using a
+    // DispatchSource to read from STDIN_FILENO a global queue is used to loop
+    // while it receives input.
+//    dispatch_queue_t input_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    dispatch_queue_t input_queue = dispatch_queue_create("serialctl.prompt_input", NULL);
+    dispatch_async(input_queue, ^{
+        char *line;
+        while((line = prompt_read()) != NULL) {
+            interpret_command(line);
+            free(line);
+        }
+    });
+
+
+    char *home_id_str = create_home_id_str(device->home_id);
+    prompt_printf("Initialized SerialAPI device at '%s'\n", device->path);
+    prompt_printf("Library '0x%02x' - Version '%.2Lf'\n", device->library, device->version);
+    prompt_printf("Home ID '%s' - Node ID '%03d'\n", home_id_str, device->node_id);
+    free(home_id_str);
+
+
+
+    dispatch_main();
+}
+
+gdb debug:
+ (gdb) r
+    Starting program: /home/jia/libzwsapi/cmake-build-debug/serialapictl -i /dev/ttyACM2
+    warning: Unable to find libthread_db matching inferior's thread library, thread debugging will not be available.
+    [Thread debugging using libthread_db enabled]
+    Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+    [New Thread 0x7ffff6ba8700 (LWP 2813)]
+    [New Thread 0x7ffff63a7700 (LWP 2814)]
+    serialAPI> [New Thread 0x7ffff5ba6700 (LWP 2815)]
+                                                     [New Thread 0x7ffff53a5700 (LWP 2816)]
+                                                                                           [New Thread 0x7ffff4ba4700 (LWP 2817)]
+                                                                                                                                 [New Thread 0x7fffe7fff700 (LWP 2818)]
+                                       [New Thread 0x7fffe77fe700 (LWP 2819)]
+    Initialized SerialAPI device at '/dev/ttyACM2'
+    Library '0x07' - Version '4.33'
+    Home ID 'dbf54165' - Node ID '001'
+    serialAPI> 
+               Thread 1 "serialapictl" received signal SIGILL, Illegal instruction.
+                                                                                   0x00007ffff79c6b73 in _dispatch_release () from /usr/lib/libdispatch.so.0
+    (gdb) bt
+    #0  0x00007ffff79c6b73 in _dispatch_release () from /usr/lib/libdispatch.so.0
+    #1  0x00007ffff79c77bb in dispatch_main () from /usr/lib/libdispatch.so.0
+    #2  0x0000000000402e69 in main (argc=3, argv=0x7fffffffe368) at /home/jia/libzwsapi/serialapictl/main.c:138
+    (gdb)Maximum Index of an array and it's length on a platformIn C, the index of an array of char can range from 0 to 2 ^ (sizeof(size_t) * CHAR_BITS), but the count of the array's members, is that number plus 1, which can't be hold by a size_t variable.  
+For example, in x86, if sizeof(size_t) is 4, then the index can go from 0 to 0xFFFFFFFF, but the count of the members, if the array is full, is 0xFFFFFFFF + 1. which can't be hold by sizeof(size_t). 
+1) Is this correct?
+2) I'm considering to limit the highest index to 0xFFFFFFFE, is there any better solution?
+I know this example is extreme, but I want to use it as a reference.The C standard says that the size of an object is returned with sizeof and its type is size_t and the return value is in bytes, so it could be pretty safe to say that for all sorts of ordinary objects, the absolute maximum size in bytes would be SIZE_MAX. One cannot allocate an object greater than SIZE_MAX with malloc, realloc; but the API of calloc could allow that.
+Therefore any array has maximum of SIZE_MAX elements.
+While a single object cannot exceed SIZE_MAX, the total number of bytes in all objects in a program may well exceed SIZE_MAX.Objects
+The largest size of an object is about SIZE_MAX.  sizeof object returns the size of any object.  The type returned is type size_t.   The range of size_t is [0...SIZE_MAX].
+The size limit is effective one less as the address after the object needs to be computable.
+Since an array is an object, the largest 4-byte int array would be
+int big_int_array[SIZE_MAX/sizeof(int)];  // Perhaps 1 less
+
+
+Allocations
+The largest memory that be be allocated via malloc() is about SIZE_MAX.
+char *big_array = malloc(SIZE_MAX - 1);
+
+The largest memory that be be allocated via calloc() is about SIZE_MAX * SIZE_MAX bytes, yet such a large allocation attempts usually return NULL.
+double *big_array = calloc(SIZE_MAX/2, sizeof *big_array);
+
+Rare machines allows this, not Linux.  Most platforms will returns NULL if the product meets/exceeds SIZE_MAX.  
+Here, big_array[] can be indexed [0...SIZE_MAX/2).  This usually requires the address scheme to not be the traditional universal linear model many platforms employ.Is there a size limit to how many members or the type types of variables a structure may contain?I ran into some weird issues (at compile time) with my embedded C code when I increased the size of the array from size [2] to [27] which contained structured metadata. So it is obvious that this is a nested structured style program and NOT my original work!
+I remember in assembly code instructions, there used to be a JMP FAR, JMP NEAR/SHORT.. Is there any such limitations in structures (obviously there is no jump in structures). Could there be a condition that the compiler cannot assign a contiguous memory block for a structure because there is a limit to it and fails during compilation.
+SOME CLUE: The fix as i recall was to move the member (array member)from original structure to another nested structure. That's the reason why i deduced that there maybe a limitation.   
+//STRUCTURES
+typedef UINT8 P_Name_t[5];
+typedef UINT8 ChipSN_t[3]; 
+
+typedef struct                   
+{  
+   ChipSN_t  ChipSN; 
+   <other members>   
+} ChipIdent_t;
+
+
+typedef struct Data_t              
+{ 
+   ChipIdent_t      ReadOnlyMemID;
+    <other members>   
+} Data_t;
+
+
+typedef struct                
+{
+   P_Name_t NameOfPart;   
+   <other members>
+} Log_t;
+
+Data_t     Data_Src;
+
+typedef struct
+{
+   P_Name_t       NameOfPart;           
+   ChipSN_t       ChipSN;   
+}PartNum_ID_t;
+
+
+typedef struct
+{
+   PartNum_ID_t PN_ChipID[27];
+   <other members>; 
+}According to standard, there is a limitation; but the limitation is much more than the size you mentioned here. C89 and C99 standard has the limit of 1023 structure members. See below text from the standard.
+
+5.2.4.1 Translation limits
+— 1023 members in a single structure or union
+
+So looks like if your code is correct and limited to 1023 structure members the compiler you are using may have the limitation.There may indeed be a limit to the number of structure elements your compiler can handle for a single structure, but as MCG quoted from the C Standard, this limit must be at least 1023 for compliant compilers and most compilers have higher limits or no practical limits at all.
+I suspect the problem is elsewhere:
+
+The Makefile for your project may have incomplete dependencies on the header file with the structure definitions: modules compiled with different definitions will be incompatible and produce undefined behavior. Remove all object files and recompile the project.
+Some assembly modules may rely on the original structure layout: changing the definition will only affect the recompiled C modules.
+Some library modules or OS system calls may rely on the original layout. Recompiling all libraries or even patching the OS may be required.
+Some functions may rely on the original layout and use casts to access some of the structures via another type. Changing the layout may break such code, which is brittle anyway as even changing compilers may produce similar problems.
+It is also possible that some of the type be multiply defined in different modules. This is poor and very error prone coding style as changing only one of the definitions will lead to undefined behavior when the object modules are linked together.combine multiple chars to an intI have four unsigned chars, each containing a byte, that I want to combine together to form a single int32_t, where the bytes come one after another.
+       unsigned char x1 = 0b11100111;
+       unsigned char x2 = 0b00010101;
+       unsigned char x3 = 0b10000110;
+       unsigned char x4 = 0b00001111;
+
+With the four chars above the int32_t should have a binary representation of 0b11100111000101011000011000001111. 
+How can this be done in c?You can do this with a series of shifts and bitwise OR operations:
+uint32_t x = 0;
+x |= (uint32_t)x1 << 24;
+x |= (uint32_t)x2 << 16;
+x |= (uint32_t)x3 << 8;
+x |= (uint32_t)x4;
+
+Since the bytes are unsigned, you should use an uint32_t for the destination, otherwise you run into implementation defined behavior if the high order bit is set.You could do it like follows:
+
+
+
+    #include <stdint.h>
+    #include <stdio.h>
+
+    int main() {
+      unsigned char x1 = 0b11100111;
+      unsigned char x2 = 0b00010101;
+      unsigned char x3 = 0b10000110;
+      unsigned char x4 = 0b00001111;
+      int32_t x5 = x1;
+      x5 <<= 8;
+      x5 |= x2;
+      x5 <<= 8;
+      x5 |= x3;
+      x5 <<= 8;
+      x5 |= x4;
+
+      printf("%d", x5);
+
+    }

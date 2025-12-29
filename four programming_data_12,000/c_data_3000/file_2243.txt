@@ -1,0 +1,4516 @@
+DispatchReadSource event handler not firing for bound socketI'm trying to implement a simple TCP socket server in Swift. This code should be fairly similar to a C implementation but with extra Swift-isms.
+I'm trying to connect using curl http://localhost:8080 which should at least trigger an "accept" even if there is no HTTP logic in the server. The response from curl is Connection refused
+Here is the code I am using. It outputs 2 "Listening on descriptor" lines, but no "Accepting…" lines
+import LibC
+import Dispatch
+
+let port = 8080
+let listenBacklogLen = 16
+
+// Setup Sockets
+let socketDescriptor = (
+    ipv4: socket(PF_INET,  SOCK_STREAM, IPPROTO_TCP),
+    ipv6: socket(PF_INET6, SOCK_STREAM, IPPROTO_TCP)
+)
+let descriptors = [socketDescriptor.ipv4, socketDescriptor.ipv6]
+
+var address = (
+    ipv4: sockaddr_in(),
+    ipv6: sockaddr_in6()
+)
+
+address.ipv4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+address.ipv4.sin_family = sa_family_t(AF_INET)
+address.ipv4.sin_port = in_port_t(port)
+address.ipv4.sin_addr.s_addr = INADDR_ANY
+
+address.ipv6.sin6_len = UInt8(MemoryLayout<sockaddr_in>.size)
+address.ipv6.sin6_family = sa_family_t(AF_INET6)
+address.ipv6.sin6_port = in_port_t(port)
+address.ipv6.sin6_addr = in6addr_any
+
+var reuseAddress: Int = 1
+let reuseAddressLen = socklen_t(MemoryLayout.size(ofValue: reuseAddress))
+withUnsafePointer(to: &reuseAddress) { ref in
+    for descriptor in descriptors {
+        assert(setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, ref, reuseAddressLen) == 0)
+    }
+}
+
+withUnsafePointer(to: &address.ipv4) { ref in
+    ref.withMemoryRebound(to: sockaddr.self, capacity: 1) { reboundRef in
+        assert(bind(socketDescriptor.ipv4, reboundRef, socklen_t(MemoryLayout.size(ofValue: ref.pointee))) == 0)
+    }
+}
+withUnsafePointer(to: &address.ipv6) { ref in
+    ref.withMemoryRebound(to: sockaddr.self, capacity: 1) { reboundRef in
+        assert(bind(socketDescriptor.ipv6, reboundRef, socklen_t(MemoryLayout.size(ofValue: ref.pointee))) == 0)
+    }
+}
+
+var acceptSources: [DispatchSourceRead] = []
+var requestSources: [DispatchSourceRead] = []
+for descriptor in descriptors {
+    assert(listen(descriptor, Int32(listenBacklogLen)) == 0);
+
+    let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: .global(qos: .userInitiated))
+    source.setEventHandler {
+        print("Accepting…")
+        var address = sockaddr()
+        var addressLen: socklen_t = socklen_t(MemoryLayout.size(ofValue: address))
+        let requestSocketDescriptor = accept(descriptor, &address, &addressLen)
+        assert(requestSocketDescriptor >= 0)
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: requestSocketDescriptor, queue: .global(qos: .userInitiated))
+        source.setEventHandler { [unowned source] in
+            var char: CChar = 0
+            let bytesRead = read(requestSocketDescriptor, &char, 1)
+            switch bytesRead {
+            case -1:
+                if ![EAGAIN, EINTR].contains(errno) {
+                    print("Read returned error (\(errno)): \(strerror(errno))")
+                    fallthrough
+                }
+            case 0:
+                print("Done")
+                source.cancel()
+            default:
+                print("C: \(char)")
+            }
+        }
+        requestSources.append(source)
+        source.resume()
+    }
+    acceptSources.append(source)
+
+    print("Listening on descriptor: \(descriptor)")
+    source.resume()
+}
+
+dispatchMain()
+
+BTW, LibC is a simple module which unifies glibc and Darwin:
+#if os(Linux)
+    @_exported import Glibc
+#else
+    @_exported import Darwin.C
+#endifAha! The port must be big-endian: 
+address.ipv4.sin_port = in_port_t(port).bigEndian
+address.ipv6.sin_port = in_port_t(port).bigEndian
+Figured this out with help from: Socket Server Example with SwiftWhy do some C compilers set the return value of a function in weird places?I wrote this snippet in a recent argument over the supposed speed of array[i++] vs array[i]; i++. 
+int array[10];
+
+int main(){
+    int i=0;
+    while(i < 10){
+        array[i] = 0;
+        i++;
+    }
+    return 0;
+}
+
+Snippet at the compiler explorer: https://godbolt.org/g/de7TY2
+As expected, the compiler output identical asm for array[i++] and array[i]; i++ with at least -O1. However what surprised me was the placement of the xor eax, eax seemingly randomly in the function at higher optimization levels.
+
+GCC
+At -O2, GCC places the xor before the ret as expected
+    mov     DWORD PTR [rax], 0
+    add     rax, 4
+    cmp     rax, OFFSET FLAT:array+40
+    jne     .L2
+    xor     eax, eax
+    ret
+
+However it places the xor after the second mov at -O3
+    mov     QWORD PTR array[rip], 0
+    mov     QWORD PTR array[rip+8], 0
+    xor     eax, eax
+    mov     QWORD PTR array[rip+16], 0
+    mov     QWORD PTR array[rip+24], 0
+    mov     QWORD PTR array[rip+32], 0
+    ret
+
+
+icc
+icc places it normally at -O1:
+    push      rsi
+    xor       esi, esi
+    push      3
+    pop       rdi
+    call      __intel_new_feature_proc_init
+    stmxcsr   DWORD PTR [rsp]
+    xor       eax, eax
+    or        DWORD PTR [rsp], 32832
+    ldmxcsr   DWORD PTR [rsp]
+..B1.2:
+    mov       DWORD PTR [array+rax*4], 0
+    inc       rax
+    cmp       rax, 10
+    jl        ..B1.2
+    xor       eax, eax
+    pop       rcx
+    ret
+
+but in a strange place at -O2
+    push      rbp
+    mov       rbp, rsp
+    and       rsp, -128
+    sub       rsp, 128
+    xor       esi, esi
+    mov       edi, 3
+    call      __intel_new_feature_proc_init
+    stmxcsr   DWORD PTR [rsp]
+    pxor      xmm0, xmm0
+    xor       eax, eax
+    or        DWORD PTR [rsp], 32832
+    ldmxcsr   DWORD PTR [rsp]
+    movdqu    XMMWORD PTR array[rip], xmm0
+    movdqu    XMMWORD PTR 16+array[rip], xmm0
+    mov       DWORD PTR 32+array[rip], eax
+    mov       DWORD PTR 36+array[rip], eax
+    mov       rsp, rbp
+    pop       rbp
+    ret       
+
+and -O3
+    and       rsp, -128
+    sub       rsp, 128
+    mov       edi, 3
+    call      __intel_new_proc_init
+    stmxcsr   DWORD PTR [rsp]
+    xor       eax, eax
+    or        DWORD PTR [rsp], 32832
+    ldmxcsr   DWORD PTR [rsp]
+    mov       rsp, rbp
+    pop       rbp
+    ret   
+
+
+Clang
+only clang places the xor directly in front of the ret at all optimization levels:
+    xorps   xmm0, xmm0
+    movaps  xmmword ptr [rip + array+16], xmm0
+    movaps  xmmword ptr [rip + array], xmm0
+    mov     qword ptr [rip + array+32], 0
+    xor     eax, eax
+    ret
+
+
+Since GCC and ICC both do this at higher optimisation levels, I presume there must be some kind of good reason.
+Why do some compilers do this?
+The code is semantically identical of course and the compiler can reorder it as it wishes, but since this only changes at higher optimization levels this must be caused by some kind of optimization.Since eax isn't used, compilers can zero the register whenever they want, and it works as expected.
+An interesting thing that you didn't notice is the icc -O2 version:
+xor       eax, eax
+or        DWORD PTR [rsp], 32832
+ldmxcsr   DWORD PTR [rsp]
+movdqu    XMMWORD PTR array[rip], xmm0
+movdqu    XMMWORD PTR 16+array[rip], xmm0
+mov       DWORD PTR 32+array[rip], eax   ; set to 0 using the value of eax
+mov       DWORD PTR 36+array[rip], eax
+
+notice that eax is zeroed for the return value, but also used to zero 2 memory regions (last 2 instructions), probably because the instruction using eax is shorter than the instruction with the immediate zero operand.
+So two birds with one stone.Different instructions have different latencies.  Sometimes changing the order of instructions can speed up the code for several reasons.  For example:
+If a certain instruction takes several cycles to complete, if it is at the end of the function the program just waits until it is done.  If it is earlier in the function other things can happen while that instruction finishes.  That is unlikely the actual reason here, though, on second thought, as xor of registers is I believe a low-latency instruction.  Latencies are processor dependent though.
+However, placing the XOR there may have to do with separating the mov instructions between which it is placed. 
+There are also optimizations that take advantage of the optimization capabilities of modern processors such as pipelining, branch prediction (not the case here as far as I can see....), etc.  You need a pretty deep understanding of these capabilities to understand what an optimizer may do to take advantage of them.  
+You might find this informative.  It pointed me to Agner Fog's site, a resource I have not seen before but has a lot of the information you wanted (or didn't want :-) ) to know but were afraid to ask :-)Those memory accesses are expected to burn at least several clock cycles.  You can move the xor without changing the functionality of the code.  By pulling it back with one/some memory accesses after it it becomes free, doesnt cost you any execution time it is parallel with the external access (the processor finishes the xor and waits on the external activity rather than just waits on the external activity).  If you put it in a clump of instructions without memory accesses it costs a clock at least.  And as you probably know using the xor vs mov immediate reduces the size of the instruction, probably not costing clocks but saving space in the binary.  A ghee whiz kinda cool optimization that dates back to the original 8086, and is still used today even if it doesnt save you much in the end.Where processor set the particular value depends on the moment where passing the execution tree it is sure that this register will not be needed anymore and will not be changed by the external world.
+Here is less trivial example:
+https://godbolt.org/g/6AowMJ
+And the processor zeroes eax past the memset because memset can change its value. The moment depends on parsing the complex tree, and it possible not logical for the humans.Linux SPI process crashing in kernel driverI have a SPI device (aka SPI slave) driver that I've used for several years on an Atmel AT91 processor.  I'm currently porting the driver to a new set of boards and am moving to a Gumstix Duovero CPU.  The old stuff was all running in Linux 3.8, the new stuff is all 3.18.21 from the gumstix kernel repository.
+In a nutshell, the way the system operates is that there's an FPGA that sends a pulse to a GPIO pin to tell the processor that data is ready.  In response the CPU sends 4 bytes, and reads 4 bytes.  The SPI bus clock is set to 1Mhz, and the FPGA signal, called "data ready" fires at about 20khz.  The transfers all occur in PIO because they are too small for DMA.
+I've been debugging the new system for several days and am about at my wit end.  I think that the frequency with which interrupts happen is the crux of my problem, but I'm not sure.  I feel like perhaps the interrupt handler is triggering before the driver init is done, but I could be wrong.  In any case, when you boot the system, one of 3 things happens:
+
+The system hangs with a kernel panic. (90% of the time)
+The system boots, but spi4 dies. (7% of the time)
+Everything boots and works as expected (3% of the time)
+
+I don't know a huge amount about the kernel's generic SPI interfaces and haven't found anything that would indicate a problem.  The old code called some of Atmel's SPI code directly, but I think even now that's all been merged into the more generic spi.h and gpio.h files.  Looking at the traceback below there's obviously a NULL pointer problem, but I haven't found it yet.
+Any feedback is appreciated.  I'll post the stack trace and source code below.
+Traceback
+[    1.850311] QUICKLOGIC: Init called, allocating memory
+[    1.855712] QUICKLOGIC: Allocating locks
+[    1.859985] QUICKLOGIC: Init SPI messages
+[    1.864349] QUICKLOGIC: spi_register driver complete.
+[    1.871276] QUICKLOGIC: Added device to bus, put_device called.
+[    1.877563] QUICKLOGIC: Looking for Quicklogic data ready trigger on GPIO 110.
+[    1.885131] QUICKLOGIC: GPIO request looks ok, trying to grab an IRQ.
+[    1.891845] QUICKLOGIC: gpio_to_irq says we'll request IRQ 270
+[    1.898925] Unable to handle kernel NULL pointer dereference at virtual address 00000004
+[    1.907379] pgd = c0004000
+[    1.910186] [00000004] *pgd=00000000
+[    1.913940] Internal error: Oops: 805 [#1] SMP ARM
+[    1.918914] Modules linked in:
+[    1.922119] CPU: 1 PID: 703 Comm: spi4 Not tainted 3.18.21 #35
+[    1.928192] task: ee24f140 ti: ee51a000 task.ti: ee51a000
+[    1.933837] PC is at spi_pump_messages+0xec/0x54c
+[    1.938751] LR is at _raw_spin_lock_irqsave+0x48/0x54
+[    1.944030] pc : [<c040e2a0>]    lr : [<c05ccec4>]    psr: 60000193
+[    1.944030] sp : ee51bed0  ip : c091fda8  fp : ee51a000
+[    1.955993] r10: ee26a308  r9 : 00000001  r8 : 00000000
+[    1.961425] r7 : c111af18  r6 : ee26a32c  r5 : ee26a000  r4 : ee26a31c
+[    1.968231] r3 : c1151dac  r2 : 00000000  r1 : a0000113  r0 : 00000000
+[    1.975036] Flags: nZCv  IRQs off  FIQs on  Mode SVC_32  ISA ARM  Segment kernel
+[    1.982757] Control: 10c5387d  Table: 8000404a  DAC: 00000015
+[    1.988739] Process spi4 (pid: 703, stack limit = 0xee51a240)
+[    1.994720] Stack: (0xee51bed0 to 0xee51c000)
+[    1.999267] bec0:                                     c111af18 00000000 00000001 ee26a308
+[    2.007812] bee0: ee26a2e8 ee26a31c 00000000 ee26a2e8 c111af18 00000000 00000001 ee26a308
+[    2.016326] bf00: ee51a000 c005b618 ee24f140 00000000 ee2dc800 ee26a2e8 c005b554 00000000
+[    2.024871] bf20: 00000000 00000000 00000000 c005b4e8 00000000 00000000 60000193 ee26a2e8
+[    2.033386] bf40: 00000000 00000000 dead4ead ffffffff ffffffff c095c238 00000000 00000000
+[    2.041900] bf60: c076bef4 ee51bf64 ee51bf64 00000000 00000000 dead4ead ffffffff ffffffff
+[    2.050445] bf80: c095c238 00000000 00000000 c076bef4 ee51bf90 ee51bf90 ee064040 ee2dc800
+[    2.058959] bfa0: c005b420 00000000 00000000 c000e730 00000000 00000000 00000000 00000000
+[    2.067504] bfc0: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[    2.076019] bfe0: 00000000 00000000 00000000 00000000 00000013 00000000 5726fda2 ebc47f2b
+[    2.084564] [<c040e2a0>] (spi_pump_messages) from [<c005b618>] (kthread_worker_fn+0xc4/0x178)
+[    2.093475] [<c005b618>] (kthread_worker_fn) from [<c005b4e8>] (kthread+0xc8/0xe4)
+[    2.101379] [<c005b4e8>] (kthread) from [<c000e730>] (ret_from_fork+0x14/0x24)
+[    2.108917] Code: eafffff1 e2432024 e5842038 e8930005 (e5802004) 
+[    2.115295] ---[ end trace 1b2a03254ba5aba5 ]---
+[   18.854156] BUG: spinlock lockup suspected on CPU#0, swapper/0/1
+[   18.860412]  lock: 0xee26a32c, .magic: dead4ead, .owner: spi4/703, .owner_cpu: 1
+[   18.868133] CPU: 0 PID: 1 Comm: swapper/0 Tainted: G      D        3.18.21 #35
+[   18.875701] [<c00159ac>] (unwind_backtrace) from [<c001213c>] (show_stack+0x10/0x14)
+[   18.883819] [<c001213c>] (show_stack) from [<c05c708c>] (dump_stack+0x84/0x9c)
+[   18.891357] [<c05c708c>] (dump_stack) from [<c0086fe8>] (do_raw_spin_lock+0xf0/0x194)
+[   18.899536] [<c0086fe8>] (do_raw_spin_lock) from [<c05ccec4>] (_raw_spin_lock_irqsave+0x48/0x54)
+[   18.908721] [<c05ccec4>] (_raw_spin_lock_irqsave) from [<c040d1b8>] (spi_queued_transfer+0x18/0x98)
+[   18.918151] [<c040d1b8>] (spi_queued_transfer) from [<c040d10c>] (spi_async+0x5c/0x64)
+[   18.926422] [<c040d10c>] (spi_async) from [<c0411178>] (grab_spi_data+0xe4/0x170)
+[   18.934234] [<c0411178>] (grab_spi_data) from [<c008e3bc>] (handle_irq_event_percpu+0x3c/0x1d8)
+[   18.943298] [<c008e3bc>] (handle_irq_event_percpu) from [<c008e594>] (handle_irq_event+0x3c/0x5c)
+[   18.952575] [<c008e594>] (handle_irq_event) from [<c00912e0>] (handle_edge_irq+0xec/0x188)
+[   18.961181] [<c00912e0>] (handle_edge_irq) from [<c008da94>] (generic_handle_irq+0x28/0x3c)
+[   18.969909] [<c008da94>] (generic_handle_irq) from [<c03426e8>] (omap_gpio_irq_handler+0x16c/0x224)
+[   18.979339] [<c03426e8>] (omap_gpio_irq_handler) from [<c008da94>] (generic_handle_irq+0x28/0x3c)
+[   18.988616] [<c008da94>] (generic_handle_irq) from [<c008dd78>] (__handle_domain_irq+0x64/0xc8)
+[   18.997680] [<c008dd78>] (__handle_domain_irq) from [<c00086f0>] (gic_handle_irq+0x20/0x60)
+[   19.006378] [<c00086f0>] (gic_handle_irq) from [<c05cd9e4>] (__irq_svc+0x44/0x5c)
+[   19.014190] Exception stack(0xee067d68 to 0xee067db0)
+[   19.019470] 7d60:                   00000001 00000001 00000000 ee064b40 c0913a3c ee3b6cc0
+[   19.027984] 7d80: ee3b6cc0 ee107940 0000010e ee22985c 60000113 c11341c4 00000000 ee067db0
+[   19.036529] 7da0: c0081914 c05cd038 20000113 ffffffff
+[   19.041778] [<c05cd9e4>] (__irq_svc) from [<c05cd038>] (_raw_spin_unlock_irq+0x28/0x2c)
+[   19.050140] [<c05cd038>] (_raw_spin_unlock_irq) from [<c01a2394>] (proc_alloc_inum+0x30/0xac)
+[   19.059020] [<c01a2394>] (proc_alloc_inum) from [<c01a2428>] (proc_register+0x18/0x134)
+[   19.067382] [<c01a2428>] (proc_register) from [<c01a2640>] (proc_mkdir_data+0x44/0x6c)
+[   19.075653] [<c01a2640>] (proc_mkdir_data) from [<c0093df0>] (register_irq_proc+0x6c/0x128)
+[   19.084350] [<c0093df0>] (register_irq_proc) from [<c008fbb0>] (__setup_irq+0x264/0x530)
+[   19.092803] [<c008fbb0>] (__setup_irq) from [<c008ffac>] (request_threaded_irq+0xa4/0x130)
+[   19.101440] [<c008ffac>] (request_threaded_irq) from [<c08867b8>] (quicklogic_init+0x588/0x694)
+[   19.110504] [<c08867b8>] (quicklogic_init) from [<c00089c4>] (do_one_initcall+0x80/0x1c8)
+[   19.119049] [<c00089c4>] (do_one_initcall) from [<c084ae40>] (kernel_init_freeable+0x1c4/0x28c)
+[   19.128112] [<c084ae40>] (kernel_init_freeable) from [<c05c341c>] (kernel_init+0x8/0xec)
+[   19.136566] [<c05c341c>] (kernel_init) from [<c000e730>] (ret_from_fork+0x14/0x24)
+[   22.871673] INFO: rcu_sched detected stalls on CPUs/tasks: { 0} (detected by 1, t=2102 jiffies, g=-279, c=-280, q=254)
+[   22.882843] Task dump for CPU 0:
+[   22.886230] swapper/0       R running      0     1      0 0x00000002
+[   22.892852] [<c05c8078>] (__schedule) from [<ee009000>] (0xee009000)
+
+quicklogic.c
+/*
+  quicklogic.c
+  Authored by Maxwell Bottiger
+
+  Based on examples from Scott Ellis, 2010
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+*/
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/cdev.h>
+#include <linux/spi/spi.h>
+#include <linux/string.h>
+#include <linux/dma-mapping.h>
+#include <asm/uaccess.h>
+#include <linux/semaphore.h> //Mutexes, which seem to have come in from somewhere else.
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+#include <linux/signal.h>
+#include <linux/delay.h>
+//#include "../../arch/arm/mach-at91/include/mach/gpio.h"
+#include <linux/gpio.h>
+
+#define SPI_MSG_LEN     4 // should result in PIO
+//#define AT91_PIN_PA24 121
+#define AT91_PIN_PA24 110
+//#define SPI_TRANSFERS 25000 // transfers in 5 seconds
+#define SPI_TRANSFERS 10
+#define SPI_BUFF_SIZE 100000 // ~5 seconds
+#define USER_BUFF_SIZE 100000 // ~5 seconds of samples a 200us per sample
+#define SPI_MSG_BUFFER 10 // really only 2, but 10 saves our souls during startup.
+#define READ_SLEEP_MSECS 500 // time to wait between user buffer checks
+/* 
+   So, the buffer attempts to read every 0.5 seconds, and a buffer is ready every 5
+   seconds.  Therefore we should never attempt to read more than 10 times.  If we
+   read more than 10x, it probably means the process that had the device open
+   has exited without closing the file handle.  So, count off the number of 
+   iterations, then break if you cross the threshold. */
+
+#define READ_ATTEMPT_THRESHOLD 12 
+
+#define SPI_BUS 4
+#define SPI_BUS_CS 0
+#define SPI_BUS_SPEED 1000000
+/*bus speed is defined in board-sam9x5ek.c, which is an atmel thing I think*/
+
+
+const char this_driver_name[] = "quicklogic";
+
+
+struct quicklogic_control {
+    struct spi_message msg[SPI_MSG_BUFFER]; 
+    struct spi_transfer transfer[SPI_MSG_BUFFER];
+    u8 *tx_buff; 
+    u8 *rx_buff;
+    dma_addr_t tx_dma;
+    dma_addr_t rx_dma;
+    spinlock_t* lock;
+    int dirty;
+    int active;
+};
+
+static struct quicklogic_control quicklogic_b1;
+static struct quicklogic_control quicklogic_b2;
+
+
+struct quicklogic_dev {
+    spinlock_t spi_lock;
+    struct semaphore fop_sem;
+    dev_t devt;
+    struct cdev cdev;
+    struct class *class;
+    struct spi_device *spi_device;
+    char *user_buff;
+    u8 test_data;   
+};
+
+static struct quicklogic_dev quicklogic_dev;
+
+void spi_completion_handler(void* arg)
+{
+
+}
+
+irqreturn_t grab_spi_data(int irq,void *dev_id)
+{
+    static struct quicklogic_control* buffer = &quicklogic_b1;
+    static int i = 0;
+    static int complete = 0;
+    int status;
+    unsigned long flags;
+    int index;
+    spinlock_t* mSpinLock;
+    index = i % SPI_MSG_BUFFER;
+    spi_message_init(&(buffer -> msg[index]));
+    mSpinLock =  buffer -> lock;
+    buffer -> transfer[index].tx_buf = quicklogic_b1.tx_buff;
+    buffer -> transfer[index].rx_buf = buffer -> rx_buff + (i * 4);
+    buffer -> transfer[index].len = SPI_MSG_LEN;
+    buffer -> msg[index].complete = spi_completion_handler;
+    buffer -> msg[index].context = &complete;
+    //Select insertion point in the buffer, then send an SPI message
+    spi_message_add_tail(&(buffer->transfer[index]), &(buffer->msg[index]));
+    spin_lock_irqsave(mSpinLock, flags);
+    if (quicklogic_dev.spi_device)
+        status = spi_async(quicklogic_dev.spi_device, &(buffer->msg[index]));
+    else
+        status = -ENODEV;
+    buffer -> active = 1;
+    i++; //move along to the next sample
+    if (i>SPI_TRANSFERS) { // end of the buffer
+        //printk(KERN_INFO "QUICKLOGIC: %i transfers have taken place, switching buffers.\n", i);
+        buffer -> dirty = 0; // contents are unread
+        buffer -> active = 0; // buffer is at rest
+        if (buffer == &quicklogic_b1)
+            buffer = &quicklogic_b2;
+        else
+            buffer = &quicklogic_b1;
+        i = 0; //reset our counter
+        complete = 0;
+    }
+    spin_unlock_irqrestore(mSpinLock, flags);
+    return IRQ_HANDLED;
+}
+
+int check_buffer(struct quicklogic_control* buffer)
+{
+    unsigned long flags;
+    int success;
+
+    success = 0;
+    //printk("QUICKLOGIC: In check_buffer\n");
+    spin_lock_irqsave(buffer -> lock, flags); // lock buffer 1
+    if (buffer -> active != 1) { // not being filled
+        if (buffer -> dirty == 0) { // buffer has not yet been read
+            memcpy(quicklogic_dev.user_buff, buffer -> rx_buff, USER_BUFF_SIZE);
+            buffer -> dirty = 1;
+            success = 1;
+        }
+    }
+    //spin_unlock_irqrestore(quicklogic_b1.lock, flags); // unlock buffer 1
+    spin_unlock_irqrestore(buffer -> lock, flags);
+    return success;
+}
+static ssize_t quicklogic_read(struct file *filp, char __user *buff, size_t count,
+            loff_t *offp)
+{
+    size_t len;
+    size_t status;
+    int goodRead;
+    int extra = 0;
+    int readAttempts; //5 second samples / 0.5 second attempts means we should iterate no more than 10 times
+    static size_t remainder = USER_BUFF_SIZE;
+    goodRead = 0;
+
+    //printk("QUICKLOGIC: Inside quicklogic_read, requesting %i bytes\n", count);
+    if (*offp > 0 && remainder == 0) { // this is the end of a previous read
+        remainder = USER_BUFF_SIZE;
+        printk(KERN_ALERT "QUICKLOGIC: offp is greater than 0 and no data is left, returning.\n");
+        return 0;
+    }
+
+    if (down_interruptible(&quicklogic_dev.fop_sem))  {
+        printk(KERN_ALERT "QUICKLOGIC: down_interruptible fop_sem failed, returning.\n"); 
+        return -ERESTARTSYS;
+    }
+    if (remainder == USER_BUFF_SIZE) { // this is a new read
+        readAttempts = 0;
+        while (goodRead == 0)  {
+            if (check_buffer(&quicklogic_b1)) {
+                //printk(KERN_INFO "QUICKLOGIC: Buffer 1 will be returned\n");
+                goodRead = 1;
+            }
+            else if (check_buffer(&quicklogic_b2))  {
+                //printk(KERN_INFO "QUICKLOGIC: Buffer 2 will be returned\n");
+                goodRead = 1;
+            }
+            else if (readAttempts > READ_ATTEMPT_THRESHOLD)  {
+                printk(KERN_ALERT "QUICKLOGIC: Exceded read threshold, exiting quicklogic_read()\n");
+                up(&quicklogic_dev.fop_sem);
+                return 0;
+            }
+            else  {
+                //printk(KERN_INFO "QUICKLOGIC: Neither buffer is ready, sleeping instead.\n");
+                msleep_interruptible(READ_SLEEP_MSECS);
+                readAttempts++;
+            }
+        }
+    }
+
+
+    /* 1 - trylock b1
+       2 - if b1 is open, lock and check dirty flag
+       3 - if clean and locked, copy data to user, set dirty flag, unlock and return
+       4 - b1 is locked, so lock b2
+       5 - check the dirty bit - if clean copy data to user, set dirty flag, unlock and return
+       6 - if b2 is dirty, lock b1 and wait
+       7 - when lock is released do steps 2 and 3
+    */
+    //TODO need to fix this in the buffer selection code.
+    //memcpy(quicklogic_dev.user_buff, quicklogic_ctl.rx_buff, SPI_BUFF_SIZE);
+    //quicklogic_dev.user_buff[SPI_BUFF_SIZE] = '\0'; //probably don't need this.
+
+    //len = strlen(quicklogic_dev.user_buff);
+
+    len = USER_BUFF_SIZE;
+    if (count <= remainder) {
+        extra = copy_to_user(buff, quicklogic_dev.user_buff, count);
+        //printk("QUICKLOGIC: %i bytes remaining to transfer\n", extra);
+        remainder -= count;
+    }
+    else {
+        extra = copy_to_user(buff, quicklogic_dev.user_buff, remainder);
+        //printk("QUICKLOGIC: %i bytes remaining to transfer\n", extra);
+        count = remainder;
+        remainder = USER_BUFF_SIZE; // Last transfer, so we need to re-init remainder
+    }
+    if (extra)  {
+        printk(KERN_ALERT "QUICKLOGIC: quicklogic_read(): copy_to_user() failed\n");
+        status = -EFAULT;
+    } else {
+        //printk("QUICKLOGIC: Sent data back to user space\n");
+        *offp += count;
+        status = count;
+    }
+    up(&quicklogic_dev.fop_sem);
+    //printk("QUICKLOGIC: Returning status=%i\n", status);
+    return status;
+}
+
+static int quicklogic_open(struct inode *inode, struct file *filp)
+{   
+    int status = 0;
+
+    if (down_interruptible(&quicklogic_dev.fop_sem)) 
+        return -ERESTARTSYS;
+
+    if (!quicklogic_dev.user_buff) {
+        quicklogic_dev.user_buff = kmalloc(USER_BUFF_SIZE, GFP_KERNEL);
+        if (!quicklogic_dev.user_buff) 
+            status = -ENOMEM;
+    }   
+
+    up(&quicklogic_dev.fop_sem);
+
+    return status;
+}
+
+static int quicklogic_probe(struct spi_device *spi_device)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&quicklogic_dev.spi_lock, flags);
+    quicklogic_dev.spi_device = spi_device;
+    spin_unlock_irqrestore(&quicklogic_dev.spi_lock, flags);
+
+    return 0;
+}
+
+static int quicklogic_remove(struct spi_device *spi_device)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&quicklogic_dev.spi_lock, flags);
+    quicklogic_dev.spi_device = NULL;
+    spin_unlock_irqrestore(&quicklogic_dev.spi_lock, flags);
+
+    return 0;
+}
+
+
+
+static int __init add_quicklogic_device_to_bus(void)
+{
+    struct spi_master *spi_master;
+    struct spi_device *spi_device;
+    struct device *pdev;
+    char buff[64];
+    int status = 0;
+    int quicklogic_irq;
+
+    spi_master = spi_busnum_to_master(SPI_BUS);
+    if (!spi_master) {
+        printk(KERN_ALERT "spi_busnum_to_master(%d) returned NULL\n",
+            SPI_BUS);
+        printk(KERN_ALERT "Missing modprobe omap2_mcspi?\n");
+        return -1;
+    }
+
+    spi_device = spi_alloc_device(spi_master);
+    if (!spi_device) {
+        put_device(&spi_master->dev);
+        printk(KERN_ALERT "spi_alloc_device() failed\n");
+        return -1;
+    }
+
+    //spi_device->chip_select = SPI_BUS_CS;
+    spi_device->chip_select = SPI_MODE_0;
+    /* Check whether this SPI bus.cs is already claimed */
+    snprintf(buff, sizeof(buff), "%s.%u", 
+            dev_name(&spi_device->master->dev),
+            spi_device->chip_select);
+
+    pdev = bus_find_device_by_name(spi_device->dev.bus, NULL, buff);
+    if (pdev) {
+        /* We are not going to use this spi_device, so free it */ 
+        spi_dev_put(spi_device);
+
+        /* 
+         * There is already a device configured for this bus.cs  
+         * It is okay if it us, otherwise complain and fail.
+         */
+        if (pdev->driver && pdev->driver->name && 
+                strcmp(this_driver_name, pdev->driver->name)) {
+            printk(KERN_ALERT 
+                "Driver [%s] already registered for %s\n",
+                pdev->driver->name, buff);
+            status = -1;
+        } 
+    } else {
+        spi_device->max_speed_hz = SPI_BUS_SPEED;
+        /*spi_device->mode = SPI_MODE_0;*/
+        spi_device->mode = SPI_MODE_1;
+        //spi_device->bits_per_word = 32;
+        spi_device->irq = -1;
+        spi_device->controller_state = NULL;
+        spi_device->controller_data = NULL;
+        strlcpy(spi_device->modalias, this_driver_name, SPI_NAME_SIZE);
+
+        status = spi_add_device(spi_device);        
+        if (status < 0) {   
+            spi_dev_put(spi_device);
+            printk(KERN_ALERT "spi_add_device() failed: %d\n", 
+                status);        
+        }               
+    }
+    put_device(&spi_master->dev);
+    printk(KERN_ALERT "QUICKLOGIC: Added device to bus, put_device called.\n");
+
+    if (gpio_request(AT91_PIN_PA24, "quicklogic_ready") < 0) {
+        status = -1;
+        printk(KERN_ALERT "QUICKLOGIC: Unable to claim GPIO pin");
+    }
+    else
+        gpio_direction_input(AT91_PIN_PA24);
+        printk(KERN_ALERT "QUICKLOGIC: Looking for Quicklogic data ready trigger on GPIO %i.\n", AT91_PIN_PA24);
+        printk(KERN_ALERT "QUICKLOGIC: GPIO request looks ok, trying to grab an IRQ.\n");
+        quicklogic_irq = gpio_to_irq(AT91_PIN_PA24); // from gpio.h
+    printk(KERN_ALERT "QUICKLOGIC: gpio_to_irq says we'll request IRQ %i\n", quicklogic_irq);
+    if (request_irq(quicklogic_irq, grab_spi_data, IRQF_TRIGGER_FALLING, "quicklogic_ready", NULL) < 0)
+        status = -1;
+    //set_irq_type(quicklogic_irq, IRQ_TYPE_EDGE_RISING);
+    printk(KERN_ALERT "QUICKLOGIC: IRQ %i registered\n", quicklogic_irq);
+
+    return status;
+}
+
+static struct spi_driver quicklogic_driver = {
+    .driver = {
+        .name = this_driver_name,
+        .owner = THIS_MODULE,
+    },
+    .probe = quicklogic_probe,
+    .remove = quicklogic_remove,
+};
+//.remove = __devexit_p(quicklogic_remove),
+
+static int __init quicklogic_init_spi(void)
+{
+    int error;
+    int i;
+    printk(KERN_ALERT "QUICKLOGIC: Init called, allocating memory");
+    /* Allocate SPI data buffers */
+    quicklogic_b1.tx_buff = kmalloc(4, GFP_KERNEL); // | GFP_DMA);
+    if (!quicklogic_b1.tx_buff) {
+        error = -ENOMEM;
+        goto quicklogic_init_error;
+    }
+    memset(quicklogic_b1.tx_buff, 0, 4);
+
+    quicklogic_b2.tx_buff = kmalloc(4, GFP_KERNEL); // | GFP_DMA);
+    if (!quicklogic_b2.tx_buff) {
+        error = -ENOMEM;
+        goto quicklogic_init_error;
+    }
+    memset(quicklogic_b2.tx_buff, 0, 4);
+
+    quicklogic_b1.rx_buff = kmalloc(SPI_BUFF_SIZE, GFP_KERNEL); // | GFP_DMA);
+    if (!quicklogic_b1.rx_buff) {
+        error = -ENOMEM;
+        goto quicklogic_init_error;
+    }
+    memset(quicklogic_b1.rx_buff, 9, SPI_BUFF_SIZE);
+
+    quicklogic_b2.rx_buff = kmalloc(SPI_BUFF_SIZE, GFP_KERNEL); // | GFP_DMA);
+    if (!quicklogic_b2.rx_buff) {
+        error = -ENOMEM;
+        goto quicklogic_init_error;
+    }
+    memset(quicklogic_b2.rx_buff, 9, SPI_BUFF_SIZE);
+
+    /* configure DMA recieve buffer */
+    /*quicklogic_b1.rx_dma = dma_map_single(&quicklogic_dev.spi_device->dev,
+        (void*)quicklogic_b1.rx_buff, SPI_BUFF_SIZE, DMA_FROM_DEVICE);
+    quicklogic_b2.rx_dma = dma_map_single(&quicklogic_dev.spi_device->dev,
+        (void*)quicklogic_b2.rx_buff, SPI_BUFF_SIZE, DMA_FROM_DEVICE);
+    quicklogic_b1.tx_dma = dma_map_single(&quicklogic_dev.spi_device->dev,
+        (void*)quicklogic_b1.tx_buff, 4, DMA_TO_DEVICE);    
+    quicklogic_b2.tx_dma = dma_map_single(&quicklogic_dev.spi_device->dev,
+        (void*)quicklogic_b2.tx_buff, 4, DMA_TO_DEVICE);*/
+
+    printk(KERN_ALERT "QUICKLOGIC: Allocating locks\n");
+    /* Allocate and initialize buffer locks */
+    quicklogic_b1.lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+    quicklogic_b2.lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+    spin_lock_init(quicklogic_b1.lock);
+    spin_lock_init(quicklogic_b2.lock);
+
+    /* init both buffers as dirty so as not to read useless information. */ 
+    quicklogic_b1.dirty = 1;
+    quicklogic_b2.dirty = 1;
+
+    printk(KERN_ALERT "QUICKLOGIC: Init SPI messages\n");
+    /* init SPI messages */
+    for (i = 0; i < SPI_MSG_BUFFER; i++)  {
+        spi_message_init(&quicklogic_b1.msg[i]);
+        spi_message_init(&quicklogic_b2.msg[i]);
+        quicklogic_b1.msg[i].status = 0;
+        quicklogic_b2.msg[i].status = 0;
+        /*Tell the driver we want DMA */
+        //quicklogic_b1.msg[i].is_dma_mapped = 1;
+        //quicklogic_b2.msg[i].is_dma_mapped = 1;
+    }
+    error = spi_register_driver(&quicklogic_driver);
+    if (error < 0) {
+        printk(KERN_ALERT "spi_register_driver() failed %d\n", error);
+        goto quicklogic_init_error;
+    }
+    else {
+        printk(KERN_ALERT "QUICKLOGIC: spi_register driver complete.\n");
+    }
+
+    error = add_quicklogic_device_to_bus();
+    if (error < 0) {
+        printk(KERN_ALERT "add_quicklogic_to_bus() failed\n");
+        spi_unregister_driver(&quicklogic_driver);
+        goto quicklogic_init_error; 
+    }
+    else {
+        printk(KERN_ALERT "QUICKLOGIC: add_quicklogic_device_to_bus complete.\n");
+    }
+    return 0;
+
+quicklogic_init_error:
+
+    if (quicklogic_b1.tx_buff) {
+        kfree(quicklogic_b1.tx_buff);
+        quicklogic_b1.tx_buff = 0;
+    }
+
+    if (quicklogic_b2.tx_buff) {
+        kfree(quicklogic_b2.tx_buff);
+        quicklogic_b2.tx_buff = 0;
+    }
+
+    if (quicklogic_b1.rx_buff) {
+        kfree(quicklogic_b1.rx_buff);
+        quicklogic_b1.rx_buff = 0;
+    }
+
+    if (quicklogic_b2.rx_buff) {
+        kfree(quicklogic_b2.rx_buff);
+        quicklogic_b2.rx_buff = 0;
+    }
+
+    return error;
+}
+
+static const struct file_operations quicklogic_fops = {
+    .owner =    THIS_MODULE,
+    .read =     quicklogic_read,
+    .open =     quicklogic_open,    
+};
+
+static int __init quicklogic_init_cdev(void)
+{
+    int error;
+
+    quicklogic_dev.devt = MKDEV(0, 0);
+
+    error = alloc_chrdev_region(&quicklogic_dev.devt, 0, 1, this_driver_name);
+    if (error < 0) {
+        printk(KERN_ALERT "alloc_chrdev_region() failed: %d \n", 
+            error);
+        return -1;
+    }
+
+    cdev_init(&quicklogic_dev.cdev, &quicklogic_fops);
+    quicklogic_dev.cdev.owner = THIS_MODULE;
+
+    error = cdev_add(&quicklogic_dev.cdev, quicklogic_dev.devt, 1);
+    if (error) {
+        printk(KERN_ALERT "cdev_add() failed: %d\n", error);
+        unregister_chrdev_region(quicklogic_dev.devt, 1);
+        return -1;
+    }   
+
+    return 0;
+}
+
+static int __init quicklogic_init_class(void)
+{
+    quicklogic_dev.class = class_create(THIS_MODULE, this_driver_name);
+
+    if (!quicklogic_dev.class) {
+        printk(KERN_ALERT "class_create() failed\n");
+        return -1;
+    }
+
+    if (!device_create(quicklogic_dev.class, NULL, quicklogic_dev.devt, NULL,   
+            this_driver_name)) {
+        printk(KERN_ALERT "device_create(..., %s) failed\n",
+            this_driver_name);
+        class_destroy(quicklogic_dev.class);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int __init quicklogic_init(void)
+{
+
+    memset(&quicklogic_dev, 0, sizeof(quicklogic_dev));
+    memset(&quicklogic_b1, 0, sizeof(quicklogic_b1));
+    memset(&quicklogic_b2, 0, sizeof(quicklogic_b2));
+
+    spin_lock_init(&quicklogic_dev.spi_lock);
+    sema_init(&quicklogic_dev.fop_sem, 1);
+
+    if (quicklogic_init_cdev() < 0) 
+        goto fail_1;
+
+    if (quicklogic_init_class() < 0)  
+        goto fail_2;
+
+    if (quicklogic_init_spi() < 0) 
+        goto fail_3;
+
+    return 0;
+
+fail_3:
+    device_destroy(quicklogic_dev.class, quicklogic_dev.devt);
+    class_destroy(quicklogic_dev.class);
+
+fail_2:
+    cdev_del(&quicklogic_dev.cdev);
+    unregister_chrdev_region(quicklogic_dev.devt, 1);
+
+fail_1:
+    return -1;
+}
+module_init(quicklogic_init);
+
+static void __exit quicklogic_exit(void)
+{
+    spi_unregister_device(quicklogic_dev.spi_device);
+    spi_unregister_driver(&quicklogic_driver);
+
+    device_destroy(quicklogic_dev.class, quicklogic_dev.devt);
+    class_destroy(quicklogic_dev.class);
+
+    cdev_del(&quicklogic_dev.cdev);
+    unregister_chrdev_region(quicklogic_dev.devt, 1);
+
+    if (quicklogic_b1.tx_buff)
+        kfree(quicklogic_b1.tx_buff);
+
+    if (quicklogic_b2.tx_buff)
+        kfree(quicklogic_b2.tx_buff);
+
+    if (quicklogic_b1.rx_buff)
+        kfree(quicklogic_b1.rx_buff);
+
+    if (quicklogic_b2.rx_buff)
+        kfree(quicklogic_b2.rx_buff);
+
+    if (quicklogic_dev.user_buff)
+        kfree(quicklogic_dev.user_buff);
+    //TODO free_irq(irq_num, NULL);
+    gpio_free(AT91_PIN_PA24);
+}
+module_exit(quicklogic_exit);
+
+MODULE_AUTHOR("Maxwell Bottiger");
+MODULE_DESCRIPTION("Quicklogic interface module");
+MODULE_LICENSE("GPL");
+MODULE_VERSION("0.3");C/C++ intrinsics for non-temporal loads of 32- and 64-bit values on x86_64?Are there C/C++ intrinsics for non-temporal loads (i.e. loads without caching, directly from DRAM) of 32- and 64-bit values on x86_64?
+My compiler is MSVC++2017 toolset v141. But intrinsics for other compilers are welcome, as well as references to the underlying assembly instructions.At the time of writing (August 2017) there are no non-temporal loads to GP registers.
+
+The only available non-temporal instructions are:
+Integer domain
+
+(v)movntdqa (load) despite the name this instruction moves 128/256/512 bits, aligned on their natural boundary, into xmm/ymm/zmm registers respectively.
+(v)movntdq (store) despite the name this instruction moves xmm/ymm/zmm registers into a 128/256/512 bits, aligned on their natural boundary, memory location.
+
+GP registers
+
+movnti (store) store a 32/64-bit GP register into a DWORD/QWORD in memory.
+
+MMX registers
+movntq (store) store an MMX register into a QWORD in memory.
+Floating point domain
+
+(v)movntpd/s (store) (legacy and VEX encoded) store a xmm/ymm/zmm register into an aligned 128/256/512 bits memory location. Like movntdq but in the FP domain.
+(v)movntpd/s (store) (EVEX encoded) store a xmm/ymm/zmm register into an aligned 512 bits memory location clearing the upper unused bits. Like movntdq but in the FP domain.
+Intel manuals are contradictory on this
+
+Masked movs
+
+(v)maskmovdqu (store) stores the bytes of an xmm register according to the mask in another xmm register.
+(v)maskmovq (store) stores the bytes of an MMX register according to the mask in another MMX register.Take a look here:
+https://software.intel.com/sites/landingpage/IntrinsicsGuide/#text=temporal
+void _mm_stream_pi (__m64* mem_addr, __m64 a)
+void _mm_stream_si32 (int* mem_addr, int a)
+
+and some others
+and 
+https://msdn.microsoft.com/en-us/library/hh977023.aspx
+it is actually VS2015 documentation but the VS2017 one (at least for me) is strange, disorganised and I cant find anything there :). 
+for this at least as I know 
+void _mm_prefetch (char const* p, int i) is used for it. 
+
+those loads are short enough to only inform the uP to do not evict other data from the cache without the performance penalty (so even for non-temporal load if the there is a room in the cache it will be cached, but it will not evict any data)Exit case in switch in CI am trying this code with exit case, the exit case doesn't work it still asks me for the two numbers and then it exits. I have provided the output. What is the alternative to the switch case that I can use for menu driven programs?
+Sample input/output:
+::::::Menu:::::
+
+1. Addition:
+2. Subtraction
+3. Multiplication
+4. Division
+5. Mod
+6. Exit
+
+Enter your choice:6
+
+Enter the values of a and b:3 4
+
+
+#include<stdio.h>
+#include<stdlib.h>
+
+int main(){
+    int a,b,c;
+    int no;
+    do{
+
+    printf("\n::::::Menu:::::\n");
+    printf(" 1. Addition:\n 2. Subtraction \n 3. Multiplication \n 4. Division \n 5. Mod \n 6. Exit");
+    printf("\nEnter your choice:");
+    scanf("%d",&no);
+    printf("\nEnter the values of a and b:");
+    scanf("%d%d",&a,&b);
+
+    switch(no){
+        case 1:
+                c = a + b;
+                printf("\nAddition is:%d",c);
+        break;
+
+        case 2:
+                c = a - b;
+                printf("\nSubtraction is:%d",c);
+        break;
+
+        case 3:
+                c = a * b;
+                printf("\nMultiplication is:%d",c);
+        break;
+
+        case 4:
+                c = a / b;
+                printf("\nDivision is:%f",c);
+        break;
+
+        case 5:
+                c = a % b;
+                printf("\nMod is:%d",c);
+        break;
+
+        case 6:
+            exit(1);
+        default:
+                printf("\nInvalid choice\n");
+        break;  
+        }
+
+    }while(no!=6);
+    return 0;
+}Your program asks for two numbers because you are checking for the exit code after the second scanf statement. If you wish the program to exit when 6 is entered, then you have to add an if statement in between the first and second scanf. You should additionally removed the exit case from your switch statement. Below is an example:
+printf("\nEnter your choice:");
+scanf("%d",&no);
+if (no == 6)
+    exit(0);
+printf("\nEnter the values of a and b:");
+scanf("%d%d",&a,&b);You're reading the user's menu option, then asking for the next two numbers before you get to the switch statement, so of course it will always ask for those two numbers.
+You need to either check specifically for 6 right after reading the menu input, or you need to move the second prompts to only where they're needed, i.e. inside each case.It keeps asking for the two numbers because the switch statement is positioned right AFTER you ask for the user input. I restructured your code, this should work:
+#include<stdio.h>
+#include<stdlib.h>
+
+int main(){
+int a,b,c;
+int no;
+
+while(1){
+
+printf("\n::::::Menu:::::\n");
+printf(" 1. Addition:\n 2. Subtraction \n 3. Multiplication \n 4. Division \n 5. Mod \n 6. Exit");
+printf("\nEnter your choice:");
+scanf("%d",&no);
+if (no == 6)
+  break;
+
+printf("\nEnter the values of a and b:");
+scanf("%d%d",&a,&b);
+
+switch(no){
+    case 1:
+            c = a + b;
+            printf("\nAddition is:%d",c);
+    break;
+
+    case 2:
+            c = a - b;
+            printf("\nSubtraction is:%d",c);
+    break;
+
+    case 3:
+            c = a * b;
+            printf("\nMultiplication is:%d",c);
+    break;
+
+    case 4:
+            c = a / b;
+            printf("\nDivision is:%f",c);
+    break;
+
+    case 5:
+            c = a % b;
+            printf("\nMod is:%d",c);
+    break;
+
+    default:
+            printf("\nInvalid choice\n");
+    break;  
+    }
+}
+return 0;
+}
+
+Note how I changed the do-while to a while-true and explicitly check for no == 6 PRIOR to asking for user input.The statements in C are meant to be executed sequentially unless you disrupt the normal flow of action using jumps. In your case
+printf("\nEnter your choice:");
+scanf("%d",&no);
+printf("\nEnter the values of a and b:");
+scanf("%d%d",&a,&b);
+// Only now does the switch start.
+
+You ask for the choice first and then for the two numbers. That is why you always end up in entering the two values. One way is to take the exit out of the switch-case which perhaps is the simplest solution I guess. Something like 
+printf("\nEnter your choice:");
+scanf("%d",&no);
+if ( 6 == no )
+      exit(1);
+
+
+What is the alternative to the switch case that I can use for menu
+  driven programs
+
+Well, switch-case is exactly made for that. Why think of an alternative?#include<stdlib.h>
+#include<conio.h>
+#include<stdio.h>
+int main()
+{
+    char ch;
+    while(1)
+    {
+        printf("l.print l   c.print c      q. exit  \n");
+        printf("enter choice ");
+        scanf("%c",&ch);
+        switch(ch)
+        {
+            case 'l':
+                    printf("You have typed l \n");
+                    break;
+            case 'c':
+                    printf("yoh have typed c  \n");
+                    break;
+            case 'q':
+                    exit(0);
+        }
+    }
+    return 0;
+}Contiki timer without pausing the processis there a way for wait that a timer expire without pausing the process? If we use 
+ PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+
+we pause the process.
+Suppose we want continue to do other stuff and when the timer expires check if the value of a function has changed.
+If it is not possible, may I have to start a new process that just wait?
+Thank you.No, there isn't - that's a fundamental consequence of how event timers work. Contiki multithreading / multiprocessing is cooperative - processes have to voluntarily pause execution to let other processes run. Since event timers are managed by another (system) process, if your process never gives up execution, the timer process never gets to run. Hence, your process will never get the timer event back.
+Sounds like event timer might not be the best option for you. You can use rtimer instead:
+rtimer_clock_t end = RTIMER_NOW() + RTIMER_SECOND;
+while(RTIMER_CLOCK_LT(RTIMER_NOW(), end)) {
+   /* do stuff */
+}
+
+Remember to poke watchdog timer occasionally - if your process will be stuck doing things for a couple of seconds (not recommended anyway), the watchdog will expire.the normal method is to write a interrupt handler to handle the timer interrupt,
+The interrupt handler has a higher priority than the main application.
+So when the interrupt event occurs, the interrupt handler runs to completion, then execution returns to the main applicationHow to iteratively generate all possible combinations of letters and numbers for matching with a variable length string?I wish to write a iterative logic program where there is an input string and the program starts from length 1 and tries all possible combinations of letters and numbers. If the match is not found, it tries all possible combinations of letters and numbers for length 2 and so on until it finds a match with the input string.
+For example,
+string input = "xG7a";
+// loop all possible combinations for length 1, i.e., 0-9 then A-Z, then a - z
+// check for all if matches the input string
+// loop all possible combinations for length 2, i.e., 00-09, then 0A-0Z, then 0a - 0z. Then 
+// for 10-19, then 1A-1Z, then 1a - 1z ... till z0-z9, then zA-zZ, then za - zz
+// again check for all if matches the input string
+// Keep doing this for lengths 3, 4, 5 and so on till it matches with the input string.
+// exit with status success if match else keep going till infinity
+// This example would exit at length 4 when it matches with "xG7a"
+
+Number of all possible combinations being matched here are (10 + 26 + 26 = 62)  = 62^1 + 62^2 + 62^3 + ... till there is a match.
+EDIT
+More details:
+
+This is part of an exercise on writing brute-forcing logic
+The input string is not known beforehand. The above example is for illustration. I've figured out the rest of the logic. The generated string is being passed into a hash function that generates a hash to match with a password hash in a database. Hence the dynamic nature of the string to be generated.
+It is known beforehand that the password string is only comprised of numbers and lower and upper case letters.
+
+Thank you in advance for all the help.Create a string with all possible characters in the proper order:
+ char charlist[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+Then for each character you want to check, loop through this string build your test string and compare:
+int i, found;
+char str_to_test[5];
+for (i=0, found=0; !found && i<strlen(charlist); i++) {
+    str_to_test[0] = charlist[i];
+    str_to_test[1] = 0;
+    if (!strcmp(str_to_test, target_string)) {
+        found = 1;
+    }
+}
+if (found) {
+    printf("found it!\n");
+} else {
+    printf("not found\n");
+}
+
+Repeat in nested loops for each substring.You say - a bit of pseudocode, I say - full working program!
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define MARGIN 5
+
+// if you're getting errors due to redeclaration of 'strdup', just remove that
+const char *strdup(const char *string) {
+    const size_t len = strlen(string);
+    char *dst = calloc(len + 1, sizeof(char));
+
+    memmove(dst, string, len);
+
+    return dst;
+}
+
+struct NumeralSystem {
+    char *alphabet;
+    size_t base;
+};
+
+struct Word {
+    struct NumeralSystem ns;
+    char *data; // the current combination, null-terminated
+    unsigned int *_internal; // indices of the characters of 'data' in 'ns.alphabet' 
+    size_t length, maxLength;
+};
+
+struct NumeralSystem NewSystem(const char *alpha) {
+    struct NumeralSystem ret = {strdup(alpha), strlen(alpha)};
+
+    return ret;
+}
+
+struct Word NewWordEmpty(const struct NumeralSystem ns, const size_t maxLength) {
+    struct Word ret;
+
+    ret.ns = ns;
+    ret.data = calloc(maxLength + 1, sizeof(char));
+    ret._internal = calloc(maxLength + 1, sizeof(unsigned int));
+    ret.maxLength = maxLength;
+
+    *ret._internal = 0;
+    *ret.data = *ret.ns.alphabet;
+
+    ret.length = 1;
+
+    return ret;
+}
+
+struct Word NewWordPreset(const struct NumeralSystem ns, const char *data) {
+    struct Word ret;
+
+    ret.length = strlen(data);
+
+    const size_t maxLength = ret.length + MARGIN;
+
+    ret.ns = ns;
+    ret.data = calloc(maxLength + 1, sizeof(char));
+    ret._internal = calloc(maxLength + 1, sizeof(unsigned int));
+    ret.maxLength = maxLength;
+
+    memmove(ret.data, data, ret.length);
+
+    for (size_t i = 0; i < ret.length; ++i) {
+        const char *found = strchr(ns.alphabet, ret.data[i]);
+        if (found == NULL) return NULL;
+
+        ret._internal[i] = found - ns.alphabet;
+    }
+
+    return ret;
+}
+
+void EnlargeWord(struct Word *wrd) { // here, wrd->length - wrd->maxLength == 1
+    const size_t newSize = wrd->maxLength + MARGIN;
+
+    wrd->data = realloc(wrd->data, newSize * sizeof(char));
+    wrd->_internal = realloc(wrd->_internal, newSize * sizeof(int));
+
+    memset(wrd->data + wrd->maxLength + 1, 0, MARGIN);
+    memset(wrd->_internal + wrd->maxLength + 1, 0, MARGIN);
+
+    wrd->maxLength = newSize;
+}
+
+void DestroyWord(struct Word *wrd) {
+    free(wrd->data), free(wrd->_internal);
+}
+
+struct Word *next(struct Word *wrd) {
+    int len = (int)(wrd->length - 1); // this can be negative, see below
+
+    // handle the overflow if current digit is equal to the last_digit of the alphabet
+    //   1. last_digit -> first_digit
+    //   2. go to previous position
+    while ((len >= 0) && (wrd->_internal[len] == wrd->ns.base - 1)) {
+        wrd->_internal[len] = 0;
+        wrd->data[len--] = *wrd->ns.alphabet;
+    }
+
+    // if all the digits in the word were equal to the last_digit of the alphabet,
+    // 'len' will be exactly (-1), and the word's length must increase
+    if (len == -1) {
+        wrd->data[wrd->length++] = *wrd->ns.alphabet;
+
+        // UH-OH, we're about to run out of bounds soon!
+        if (wrd->length > wrd->maxLength)
+            EnlargeWord(wrd);
+
+        return wrd;
+    }
+
+    // if 'len' is still nonnegative, it's the position of the digit
+    // that we haven't increased yet
+    wrd->data[len] = wrd->ns.alphabet[++wrd->_internal[len]];
+
+    return wrd;
+}
+
+
+int main(void) {
+    const struct NumeralSystem ns = NewSystem("abcdef");
+    struct Word wrd = NewWordPreset(ns, "deadbeef");
+
+    printf("%s\n", wrd.data);
+
+    for (unsigned int i = 0; i < 30; ++i)
+        printf("%s\n", next(&wrd)->data);
+
+    DestroyWord(&wrd);
+
+    return 0;
+}Defending "U" suffix after Hex literalsThere is some debate between my colleague and I about the U suffix after hexadecimally represented literals. Note, this is not a question about the meaning of this suffix or about what it does. I have found several of those topics here, but I have not found an answer to my question.
+Some background information:
+We're trying to come to a set of rules that we both agree on, to use that as our style from that point on. We have a copy of the 2004 Misra C rules and decided to use that as a starting point. We're not interested in being fully Misra C compliant; we're cherry picking the rules that we think will most increase efficiency and robustness.
+Rule 10.6 from the aforementioned guidelines states:
+
+A “U” suffix shall be applied to all constants of unsigned type.
+
+I personally think this is a good rule. It takes little effort, looks better than explicit casts and more explicitly shows the intention of a constant. To me it makes sense to use it for all unsigned contants, not just numerics, since enforcing a rule doesn't happen by allowing exceptions, especially for a commonly used representation of constants.
+My colleague, however, feels that the hexadecimal representation doesn't need the suffix. Mostly because we almost exclusively use it to set micro-controller registers, and signedness doesn't matter when setting registers to hex constants.
+My Question
+My question is not one about who is right or wrong. It is about finding out whether there are cases where the absence or presence of the suffix changes the outcome of an operation. Are there any such cases, or is it a matter of consistency?
+Edit: for clarification; Specifically about setting micro-controller registers by assigning hexadecimal values to them. Would there be a case where the suffix could make a difference there? I feel like it wouldn't. As an example, the Freescale Processor Expert generates all register assignments as unsigned.Appending a U suffix to all hexadecimal constants makes them unsigned as you already mentioned.  This may have undesirable side-effects when these constants are used in operations along with signed values, especially comparisons.
+Here is a pathological example:
+#define MY_INT_MAX  0x7FFFFFFFU   // blindly applying the rule
+
+if (-1 < MY_INT_MAX) {
+    printf("OK\n");
+} else {
+    printf("OOPS!\n");
+}
+
+The C rules for signed/unsigned conversions are precisely specified, but somewhat counter-intuitive so the above code will indeed print OOPS.
+The MISRA-C rule is precise as it states A “U” suffix shall be applied to all constants of unsigned type.  The word unsigned has far reaching consequences and indeed most constants should not really be considered unsigned.
+Furthermore, the C Standard makes a subtile difference between decimal and hexadecimal constants:
+
+A hexadecimal constant is considered unsigned if its value can be represented by the unsigned integer type and not the signed integer type of the same size for types int and larger.
+
+This means that on 32-bit 2's complement systems, 2147483648 is a long or a long long whereas 0x80000000 is an unsigned int. Appending a U suffix may make this more explicit in this case but the real precaution to avoid potential problems is to mandate the compiler to reject signed/unsigned comparisons altogether: gcc -Wall -Wextra -Werror or clang -Weverything -Werror are life savers.
+Here is how bad it can get:
+if (-1 < 0x8000) {
+    printf("OK\n");
+} else {
+    printf("OOPS!\n");
+}
+
+The above code should print OK on 32-bit systems and OOPS on 16-bit systems. To make things even worse, it is still quite common to see embedded projects use obsolete compilers which do not even implement the Standard semantics for this issue.
+For your specific question, the defined values for micro-processor registers used specifically to set them via assignment (assuming these registers are memory-mapped), need not have the U suffix at all. The register lvalue should have an unsigned type and the hex value will be signed or unsigned depending on its value, but the operation will proceed the same. The opcode for setting a signed number or an unsigned number is the same on your target architecture and on any architectures I have ever seen.With all integer-constants 
+Appending u/U insures the integer-constant will be some unsigned type.
+
+Without a u/U
+
+For a decimal-constant, the integer-constant will be some signed type.
+For a hexadecimal/octal-constant, the integer-constant will be signed  or unsigned type, depending of value and integer type ranges.
+
+
+Note: All integer-constants have positive values.
+//      +-------- unary operator
+//      |+-+----- integer-constant
+int x = -123;
+
+
+
+absence or presence of the suffix changes the outcome of an operation?
+
+When is this important?
+With various expressions, the sign-ness and width of the math needs to be controlled and  preferable not surprising.  
+// Examples: assume 32-bit `unsigned`, `long`, 64-bit `long long`
+
+// Bad       signed int overflow (UB)
+unsigned a = 4000 * 1000 * 1000;  
+// OK
+unsigned b = 4000u * 1000 * 1000;  
+
+// undefined behavior
+unsigned c = 1 << 31
+// OK
+unsigned d = 1u << 31
+
+printf("Size %zu\n", sizeof(0xFFFFFFFF));  // 8  type is `long long`
+printf("Size %zu\n", sizeof(0xFFFFFFFFu)); // 4  type is `unsigned`
+
+//              2 ** 63
+long long e = -9223372036854775808;     // C99: bad "9223372036854775808" not representable
+long long f = -9223372036854775807 - 1; // ok 
+long long g = -9223372036854775808u;    // implementation defined behavior **
+
+some_unsigned_type h_max = -1;  OK, max value for the target type.
+some_unsigned_type i_max = -1u; OK, but not max value for wide unsigned types
+
+// when negating a negative `int`
+unsigned j = 0  - INT_MIN;  // typically int overflow or UB
+unsigned k = 0u - INT_MIN;  // Never UB
+
+** or an implementation-defined signal is raised.For the specific question, which was loading register(s), then the U makes it an unsigned value, but whether the compiler treats the n-bit word pattern as a signed or unsigned value it will move the same bit pattern, assuming there isn't any size extension that would propagate an MSB. The difference that might matter is if the register load operation will set any processor condition flags based on a signed or unsigned loading. As an overall guide if the processor supports storing a constant to configuration register or a memory address then loading a peripheral register is unlikely to set the processor's NEG condition flag. Loading a general purpose register connected to an ALU, one that can be the target of an arithmetic operation like add increment or decrement, might set a negative flag on loading so that e.g. a trailing "branch (if) negative" opcode would execute the branch. You would want to check the processor's references to be sure. Small instruction set processors tend to have only a load register instruction, while larger instruction sets are more likely to have a load unsigned variant of the load instruction that doesn't set the NEG bit in the processor's flags, but again, check the processor's references. if you don't have access to the processor's errata (the boo-boo list) and need a specific flag state. All of this only tends to come up when an optimizing compiler re-aranges code with an inline assembly instruction and other uncommon situations. Examine the generate assembly code, turn off some or all compiler optimizations for the module when needed, etc.How does abort function never return?I was reading the man page for abort() system call and I came across this.
+
+RETURN VALUE
+The abort() function never returns.
+
+I was wondering how this is possible?Calling the abort function results in the program being terminated.
+Therefore, abort does not return.A number of C library functions never return to their caller:
+
+exit() terminates the program, providing an exit status.
+abort() terminates the program with an error message.
+longjmp() transfers control back to the point saved by the corresponding setjmp()
+
+The assembly code either branches directly to an address different from the return address or makes a system call that terminates the program.A function that "never returns" must unconditionally do one of these five things:
+
+Enter an infinite loop (for(;;);)
+Perform a "nonlocal transfer of control" such that some other function appears to return instead (longjmp, swapcontext)
+Invoke a "system call" that causes the operating system to terminate at least the current thread of execution (pthread_exit, _exit, reboot)
+Execute some kind of forbidden or invalid machine operation (invalid instruction, access to unmapped memory, etc), again causing the OS to terminate the process
+Call some other function that does one of the above things.
+
+abort is usually some combination of 5->3, 4, and as a last resort 1, because its contract is to terminate the process after things have already gone horribly wrong: it's not out of the question that the first thing it tries (usually kill(getpid(), SIGABRT)) won't work.
+At a lower level, we could talk about what a "thread of execution" actually is, and how the operating system sets them up and tears them down, and how the OS itself is a program invoked by the bootstrap loader, and if you squint at it the right way, "running a program" is just dynamically modifying the OS's code to include the code for the program and then jumping to it... but maybe you don't want me to reel off an entire operating systems course in this answer box.C's equivalent to Python's "or" in assignmentIn Python you are able to assign values with the "or" operator.
+two = 2 or None 
+In the above expression, two will become equal to 2.
+Can C replicate this? I doubt int two = 2 || NULL; would work, but is there a solution other than an if statement?In Python, a or b works like this:
+
+If bool(a) == True, return a
+If, then, bool(b) == True, return b
+Otherwise, return the last operand, namely, b
+
+So, this is a simple ternary operator: (a)? (a) : (b);
+
+Let's take a look at how Python's logical OR operator works internally:
+>>> import dis
+>>> dis.dis('5 or None')
+  1           0 LOAD_CONST               0 (5)
+              3 JUMP_IF_TRUE_OR_POP      9
+              6 LOAD_CONST               1 (None)
+        >>    9 RETURN_VALUE
+
+So, the or is actually JUMP_IF_TRUE_OR_POP, which is implemented in the CPython source code, line #2939.
+JUMP_IF_TRUE_OR_POP(target) works like this:
+
+If the Top Of the Stack (TOS) is truthy (that is, either it's equal to Py_True, or PyObject_IsTrue(TOS) is greater than zero), set the bytecode counter to target. TOS is popped
+Otherwise, continue execution
+
+It turns out that, as expected, the result is determined with a bunch of if statements.// Option 1
+int two;
+if(2) {
+two = 2;
+} else {
+two = 0;
+}
+
+// Option 2
+int two = 2 ? 2 : 0;How to pass void ** to a C library from JNI C code?1) image_api.h defines following method -
+int process_image(const char *svgData, void **mapData);
+2) now I need to call this method and pass proper values to process_image which is loaded from image_api.so file
+-- Whats the correct approach for creating instance of void** in JNI C wrapper Code ?
+3)
+JNIEXPORT jint JNICALL Java_JNITest_process_image(JNIEnv *env, jstring svgData, jobject mapData, jint status) {
+
+    const char *str;
+    str = (*env)->GetStringUTFChars(env, svgData, NULL);
+    **status = process_image(str,  (void**)&mapData);** 
+
+return status;
+}
+
+////////////
+I am facing UnsatisfiedLinkError while invoking process_image as the method signature not matchingIn your code
+JNIEXPORT jint JNICALL 
+Java_JNITest_process_image(JNIEnv *env, 
+    jstring svgData, 
+    jobject mapData, // this is some Java object, you need to access it
+                     // take a look here: 
+                     // http://jnicookbook.owsiak.org/recipe-No-020/
+    jint status      // you don't need that, and you can't return value
+                     // like this in JNI
+    ) {
+
+    const char *str;
+    str = (*env)->GetStringUTFChars(env, svgData, NULL);
+    // Question is ... what exactly process_image does?
+    // without any additional knowledge about process_image
+    // it is hard to guess what goes here
+    int status = process_image(str, &pointer_to_some_memory_region ); 
+    return status;
+}Based on the updates, without Java the code would have looked like:
+void * mapData; 
+int status = process_image(svgData, &mapData);
+...
+int result = process_MapData(mapData);
+
+Now we want to call process_image and process_MapData from separate native Java methods:
+processImage(svgData, ?);
+...
+int result = processMapData(?);
+
+Note that Java does not have pointers, so we must find some way to wrap void*. Luckily, size of such pointer is 64 bits or less. Java has a standard data type long that is just the right size.
+So, we can use
+native static long processImage(String svgData);
+native static int porocessMapData(long mapPtr);
+...
+long mapPtr = processImage(svgData);
+...
+int result = processMapData(mapPtr);
+
+Here is the C side:
+JNIEXPORT jlong JNICALL Java_JNITest_processImage(JNIEnv *env, jclass clazz, jstring svgData) {
+
+    char *str = (*env)->GetStringUTFChars(env, svgData, NULL);
+    void* mapData;
+    process_image(str, &mapData);
+    (*env)->ReleaseStringUTFChars(env, svgData, str);
+    return (jlong)mapData;
+}
+
+JNIEXPORT jint JNICALL Java_JNITest_processMapData(JNIEnv *env, jlcass clazz, jlong mapData) {
+    return process_mapData((void *)mapData);
+}Difference between char[] and &char[]? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+What exactly is the array name in c?
+
+                                (6 answers)
+                            
+
+Closed 4 years ago.
+
+
+
+I'm trying to better understand the & operator (address-of) for use within an API.
+Here is my example API function signature:
+apiFunction(const int*)
+
+I am working on somebody else's code and they are using the API as follows:
+int inputs[1] = {1};
+apiFunction((const int*)&inputs);
+
+I would think the correct usage should be:
+int inputs[1] = {1};
+apiFunction(inputs);
+
+Is there a difference between 'inputs' and '&inputs' when 'inputs' is a char array with length 1?
+They looks the same when I do a printf, but I fear that I may be formatting it incorrectly:
+printf("%p, %p", inputs, (const int*)&inputs);
+
+Output (for example):
+0204DE94 0204DE94The expression &input has type int (*)[1], i.e. a pointer to an array of size 1.  This is in contrast to input which (in most contexts) decays to a pointer to the first element and has type int *.
+While the address of an array and the address of the first element are the same, the difference in the type of each one comes into play when pointer arithmetic is applied.
+In the context of apiFunction which expects a const int *, you can get away with passing either &input (with a cast) or input as both have the same value.  However, the latter is the proper way to do this:
+apiFunction(inputs);
+
+So you are correct that the code you found is not passing the parameter properly.formatted string input and error in Cstruct account {
+  float interestRate;
+  char accountType[21];
+};
+
+void writeAccounts() {
+  struct account Acc;
+  FILE *fp = fopen("test.txt", "a");
+
+  printf("New interestRate : ");
+  scanf("%f", &Acc.interestRate);
+  printf("New  accountType : ");
+  scanf("%*c%20[^\n]", Acc.accountType);
+
+  fprintf(fp, "%.2f %s\n", Acc.interestRate, Acc.accountType);
+
+  fclose(fp);
+}
+
+int main() {
+  int select = 0;
+
+  do {
+    scanf("%d", &select);
+    switch (select) {
+      case 1:
+        displayAccounts();
+        break;
+      case 2:
+        getRecNo();
+        break;
+      case 3:
+        writeAccounts();
+        break;
+    }
+  } while (select != 0);
+
+  return 0
+
+Above is my code(deleted some unrelated functions) in C.
+When I try to type a string more than 20 characters for the accountType in "writeAccounts" function, program starts to skip few steps until it saves all the characters I have input.
+(CANNOT USE FGETS!! my prof doesnt allow to :/)
+http://imgur.com/a/eKQRu
+
+why is this happening?
+isn't %20[^\n] means its only going to accept 20 characters even if user puts more?
+possible way to prevent this ?why is this happening?
+
+
+The excess input remains in the input buffer and is read by subsequent scanf calls.
+
+
+isn't %20[^\n] means its only going to accept 20 characters even if user puts more?
+
+
+That is correct, and as mentioned any remaining input is not processed.
+
+
+possible way to prevent this ?
+
+
+After a successful scan (20 characters or less) the newline remains in the input buffer. You can do various things.
+Firstly you could check if the next input character is the expected newline:
+if (getchar() != '\n') {
+    // add code here to report the error and take evasive action
+}
+
+Or you could simply truncate and ignore any excess input by cleaning off the buffer:
+int c;
+while ((c = getchar()) != '\n' && c != EOF) {
+    // eats up the input buffer, the code is in the loop control
+}Why can I not assign NULL value to this pointer array element?I am still new to programming in C. I am sorry if this kind of question has already been asked, I did not really know what to search for exactly. 
+As an exercise I am programming a dictionary. The user should be able to add, print, and remove words in this stage of the exercise. Words are stored in a character pointer array called 'dict'. The function 'removeWord'  should make sure the word to be removed is replaced by the last word in the array 'dict'. So the last word should be copied to the element that has to be removed and subsequently the last element should be removed (i.e. assigned the value NULL to). When the word to be removed is the last word in the array 'dict' it should also be removed.
+The program stops running when any word in the array 'dict' is removed except for the last one in the array. When any word except for the last one is removed I want to assign the value NULL to the last element.  
+I hope my question is clear. I really appreciate any help you can provide.
+int numberOfWordsInDict(char **dict)
+{
+    int i,cnt=0;
+    for(i=0;i<10;i++)
+    {
+        if(dict[i]!=NULL)
+        {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+void addWord(char **dict, char *word)
+{
+    int i=0;
+    if(numberOfWordsInDict(dict)==10)
+    {
+        printf("Dictionary is already full!\n");
+    }
+    int k=numberOfWordsInDict(dict);
+    dict[k]=(char*)malloc((strlen(word)+1)*sizeof(char));
+
+    strcpy(dict[k],word);
+}
+
+
+void printDict(char **dict)
+{
+    int i=0;
+    printf("Dictionary:\n");
+    if(numberOfWordsInDict(dict)==0)
+    {
+        printf("The dictionary is empty.\n");
+
+    }else
+    {
+        for(i=0;i<10;i++)
+        {
+        printf("- %s\n", dict[i]);
+        }
+    }
+}
+
+void removeWord(char **dict, char *word)
+{
+    int i,j=0;
+    int swapped=0;
+    j=numberOfWordsInDict(dict);
+    for(i=0;i<j;i++)
+    {
+        if(strcmp(dict[i],word)==0 && swapped==0)
+        {
+        swapped=1;
+        //strcpy(dict[i],dict[j-1]);
+        dict[j-1] = NULL;
+        }
+    }
+
+}
+
+at dict[j-1] the error occurs.
+int main()
+{
+    char wordToBeAdded[36]={};
+    char wordToBeRemoved[36]={};
+    char *dict[10]={};
+    char operation;
+
+    while(1)
+    {
+        printf("Command (a/p/r/q): ");
+        scanf(" %c", &operation);
+
+        switch(operation)
+        {
+            case 'a':
+                printf("Add a word: ");
+                scanf(" %s", &wordToBeAdded);
+                addWord(dict,wordToBeAdded);
+                break;
+
+            case 'p':
+                printDict(dict);
+                break;
+
+            case 'r':
+                printf("Remove a word: ");
+                scanf(" %s", &wordToBeRemoved);
+                removeWord(dict,wordToBeRemoved);
+                break;
+
+            case 'q':
+                return 0;
+        }
+    }
+}The issue is that you access the last item of your dict after it has been removed. When you access the last item in the dict to compare it to the word, it has already been set to null. As Weather Vane commented, you could break when you find the word. That would prevent you from accessing this last item when it has been removed.
+void removeWord(char **dict, char *word)
+{
+    int i,j=0;
+    int swapped=0;
+    j=numberOfWordsInDict(dict);
+    for(i=0;i<j;i++)
+    {
+        if(strcmp(dict[i],word)==0 && swapped==0)
+        {
+            swapped=1;
+            //strcpy(dict[i],dict[j-1]);
+            dict[j-1] = NULL;
+        }
+    }
+
+}
+
+So when i=j-1 if(strcmp(dict[i],word)==0 && swapped==0) this will try to dereference the pointer that you just set to null.Your code is not going to removing any words: as you never change the value of variable j, what it does is just repeatedly set the last pointer to NULL, which is nothing about remove an specific item from the string list.
+Besides that, your code did not free the space of any removed words.
+In addition, your code is bad at the scope of software engineering, which should:
+
+Collect constants to one same location, such as #define DICT_MAX_SIZE 10instead of writing value everywhere.
+Do NOT use meaningless variable names such as i j k when there are better choices which can demonstrate its function clearly, such as dict_size, i_head, i_tail, etc..The problem is in when you iterate through the table and try to read from the pointer with value of NULL.
+When you delete the last word, you will never get there. But if you delete not the last one when you iterate through the table you dereference it. 
+I am not going to change logic of your code (and do not check if it does what the function name promises) - just sanitize the use of pointer by adding the check if it is not NULL
+void printDict(char **dict)
+{
+    int i=0;
+    printf("Dictionary:\n");
+    if(numberOfWordsInDict(dict)==0)
+    {
+        printf("The dictionary is empty.\n");
+
+    }else
+    {
+        for(i=0;i<10;i++)
+        {
+        if(dict[i] != NULL) printf("- %s\n", dict[i]);
+        }
+    }
+}
+
+
+void removeWord(char **dict, char *word)
+{
+    int i,j=0;
+    int swapped=0;
+    j=numberOfWordsInDict(dict);
+    for(i=0;i<j;i++)
+    {
+        if(dict[i] != NULL) 
+           if(strcmp(dict[i],word)==0 && swapped==0)
+           {
+           swapped=1;
+           //strcpy(dict[i],dict[j-1]);
+           free(dict[j-1];
+           dict[j-1] = NULL;
+        }
+    }
+
+}mingw-64 - Install packageI am using mingw_64 and CLion in Windows 10 to try to use a library (https://github.com/libtrading/libtrading) in a simple project, but the library requires some packages to be installed prior the use of the library. The thing is that the installing instructions are for Linux environment as follows:
+# Debian
+$ apt-get install pkg-config libxml2-dev libglib2.0-dev libncurses5-dev \
+    python-yaml libevent-dev
+
+# Fedora
+$ yum install zlib-devel libxml2-devel glib2-devel vim-common ncurses-devel \
+    python-yaml libevent-devel
+
+# OSX
+$ brew install libevent glib pkgconfig
+$ pip install pyyaml
+
+So, how do I install these pre-requisites in my mingw_64 and CLion in Windows 10 environment?If you installed MinGW through MSYS2, you can use the MSYS2 pacman package manager to install additional packages:
+
+The MSYS2 software distribution uses a port of pacman from Arch Linux to manage (install, remove and update) binary packages and also to build those packages in the first place.
+Finding package
+pacman -Ss <name or part of the name of the package>
+Installing a package
+pacman -S <name of the package>
+
+Example:
+$ pacman -Ss libxml2
+mingw64/mingw-w64-x86_64-libxml2 2.9.8-1
+    XML parsing library, version 2 (mingw-w64)
+. . .
+$ pacman -S mingw64/mingw-w64-x86_64-libxml2
+resolving dependencies...
+looking for conflicting packages...
+
+Total Download Size:    1.37 MiB
+Total Installed Size:  11.06 MiB
+
+:: Proceed with installation? [Y/n]
+:: Retrieving packages...
+:: Processing package changes...
+(1/1) installing mingw-w64-x86_64-libxml2           [##################################] 100%
+
+A shorter version of pacman is pacboy. For example, you can specify the :x suffix to install a mingw64 package:
+$ pacboy -S libxml2:xMinGW does not have any package management, so installing dependencies usually means building them yourself from source. For those self-built packages I have a Unix-like directory structure (with the usual bin, lib, include, etc. directories) apart from the MinGW installation.
+Before I expand on that, please check if libTrading supports Windows at all. A quick glance over the libTrading GitHub shows no mention of Windows anywhere. That may mean that the project does not support Windows at all. But then we’re no more talking about configuring a build environment, but adding support for a whole new operating sytem to that project.Here is the way I used
+$ cat /usr/bin/install
+# How to use
+# install rsync
+
+cd /
+
+echo $1
+# echo $2
+
+URL=http://repo.msys2.org/msys/x86_64
+FILE=`wget -O - -o /dev/null $URL | sed -n 's/.*href="\([^"]*\).*/\1/p' | grep -E ^$1 | egrep -v '.sig$' | sort | tail -1f`
+
+echo $FILE
+
+# wget -qO- $URL/$FILE | tar -I zstd -xvf - -C /
+# wget -qO- $URL/$FILE | tar xJvf - -C /
+
+if [[ $FILE == *.zst ]] # * is used for pattern matching
+then
+  wget -qO- $URL/$FILE | tar -I zstd -xvf - -C /
+elif [[ $FILE == *.xz ]]
+then
+  wget -qO- $URL/$FILE | tar xJvf - -C /
+else
+  echo "$FILE is not extracted"
+fi
+
+
+$ install whois
+whois
+
+whois-5.5.9-1-x86_64.pkg.tar.zst
+.BUILDINFO
+.MTREE
+.PKGINFO
+etc/
+etc/whois.conf
+usr/
+usr/bin/
+usr/bin/whois.exe
+usr/share/
+usr/share/man/
+usr/share/man/man1/
+usr/share/man/man1/whois.1.gz
+usr/share/man/man5/
+usr/share/man/man5/whois.conf.5.gzHow to know if a file is a storage device in linuxI am writing a program that writes partition table to and/or cleans a storage device (persistent), may be a SDD/HDD/FDD/USB Flash. 
+But initially I am using stat() to find the details of the path argument passed to my code. I am able to identify if the path is a regular or special file using stat.st_rdev and  I am also able to find the device's major and minor numbers using major()/minor().
+But how can I use this information to distinguish a storage device from any other random device? Is there any range of major/minor numbers to check, between which all devices are one or other type of persistent storage device...
+Or is there something simpler?How are stateful CLR delegates marshaled to native C functions which only take a function pointer(Alternative title: How to implement an equivalent to a CLR delegate in C or C++)
+Consider this C function:
+int Test(int(*fn1)(double a));
+
+If I were to call this function from a C program, I would have no way to pass an arbitrary state object along with my function pointer - I can effectively only work with global state. This is a common issue, which is why many C APIs offer something similar to
+int Test(int(*fn1)(double a, void *state), void *state);
+
+However, to my surprise, I noticed that this is not a problem when calling the first version of the function from a C# program.
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+delegate int CallbackType(double something);
+
+[DllImport("TestLib.dll", CallingConvention = CallingConvention.Cdecl)]
+extern static int Test(CallbackType fn);
+
+When the callback function is called (i.e. in C# code), the this pointer along with all its members is preserved (which automatically implies that additional features like closures and multicast delegates can be made to work easily).
+I didn't understand how the marshaler can squeeze 2 pointers worth of information into 1. I did a whole lot of tests and realised when calling the C function with different instances of TestCallback (i.e. different invocation targets in C#), the function pointer that arrives in C is a different address every time. More precisely, it seems that there is a direct 1:1 mapping between TestCallback instances and unique C function pointer addresses, and that address seems to be persistent - however I was not able to find where that address is stored inside the TestCallback instance.
+I conclude that upon instanciation of TestCallback, which is during the runtime of the program, the CLR must emit an executable native code block into RAM. That code block that calls a dispatcher function with a hard-coded state object pointer (the state object possibly being the specific TestCallback instance for which the code black was emitted).
+However, so far I have found nothing that either confirms or disproves that - either there isn't any in-depth info on this topic, or it's buried by superficial tutorials.
+If that is true, how can that possibly work on an architecture where program memory and data memory are strictly separated, such that the CPU cannot load runtime generated code from the data memory? How does it work on platforms that mandate ahead-of-time compilation? And how can something like that be implemented in a lower level langugate like C or C++?
+
+Some additional code I used for testing:
+C header file ===================
+
+extern __declspec(dllexport) int Test(
+    int(*fn1)(double a), int *address1,
+    int(*fn2)(double a), int *address2,
+    int(*fn3)(double a), int *address3
+);
+
+C file ===================
+
+int Test(
+    int(*fn1)(double a), int *address1,
+    int(*fn2)(double a), int *address2,
+    int(*fn3)(double a), int *address3
+)
+{
+    *address1 = (int)fn1;
+    *address2 = (int)fn2;
+    *address3 = (int)fn3;
+    int result = fn1(5538867.0);
+    result += 9;
+    return result;
+}
+
+C# file ===================
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        var sc1 = new SomeClass(5538867);
+        var sc2 = new SomeClass(-999999);
+        var callback1 = new CallbackType(sc1.TheCallback);
+        var callback2 = new CallbackType(sc2.TheCallback);
+        int called_address1 = 0, called_address2 = 0, called_address3 = 0;
+
+        var result = Test(
+            callback1, ref called_address1,
+            callback2, ref called_address2,
+            callback2, ref called_address3
+            );
+        // should be 9 or 8
+        Console.WriteLine(result);
+        Console.WriteLine(called_address1.ToString("x8"));
+        Console.WriteLine(called_address2.ToString("x8"));
+        Console.WriteLine(called_address3.ToString("x8"));
+
+        result = Test(
+            callback1, ref called_address1,
+            callback2, ref called_address2,
+            callback2, ref called_address3
+            );
+
+        Console.WriteLine(result);
+        Console.WriteLine(called_address1.ToString("x8"));
+        Console.WriteLine(called_address2.ToString("x8"));
+        Console.WriteLine(called_address3.ToString("x8"));
+
+        GC.KeepAlive(callback1);
+        GC.KeepAlive(callback2);
+
+        Console.ReadKey();
+    }
+
+    class SomeClass
+    {
+        public SomeClass(int i)
+        {
+            this.i = i;
+            this.something_else = "sjdklfjksdf";
+        }
+
+        private readonly int i;
+        private readonly string something_else;
+
+        public int TheCallback(double something)
+        {
+            return (int)something - this.i + this.something_else.Length - 11;
+        }
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate int CallbackType(double something);
+
+    [DllImport("TestLib.dll", CallingConvention = CallingConvention.Cdecl)]
+    extern static int Test(
+        CallbackType callback1, ref int called_address1,
+        CallbackType callback2, ref int called_address2,
+        CallbackType callback3, ref int called_address3
+        );
+}I have since found a partial answer.
+
+I conclude that upon instanciation of TestCallback, which is during the runtime of the program, the CLR must emit an executable native code block into RAM. That code block that calls a dispatcher function with a hard-coded state object pointer (the state object possibly being the specific TestCallback instance for which the code black was emitted).
+
+This is correct; when a delegate is instanciated, a Thunk may be generated. It contains instructions to load context data as if they were constants, and then jumps to the actual target function. When the target function returns, it does not return to the thunk (because it does not need to return there), but directly to original caller.
+
+how can that possibly work on an architecture where program memory and data memory are strictly separated, such that the CPU cannot load runtime generated code from the data memory?
+
+It doesn't work if the target platform has no memory that is both writable and executable. This affects non-programmable controllers where the instruction pointer can only point to ROM, for example.
+
+How does it work on platforms that mandate ahead-of-time compilation?
+
+It might not work, at least not on all platforms. On Mono, for example, it requires the MonoPInvokeCallbackAttribute, and only static methods can be used as callbacks, see this MSDN article on Xamarin on iOS.
+
+And how can something like that be implemented in a lower level langugate like C or C++?
+
+It requires manually writing the required X86 (or whatever the target platforms is) load and jump instructions, as bytes, to memory. There are libraries to do that, and the target platform must be known; there is no compiler support for it.
+(NOTE: I could have sworn Hans Passant posted an answer to this question before)How to compile hal mbed on mbed-cliI want to compile and run an example on my nucleo board. I am able to compile and flash using the mbed os api. However I have downloaded the STM32Cube_FW_F4_V1.16.0 package and want to run one of those examples. How do I compile this on mbed-cli or do I have to use an ide like MKD_ARM?you cant compile them on mbed. Mbed uses HAL libraries anyway behind the scenes on STM32 devices but you cant compile those examples on embed.
+The easy way:
+Install openSTM32 package
+Go to import/general/existing projects into workspace
+Find the directory containing your example and SW4STM32 (it contains project files for your IDE)
+
+Do not tick copy project into the workspace as it breaks include paths.
+Finish and you are done.
+Compile, run, enjoyWrong array values returning from a functionI am making this program in which my main function calls a function which returns an array after the calculation. I checked already that calculation is right inside the local function. But when I return that array to 'main' function then I only can print the correct value one time and it prints wrong value all other times.
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <limits.h>
+#include <stdbool.h>
+int* getJoinedPipes(int input1_size, int* input1,int* output_size){
+  int i,j,temp;
+  int op1[input1_size-1];
+  *output_size = input1_size - 1;
+  for(i=0; i<input1_size; i++){
+    for(j=i+1; j<input1_size; j++){
+      if(input1[i] > input1[j]){
+        temp     = input1[i];
+        input1[i] = input1[j];
+        input1[j] = temp;
+      }
+    }
+  }
+
+  op1[0]=input1[0] + input1[1];
+  for(i=1;i<input1_size-1;i++){
+    op1[i] = op1[i-1]+input1[i+1];
+  }
+  //printf("%d\n",op1[2]);
+
+  return op1; 
+}
+
+int main() {
+  int output_size;
+  int* output;
+
+  int ip1_size = 0;
+  int ip1_i;
+  scanf("%d\n", &ip1_size);
+  int ip1[ip1_size];
+  for(ip1_i = 0; ip1_i < ip1_size; ip1_i++) {
+    int ip1_item;
+    scanf("%d", &ip1_item);
+
+    ip1[ip1_i] = ip1_item;
+  }
+  output = getJoinedPipes(ip1_size,ip1,&output_size);
+  printf("a==%d\n",output[0]);
+  printf("a==%d\n",output[0]);
+  printf("a==%d\n",output[0]);
+  int output_i;
+  for(output_i=0; output_i < output_size; output_i++) {
+    printf("%d\n", output[output_i]);
+  }
+
+  return 0;
+}
+
+Output should be 
+5
+9
+15
+
+But in the console, it's showing the following (after dry run).  
+a==5    
+a==1943372821    
+a==1943372821    
+1943372821    
+17    
+6356632
+
+You can see first time its giving correct value (5) and later for same print its giving garbage values.op1 is an automatic array. You cannot return it and use it outside its scope.
+op1 exists only within getJoinedPipes, if you return it, the result is Undefined Behaviour.
+To fix it you can either:
+
+pass op1 as a parameter to getJoinedPiped 
+allocate op1 on the heap dynamically. You you do that, you can safely return op1 but you have to remember to free it when you don't need it.You are returning pointer to a local variable object whose lifetime has ended yet when you are trying to get its values -> horrible mistake and undefined behaviour.
+If you want to return an array from function, allocate it dynamically via malloc, and dont forget to free it after you are done with that array. You should also check return value of malloc if you got memory you asked for.
+Correct
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <limits.h>
+#include <stdbool.h>
+int* getJoinedPipes(int input1_size, int* input1,int* output_size){
+int i,j,temp;
+int * op1 = (int *)malloc(sizeof(int) * (input1_size-1));
+*output_size = input1_size - 1;
+for(i=0; i<input1_size; i++){
+    for(j=i+1; j<input1_size; j++){
+        if(input1[i] > input1[j]){
+            temp     = input1[i];
+            input1[i] = input1[j];
+            input1[j] = temp;
+        }
+    }
+}
+
+op1[0]=input1[0] + input1[1];
+for(i=1;i<input1_size-1;i++){
+    op1[i] = op1[i-1]+input1[i+1];
+}
+//printf("%d\n",op1[2]);
+
+return op1;
+}
+
+int main() {
+int output_size;
+int* output;
+
+int ip1_size = 0;
+int ip1_i;
+scanf("%d\n", &ip1_size);
+int ip1[ip1_size];
+for(ip1_i = 0; ip1_i < ip1_size; ip1_i++) {
+    int ip1_item;
+    scanf("%d", &ip1_item);
+
+    ip1[ip1_i] = ip1_item;
+}
+output = getJoinedPipes(ip1_size,ip1,&output_size);
+printf("a==%d\n",output[0]);
+printf("a==%d\n",output[0]);
+printf("a==%d\n",output[0]);
+int output_i;
+for(output_i=0; output_i < output_size; output_i++) {
+
+    printf("%d\n", output[output_i]);
+
+}
+
+free(output);
+return 0;
+}You should check your indentation... apart from that, I guess the problem could arise because the array you output in your function is created on the function stack. So what you get as an output array is a reference on the stack of your joinedPipes-function. Try to pass your array as an argument to the function and not create it as a return value. 
+Hope that does the trick...Why is socket linger used after socket close?I looked at documentation about this but shouldn't a socket linger be declared before the close so the program doesn't immediately abort before it knows what kind of shutdown to expect? Shouldn't linger be used first to explain to the socket close the shutdown should be one way or another? I'm looking at previously used code and the microsoft documentation but it just seemed odd to me. 
+https://msdn.microsoft.com/en-us/library/windows/desktop/ms738547(v=vs.85).aspx
+From this code, couldn't the socket immediately shutdown from the sockClose and the linger would be ignored? 
+Code:
+  self->socket = sockAccept(srvSocket)
+  sockClose(srvSocket);
+  sockDelay(self->socket, 1);
+  sockBuffer(self->socket, pileSize + sizeof(messages));
+  sockLinger(self->socket);Declaring a struct containing an array of pointers to that type of structI am trying to program a file manager and would like to use folders containing an array of subfolders.
+I was thinking of something like
+struct folder {
+ char* name;
+ struct folder subfolders [10];
+}
+
+Is that possbile in any way?No, it is not possible for a struct type to contain an array of the same type  (since the type would generally be diagnosed as incomplete).   Furthermore, if every variable of that type contained one or more members of the same type, the type definition would be infinitely recursive (an A containing an A containing an A .....).
+However, a struct type can contain a pointer
+struct folder1
+{
+    char* name;
+    struct folder1 *a_subfolder;
+};
+
+or an array of pointers
+struct folder2
+{
+    char* name;
+    struct folder2 *subfolders [10];
+};
+
+In both cases, code which uses theses types need to take care to ensure the pointers are initialised correctly, and that they are worked with sensibly (e.g. not trying to access the value of an uninitialised pointer, not dereferencing NULL, etc).    Read up on pointers before using this sort of construct - getting things wrong with pointers often means a program that crashes in gruesome ways.No, you cannot do this, you need to do this:
+struct folder {
+ char* name;
+ struct folder *subfolders [10];
+}
+
+Now a variable of type struct folder contains 10 pointers to variables of type struct folder.
+Before going on, you absolutely need to get familiar with pointers and dynamic memory allocation.
+Look into linked lists and binary trees first which use a similar concept. There are tons of examples and tutorials on the web (Google "c linked list example").
+Your solution:
+struct folder {
+ char* name;
+ struct folder subfolders [10];
+}
+
+doesn't make sense, because each struct folder would contain again 10 struct folder, each of which would contain 10 struct folder and so on until infinity.
+But be aware that with your concept each folder can only contain 10 subfolders at most.struct folder {
+ char* name;
+ struct folder subfolders [10];  // bad
+}
+
+Is is not possible that way per @Peter fine answer as struct folder is not fully defined before its complete definition is needed.
+`
+
+Is that possible in any way?
+
+Yes, consider dynamically allocation:
+Make functions to create, add a sub-folder, and delete.  Many refinements possible.
+typedef struct folder_s {
+  char* name;
+  size_t n;
+  struct folder_s **subfolder;
+} folder;
+
+folder *folder_alloc(const char *name) {
+  folder *root = malloc(sizeof *root);
+  if (root) {
+    root->n = 0;
+    root->subfolder = NULL;
+    root->name = strdup(name);
+    if (root->name) {
+      return root;
+    }
+    free(root);
+  }
+  return NULL;
+}
+
+folder *folder_add_subfolder(folder *f, folder *sf) {
+  size_t new_n = f->n + 1;
+  void *tmp = realloc(f->subfolder, sizeof *(f->subfolder) * new_n);
+  if (tmp == NULL) {
+    return NULL;
+  }
+  f->subfolder = tmp;
+  f->subfolder[f->n] = sf;
+  f->n = new_n;
+  return f;
+}
+
+// Only need to free the root folder, recursion will handle the sub-folders.
+void folder_free_tree(folder *f) {
+  if (f) {
+    while (f->n > 0) {
+      f->n--;
+      folder_free_tree(f->subfolder[f->n]);
+    }
+    free(f->subfolder);
+    f->subfolder = NULL; // Useful for debug
+    free(f->name);
+    f->name = NULL;  // Useful for debug
+    free(f);
+  }
+}The short answer is yes, something to that effect would work. You might want to add a struct folder parentfolder so you can navigate up as well as down.Cannot copy strings from pointer array with strcpy in C? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+Why do I get a segmentation fault when writing to a "char *s" initialized with a string literal, but not "char s[]"?
+
+                                (19 answers)
+                            
+
+Closed 4 years ago.
+
+
+
+I am doing an exercise where a character pointer array is functioning as a way to store words. I do not understand why I cannot use 'strcpy' to copy the word 'hoi' to the second element of the array in the main function. When I compile the code I get the message 'program has stopped working' in CodeBlocks.
+The functions 'numberOfWordsInDict' and 'printDict' are working properly.
+Thanks in advance.
+int numberOfWordsInDict(char **dict)
+{
+    int i, cnt = 0;
+    for(i = 0; i < 10; i++)
+    {
+        if(dict[i] != NULL)
+        {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+void printDict(char **dict)
+{
+    int i = 0;
+    printf("Dictionary:\n");
+    if(numberOfWordsInDict(dict) == 0)
+    {
+        printf("The dictionary is empty.\n");
+    } else
+    {
+        for(i = 0; i < 10; i++)
+        {
+            printf("- %s\n", dict[i]);
+        }
+    }
+}
+
+int main()
+{
+    char *dict[10] = {
+            "aap", "bro ", "jojo", "koe", "kip", 
+            "haha", "hond", "    drop", NULL,NULL};
+
+    char *newWord1 = "hoi";
+    printDict(dict);
+    strcpy(dict[1], newWord1);
+    printDict(dict);
+
+    return 0;
+}The array dict is an array of pointers to string literals.
+In this statement
+strcpy(dict[1],newWord1);
+
+you are trying to copy one string literal in another string literal.
+String literals are non-modifiable in C and C++. Any attempt to modify a strig literal results in undefined behavior of the program.
+From the C Standard (6.4.5 String literals)
+
+7 It is unspecified whether these arrays are distinct provided their
+  elements have the appropriate values. If the program attempts to
+  modify such an array, the behavior is undefined.
+
+You should declare a two-dimensional character array if you are going to copy string literals in its elements or a one dimensional array of dynamically allocated character arrays.
+The program can look the following way
+#include <stdio.h>
+#include <string.h>
+
+#define N   9
+
+size_t numberOfWordsInDict( char dict[][N] )
+{
+    size_t n = 0;
+
+    while ( *dict[n] ) ++n;
+
+    return n;
+}
+
+void printDict( char dict[][N] )
+{
+    printf("Dictionary:\n");
+
+    size_t n = numberOfWordsInDict( dict );
+    if ( n == 0 )
+    {
+        printf("The dictionary is empty.\n");
+    } 
+    else
+    {
+        for ( size_t i = 0; i < n; i++ )
+        {
+            printf( "- %s\n", dict[i] );
+        }
+    }
+}
+
+int main(void) 
+{
+    char dict[10][9] = 
+    {
+        "aap", "bro ", "jojo", "koe", "kip", "haha", "hond", "    drop"
+    };
+    char *newWord1 = "hoi";
+
+    printDict(dict);
+    strcpy(dict[1], newWord1);
+    printDict(dict);
+
+    return 0;
+}
+
+The program output is
+Dictionary:
+- aap
+- bro 
+- jojo
+- koe
+- kip
+- haha
+- hond
+-     drop
+Dictionary:
+- aap
+- hoi
+- jojo
+- koe
+- kip
+- haha
+- hond
+-     drop
+
+Or you could use a Variable Length Array.
+Keep in mind that according to the C Standard the function main without parameters shall be declared like
+int main( void )Since "bro" is a string constant and dict[1] points to it, dict[1] points to a string constant.
+When you use strcpy(dict[1]), ...,  you are trying to modify the thing that dict[1] points to. But it points to a constant. So you are trying to modify a constant.
+Constants cannot be modified.The memory the pointers point to is read-only as "string" is a string literal.To my understanding it is impossible to write to string literals.You need to reserve storage space in the RW memory and the copy the literals there. You do not have to do it manually :)
+#define MAXDICTSIZE 25
+
+int numberOfWordsInDict(char dict[][MAXDICTSIZE], int dictsize)
+{
+    int i, cnt = 0;
+    for (i = 0; i < dictsize; i++)
+    {
+        if (strlen(dict[i]))
+        {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+void printDict(char dict[][MAXDICTSIZE], int dictsize)
+{
+    int i = 0;
+    printf("Dictionary:\n");
+    if (numberOfWordsInDict(dict, dictsize) == 0)
+    {
+        printf("The dictionary is empty.\n");
+    }
+    else
+    {
+        for (i = 0; i < dictsize; i++)
+        {
+            if(strlen(dict[i]))printf("- %s\n", dict[i]);
+        }
+    }
+}
+
+and somewhere in the main()
+char dict[10][MAXDICTSIZE] = {
+    "aap", "bro ", "jojo", "koe", "kip",
+    "haha", "hond", "    drop", "","" };
+
+char *newWord1 = "hoi";
+printDict(dict, sizeof(dict)/sizeof(dict[1]));
+strcpy(dict[1], newWord1);
+printDict(dict, sizeof(dict) / sizeof(dict[1]));In a function call, what is the operator, and what are the operands?I am trying to understand some basics of C. KRC's The C Programming Language says
+
+A function call is a postfix expression, called the function designator, followed by parentheses containing  a  possibly  empty,  comma-separated  list  of  assignment  expressions  (Par.A7.17), 
+  which  constitute  the  arguments  to  the  function. 
+
+
+In a function call, what is the operator, and what are the operands?
+Is () the operator?
+Is the function name an operand?
+Are the arguments inside () operands?
+Is a function designator a synonym of a function call?
+
+Thanks.In a function call, () is an operator just like [] is an operator when accessing an array element.
+6.5.2 Postfix operators  
+
+Syntax
+1 postfix-expression:
+primary-expression
+postfix-expression [ expression ]
+postfix-expression ( argument-expression-listopt )
+postfix-expression . identifier
+postfix-expression -> identifier
+postfix-expression ++
+postfix-expression --
+( type-name ) { initializer-list }
+( type-name ) { initializer-list , }
+
+argument-expression-list:
+assignment-expression
+argument-expression-list , assignment-expression  
+
+
+Operand for this operator is the function name (or a pointer to the function).  
+
+Are the arguments inside () operands?  
+
+No. As per the C standard the list of expressions specifies the arguments to the function.The text in the C standard is nearly identical, 6.5.2.2:
+
+A postfix expression followed by parentheses () containing a possibly
+  empty, comma-separated list of expressions is a function call. The
+  postfix expression denotes the called function. The list of
+  expressions specifies the arguments to the function.
+
+The syntax is (6.5.2):
+postfix-expression ( argument-expression-listopt )
+
+This means that the function name is a "postfix-expression" and the ( ) is the actual operator. The C standard does not speak of operands for this operator, but I suppose you could call the function name an operand. The argument list is not an operand, but rather a special case.
+
+The definition of a function designator is (6.3.2.1):
+
+A function designator is an expression that has function type.
+
+Meaning in the expression func();, func would be the function designator but the expression as whole would be a function call. So it is not exactly the same term. 
+Consider the example funcptr_t f = func; which involves the function designator func but no function call.linux kernel code navigation [closed]Closed. This question is opinion-based. It is not currently accepting answers.
+                        
+                    
+
+
+
+
+
+
+
+
+
+
+Want to improve this question? Update the question so it can be answered with facts and citations by editing this post.
+                
+Closed 4 years ago.
+
+
+
+
+                        Improve this question
+                    
+
+
+
+I have a question about C code navigation. 
+In C++ or Java it's easy to navigate throught code. For example if there are 3 subsystems (3 classes) DatebaseSubsystem, HardwareSubsystem, ServerSubsystem, and any entity in project use them, I can see all calls to concrete subsystem by class name (static methods calls) or by member (object methods calls). It is enough to select member or class and click find usage in IDE.
+In C I can't understand how developers navigate through code. For example  there is a kernel driver, which uses a few subsystems. For example in USB subsystem there are  200 C interface functions. I want to see which functions from USB subsystem are used by driver.  How can I figure out this? Functions from USB subsystem don't have the same prefix. Do kernel developers write scripts for this or do they use any tool, which can do this job?Create Documentation using Doxygen and non-Doxygen commented source codeWe got here some like 10 years old C and C++ code, without documents or manual. However the source is documented in the header files quite good, but it is a lot of working going through all the files looking for an information. It looks like this:
+// Description description ....
+//
+// @param parameter 1 name:
+// description of parameter 1
+//
+// @param parameter 2 name:
+// description of parameter 2
+//
+Returntype Functionname(parameter1, parameter2);
+
+Using doxygen wizard a documentation can be created but all the comments are lost, because they are not formated in a way the parser understands.
+So is that a format i dont know? Can i teach the parser what to do? Or is it a special format that is used by another software?I wrote a python script, to convert the comments to a format the parser understands. It's not pretty, it's not safe, but it works for us.
+import re
+import time
+import os
+import shutil
+
+def convertHeaderDocumentation(file):
+
+    with open(file) as f:
+        lines = f.readlines()
+    lines = [line.rstrip('\n') for line in lines]
+
+    scanning = False
+    commentLines = []
+
+    convertedDocument = ""
+    declaration = ""
+
+    for line in lines:
+
+        if line == "" or \
+           line.strip().startswith("#"):
+            if len(commentLines) > 0:
+                convertedDocument += ''.join(el + "\n" for el in commentLines)
+                commentLines.clear()
+            convertedDocument += line + "\n"
+
+            continue
+
+        if line.strip().startswith('//'):
+            if not scanning:
+                commentLines.clear()
+                scanning = True
+
+            commentLines.append(line)
+        else:
+
+            if scanning:
+                if line.strip() != "":
+
+                    declaration = line.strip()
+
+                    match = re.search('\s*\w*\s*(\w+)\s+(\w+).*\((.*)[^)].*;', declaration)
+                    if not match is None:
+                        # check for function description
+                        description = ""
+                        for line in commentLines:
+                            if line[2:].strip().startswith("@") or \
+                               line[2:].strip() == "":
+                               break
+                            else:
+                                description += line[2:].strip()
+
+                        # scan for parameter description
+                        parameters = []
+                        parameter = ""
+                        scanning = False
+                        for line in commentLines:
+                            # start scanning, if line starts with @
+                            if line[2:].strip().startswith("@") and \
+                               scanning == False :
+                                # if present add to parameter lst
+                                if parameter != "":
+                                    parameters.append(parameter)
+
+                                scanning = True
+                                parameter = line[2:].strip() + " "
+                                continue
+
+                            # stop scanning if an empty line is read
+                            if line[2:].strip() == "":
+                                scanning = False
+
+                                # save if parameter is in buffer
+                                if parameter != "":
+                                    parameters.append(parameter)
+                                    parameter = ""
+
+                            if scanning == True and line[2:].strip() != "":
+                                parameter += line[2:].strip()
+
+
+                        convertedDocument += "/**\n"
+                        convertedDocument += " * @fn    " + declaration[:-1] + "\n"
+                        convertedDocument += " *\n"
+
+                        convertedDocument += " * @brief "
+                        restLine = 80 - len(" * @brief ")
+                        for index in range(0, len(description), restLine):
+                            convertedDocument += description[index:index + restLine] + "\n *        "
+                        convertedDocument += "\n"
+
+                        for parameter in parameters:
+                            convertedDocument += " * " + parameter + "\n *\n"
+
+                        convertedDocument += " * @return " + match.group(1) + "\n"
+                        convertedDocument += " *\n"
+
+                        convertedDocument += " * @date  " + time.strftime("%d.%m.%Y") + "<br> parsed using python\n"
+                        convertedDocument += " */\n"
+                        convertedDocument += declaration + "\n\n"
+
+                        commentLines.clear()
+
+                else :
+                    convertedDocument += ''.join(el + "\n" for el in commentLines)
+                    commentLines.clear();
+
+
+    return convertedDocument
+
+projectDir = "path to source files goes here"
+projectDir = os.abspath(projectDir)
+parentProjectDir, projectDirName   = os.path.split(projectDir)
+convertedDir     = os.path.join(parentProjectDir, "converted")
+print(convertedDir)
+
+
+for root, dirs, files in os.walk(projectDir):
+
+    # create directory structure if not present
+    tmpConvertedDir = os.path.join(convertedDir, root[len(projectDir) + 1:])
+    if not os.path.exists(tmpConvertedDir):
+        os.makedirs(tmpConvertedDir)
+
+    for file in files:
+
+        filename, fileextension = os.path.splitext(file)
+        # only copy/convert c++/c source files
+        if fileextension in {'.h','.c','.cpp'} :
+            newPath = os.path.join(tmpConvertedDir, file)
+            print(newPath)
+
+            # convert header files
+            if fileextension in {'.h'}:
+                #print("convert ", os.path.join(root, file), " to ", newPath)
+                converted = convertHeaderDocumentation(os.path.join(root, file))
+
+                with open(newPath, 'w') as f:
+                    f.write(converted)
+
+            # copy source files
+            else:
+                print("copy ", os.path.join(root, file), " to ", newPath)
+                shutil.copyfile(os.path.join(root, file), newPath)
+
+The function declaration was a bit tricky to catch with regex. For my case
+\s*\w*\s*(\w+)\s+(\w+).*\((.*)[^)].*; works just fine, but without any extra keywords a lazy quantifier is going to be more acurate for keywords before the returntype \s*\w*?\s*(\w+)\s+(\w+).*\((.*)[^)].*;
+All C and C++ files in a given projectDir directory and subfolders are converted if they are header files or just copy if they are source files. Therefore a directory ..\converted is created which contains the copied/converted files. 
+With the resulting files doxygen wizard created a sufficient documentation. Maybe this is going to help someone :-)How many registers are used when a variable is declared using register storage class?My question is simply, how many registers will a C compiler use for a variable declared using register storage class as :
+register int a. I have read this answer How many register and what kind of register are available for the storage class REGISTER in c language but could not understand much. I know it can be implementation dependent, but then this registers are limited, so when would the compiler ignore the declaration or will it generate an error?C11 still supports register:
+
+A declaration of an identifier for an object with storage-class
+  specifier register suggests that access to the object be as fast as
+  possible. The extent to which such suggestions are effective is
+  implementation-defined.
+
+In notes:
+
+The implementation may treat any register declaration simply as an
+  auto declaration.
+
+So how many registers will be used? One possible answer is 'none' because the keyword may be ignored.
+That said, in practice it's very rare for an implementation on any modern platform to define intwith a width that is wider than width of a typical platform 'word'. So if an implementation respects register int a; it's unlikely register int a will be allocated to more than one register and register int a may be 0,1 or 2 registers.
+Of course on some hardware not all registers are the same size and sometimes different instructions treat registers as separate or joined. How many registers may not be meaningful.
+As others point out use of the keyword is widely discouraged in C. Indeed its meaning now removed from C++ (though the keyword retained as reserved).
+I think that would be draconian in C which still looks to micro-controller environments where programmers come closest to want to dictate such details.
+All that said 'back in the day' (25 years ago) I worked with a compiler that ignored register but allocated the first 2 (I think) declared variables used as loop counters to registers and in the case in question the third loop in the function was longest and performance noticeably improved by declaring the big loop index first. 
+That all seems a very long time ago and no one should take it as the modern experience.The register is a suggestion for the compiler to keep the variable in the register if possible. But the modern compilers just ignore it. So the answering your question - it can be zero or more  the compiler will decide depending on the optimisation options used.
+Some compilers have special form of binging variables to the register.
+gcc version
+       register int *foo asm ("r12");
+
+it can be global or local binding.
+global binding: the register variable is kept in the register for the whole program execution, the register is taken out form the compiler register pool. It can make compiler optimisations less effective.
+local binding: the register variable is tied to the register only in the scope of the function.
+But it is not guaranteed that the library routines which were compiled without -ffixed-reg option will keep this register unaffected. Same is with the setjump & longjump as restoring of the content of registers is machine specific.
+Deep understanding of the machine code generation is required to use it efficiently. Rarely used nowadays. Use examples - reducing latency in response to the interrupt requests and similar.Accessing HDMI hardware register in CI am trying to access the HDMI hardware registers on a Phytec MIRA board using C. This is my first real step into embedded programming.
+The memory address for the Design ID register, according to the i.MX 6 Reference Manual, is 0x120000 (See page 1568).
+I wrote some code to try to access this register, and it just gives a segmentation fault when I try to dereference the pointer.
+Can anyone tell me what I am doing wrong and point me in the right direction please?
+Minimal reproducing code below:
+#include <stdio.h>
+#include <inttypes.h>
+
+int main()
+{
+  uint8_t const volatile * const HDMI_DESIGN_ID = (uint8_t const volatile * const)(0x120000);
+  printf("Design ID: %u\n", *HDMI_DESIGN_ID);
+  return 0;
+}How to subtract two time_t values (difftime returns double instead time_t)?time_t this is platform dependent type. I found difftime which returns difference in seconds, but I did not find function for simple subtraction without any convertations. How I know standard does not does not guarantee that will go consistently throughout the whole time continuum and does not told anything about encoding of time_t. Also it does not told that two different time_t will not represent one time moment. But I'm not sure about this in real life.
+
+The time_t datatype is a data type in the ISO C library defined for
+  storing system time values. Such values are returned from the standard
+  time() library function. This type is a typedef defined in the
+  standard  header. ISO C defines time_t as an arithmetic type,
+  but does not specify any particular type, range, resolution, or
+  encoding for it. Also unspecified are the meanings of arithmetic
+  operations applied to time values.
+Unix and POSIX-compliant systems implement time_t as an integer or
+  real-floating type (typically a 32- or 64-bit integer) which
+  represents the number of seconds since the start of the Unix epoch:
+  midnight UTC of January 1, 1970 (not counting leap seconds). Some
+  systems correctly handle negative time values, while others do not.
+  Systems using a signed 32-bit time_t type are susceptible to the Year
+  2038 problem.]
+https://en.wikipedia.org/w/index.php?title=Time_t&oldid=450752800
+
+I meant I need time_t in return:
+time_t v1;
+time_t v2;
+time_t diff;
+
+diff = some_substract_fct(v2, v1)
+
+Is it safe to compare/substract two time_t without difftime? E.g.:
+time_t v1;
+time_t v2;
+time_t diff;
+
+if (v2 > v1)
+{
+    ....
+}
+
+if (v2 == v1)
+{
+    ....
+}
+
+v3 = v2-v1;
+
+instead
+if (difftime(v2, v1) > 0)
+{
+}
+
+if (difftime(v2, v1) == 0.0)
+{
+}
+
+diff = some_substract_fct(v2, v1)Quoting the C11 Standard:
+
+7.27.2.4 The time function
+Description
+The time function determines the current calendar time. The encoding of the value is unspecified.
+Returns
+The time function returns the implementation’s best approximation to the current calendar time. The value (time_t)(-1) is returned if the calendar time is not available. If timer is not a null pointer, the return value is also assigned to the object it points to.
+
+Hence you cannot make any assumptions on the encoding or meaning of time_t values. Different values may represent the same time, comparison with < etc. are meaningless, and the same for the regular arithmetic subtraction with -.
+On POSIX compliant systems however, the time_tvalue, whose type is still unspecified, represents the number of seconds since Jan 1st, 1970 UTC. So you can compare, subtract and add values with the expected behavior.  On other systems, you may need to use system specific functions to retrieve the current time in a specified format or use difftime() to compute time differences in seconds.
+Note also that another standard function might be available on your system that will provide more accurate timestamps in a specified format:
+
+7.27.2.5 The timespec_get function
+Synopsis
+ #include <time.h>
+ int timespec_get(struct timespec *ts, int base);
+
+Description
+The timespec_get function sets the interval pointed to by ts to hold the current calendar time based on the specified time base.
+  If base is TIME_UTC, the tv_sec member is set to the number of seconds since an implementation defined epoch, truncated to a whole value and the tv_nsec member is set to the integral number of nanoseconds, rounded to the resolution of the system clock.
+Returns
+If the timespec_get function is successful it returns the nonzero value base; otherwise, it returns zero.How to render part of the texture inside the quad in opengl es using shadersI am trying to render some part of the texture inside my quad using the shader and an object file (.pod) which is nothing but container format of holding the vertices, normals and UVs. 
+so, just imagine i made a simple quad using 3ds max and export it as .pod and load into my scene from world to MVP . it has UVs as (0,0)(1,0)(0,1)(1,1) .. now I have a texture(.pvr) of 1024x128 pixels. I have sent all the data from cpp to vertex shader using appropriate buffers and everything is working fine. 
+Now question is, I want to render only some of the texture, lets say, starting from 200,30(left,bottom) pixels to 500,100(width,height). 
+How can I achieve the above using the vertex shader. I have written some logic in vertex shader, which acc to me is working for (0,0) coordinates, but how can I define height, width as there is only one vec2 variable. Below is the logic in vertex shader... 
+varying mediump vec2   TexCoord;
+attribute mediump vec2  inTexCoord;
+
+TexCoord.x = inTexCoord.x * (1024.0/(1024.0-200.0))-(200.0/1024.0);
+TexCoord.y = inTexCoord.y * (128.0/(128.0-30.0))-(30.0/128.0);
+
+same logic and values are working for all the UVs, Dont know how to mention height, width in it. and above code is doing some trick but not what I am expecting. it is repeating the texture inside the quad.
+ Instead I want to render only (200,30,500,100)(l,b,w,h) part of the texture and that too inside the quad showing black boundary on the side of the quad from 0-127 pixels and 0-30 pixels from left and bottom respectively and black border from 629th pixel to 1024 from right .
+I am trying to make A video wall project where TVs will be rotated in diff diff angles.The correct calculation from mapping frmo [0, 1] to a start (s) and a length (l) is
+x_mapped = x * l + s
+
+When looking at your special problem, you should be using:
+TexCoord.x = inTexCoord.x * (width/1024.0)  + (left/1024.0);
+TexCoord.y = inTexCoord.y * (height/1024.0) + (bottom/1024.0);So,I was trying more on this to work, either efficient or inefficient way, below is what I have implemented in the fragment shader and seems like working out for me..please check once n let me know any optimization can be made on this. Below code will draw only the part of the texture i want to see in screen at the same place in the quad. 
+const float MAX_WIDTH = 1280.0;
+const float MAX_HEIGHT = 720.0;
+
+const float LEFT = 00.0;
+const float TOP = 00.0;
+const float WIDTH = 500.0;
+const float HEIGHT = 500.0;
+
+void main()
+{
+    vec2 p = TexCoord;
+    float xx,xw,yy,yh,b;
+
+    xx = (LEFT/MAX_WIDTH);
+    xw = ((LEFT + WIDTH)/MAX_WIDTH);
+    yy = (TOP/MAX_HEIGHT);
+    yh = ((TOP + HEIGHT)/MAX_HEIGHT);
+
+    if((p.x > xx) && (p.x < xw) && (p.y > yy) && (p.y < yh))
+            b = 1.0;
+    else
+            b = 0.0;
+    gl_FragColor = vec4((texture2D(sTexture, TexCoord).rgb),texture2D(sTexture,TexCoord).a * b);
+
+}
+
+This below part in vertex shader will load only the part of texture which i want to see but covering the whole quad.
+    TexCoord.x = inTexCoord.x * (WIDTH/MAX_WIDTH)+(LEFT/MAX_WIDTH);
+    TexCoord.y = inTexCoord.y * (HEIGHT/MAX_HEIGHT)+(TOP/MAX_HEIGHT);
+
+Thanks for solving this.. @BDLWhat does dereferencing and printing the pointer a do in this situation? [duplicate]This question already has answers here:
+                        
+                    
+
+
+
+How to access a local variable from a different function using pointers?
+
+                                (10 answers)
+                            
+
+
+Can a local variable's memory be accessed outside its scope?
+
+                                (21 answers)
+                            
+
+Closed 4 years ago.
+
+
+
+I am running the following code:
+int* range(int start, int end, int step){
+    int size = (end - start)/step;
+    int out[size];
+    for(int i = 0, j = start; i < size; i++, j += step){
+        out[i] = j;
+    }
+    return out;
+}
+
+int main()
+{
+    int *a = range(1, 5, 1);
+    printf("%i\n", *a);
+    printf("%i\n", *a);
+    return 0;
+}
+
+I get 1 on the first line, as expected, and some garbage value on the second (6422260 for instance). What is the explanation? I would expect to get 1 on both lines.If this:
+int out[size];
+
+doesn't appear in file scope (in other words, appears inside a function), it defines a variable with automatic storage duration. This means the variable only exists as long as execution is inside its scope (which is the nearest set of braces). Once the scope is left, the variable is gone.
+Returning an array isn't possible in C, return out instead returns a pointer to the array's first element. So you see the problem: The pointer points to an object that doesn't exist any more.
+
+Now with your code, the first call to printf() seems to work. This is "by accident" (it's not guaranteed at all), but can be explained: In your implementation, nothing changes the memory where your array was located, until another function (here printf()) is called and overwrites this memory with its own local variables.
+
+How to do this correctly: There are several possibilities:
+
+Let the caller provide the array.
+return a pointer to an allocated array using malloc() as shown in anoher answer, caller has to free() it.
+Add a static to the array definition, which gives it static storage duration (for the whole execution time of the program), but be aware of a severe consequence of this: there's only one instance of this array forever, creating all sorts of problems, so, better don't.
+
+IMHO, 1. is the most idiomatic C way of doing this, using your original code:
+void range(int *out, int start, int end, int step){
+    int size = (end - start)/step;
+    for(int i = 0, j = start; i < size; i++, j += step){
+        out[i] = j;
+    }
+}
+
+int main()
+{
+    int a[5];
+    range(a, 1, 5, 1);
+    printf("%i\n", *a);
+    printf("%i\n", *a);
+    return 0;
+}C it skip one if everytimeI have a problem with 2 if.
+The First If is true because xb == 0 but the next is false because yb==1. In the else if statement both conditions are satisfied.
+xb = 0;
+yb = 1;
+xz = 0;
+yz = 0;
+if (xb == 0) {
+    if (yb == 0) {
+        ...
+    }
+} else if(xb == 0) {
+    if (yb == 1) {
+        ...
+    }
+}
+
+Why is the else if skipped, when both are true?The third if is executed only if the first if test is false because of the else keyword.
+Change your ifs to this:
+xb = 0;
+yb = 1;
+xz = 0;
+yz = 0;
+if (xb == 0) {
+    if (yb == 0) {
+        // both xb and yb and 0 ...
+    } else
+    if (yb == 1) {
+        // xb is 0 and yb is 1 ...
+    }
+} else {
+    if (yb == 0) {
+        // xb is not 0 and yb is 0 ...
+    } else
+    if (yb == 1) {
+        // xb is not 0 and yb is 1 ...
+    }
+}How to properly add hex escapes into a string-literal?When you have string in C, you can add direct hex code inside.
+char str[] = "abcde"; // 'a', 'b', 'c', 'd', 'e', 0x00
+char str2[] = "abc\x12\x34"; // 'a', 'b', 'c', 0x12, 0x34, 0x00
+
+Both examples have 6 bytes in memory. Now the problem exists if you want to add value [a-fA-F0-9] after hex entry.
+//I want: 'a', 'b', 'c', 0x12, 'e', 0x00
+//Error, hex is too big because last e is treated as part of hex thus becoming 0x12e
+char problem[] = "abc\x12e";
+
+Possible solution is to replace after definition.
+//This will work, bad idea
+char solution[6] = "abcde";
+solution[3] = 0x12;
+
+This can work, but it will fail, if you put it as const.
+//This will not work
+const char solution[6] = "abcde";
+solution[3] = 0x12; //Compilation error!
+
+How to properly insert e after \x12 without triggering error?
+
+Why I'm asking? When you want to build UTF-8 string as constant, you have to use hex values of character if it is larger than ASCII table can hold.Use 3 octal digits:
+char problem[] = "abc\022e";
+
+or split your string:
+char problem[] = "abc\x12" "e";
+
+
+Why these work:
+
+Unlike hex escapes, standard defines 3 digits as maximum amount for octal escape. 
+
+6.4.4.4 Character constants
+...
+octal-escape-sequence:
+    \ octal-digit
+    \ octal-digit octal-digit
+    \ octal-digit octal-digit octal-digit
+
+...
+hexadecimal-escape-sequence:
+    \x hexadecimal-digit
+    hexadecimal-escape-sequence hexadecimal-digit
+
+
+String literal concatenation is defined as a later translation phase than literal escape character conversion.
+
+5.1.1.2 Translation phases
+...
+
+Each source character set member and escape sequence in character constants and
+  string literals is converted to the corresponding member of the execution character
+  set; if there is no corresponding member, it is converted to an implementation-
+  defined member other than the null (wide) character. 8)
+Adjacent string literal tokens are concatenated.Since string literals are concateneated early on in the compilation process, but after the escaped-character conversion, you can just use:
+char problem[] = "abc\x12" "e";
+
+though you may prefer full separation for readability:
+char problem[] = "abc" "\x12" "e";
+
+
+For the language lawyers amongst us, this is covered in C11 5.1.1.2 Translation phases (my emphasis):
+
+
+Each source character set member and escape sequence in character constants and string literals is converted to the corresponding member of the execution character set; if there is no corresponding member, it is converted to an implementation-defined member other than the null (wide) character.
+
+Adjacent string literal tokens are concatenated.Why I'm asking? When you want to build UTF-8 string as constant, you have to use hex values of character is larger than ASCII table can hold.
+
+Well, no. You don't have to. As of C11, you can prefix your string constant with u8, which tells the compiler that the character literal is in UTF-8.
+char solution[] = u8"no need to use hex-codes áé§µ";
+
+(Same thing is supported by C++11 as well, by the way)getnameinfo() compile time error - Extracting MAC address in LinuxI have to send to the server the IP address and MAC address of the network interface from which my client socket is connected and communicating with the server.
+All machines are on intra-net.
+I have extracted the IP of my socket and I am attempting to extract the H/W address.
+My strategy :
+
+Extract IP of the socket using getsockname() system call.
+Use getifaddrs() system call to list all available network interfaces. Inside a for-loop I am using getnameinfo() system call to find IP for currently iterating interface name and then compare this IP with socket IP (extracted from step 1) to find interface name of the connected socket.
+Use ioctl(fd, SIOCGIFHWADDR, &ifr) system call to get H/W address using interface name found out in stage 2.
+
+I am facing problem getnameinfo() system call.
+If I don't type cast the first parameter to (struct sockaddr_in*) I get the following error : ai_family not supported
+getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST,
+                           NULL, 0, NI_NUMERICHOST);
+
+If I type cast the first parameter to (struct sockaddr_in*) I get the following error : error: cannot convert ‘sockaddr_in*’ to ‘const sockaddr*’ for argument ‘1’ to ‘int getnameinfo(const sockaddr*, socklen_t, char*, socklen_t, char*, socklen_t, int)’
+getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST,
+                           NULL, 0, NI_NUMERICHOST);
+
+Kindly advice. I am even open to some alternative strategy to programmatically and dynamically get Socket IP and MAC address. 
+bool Ethernet::getIp(void)
+{
+    struct      sockaddr_in addr;
+    char        bufferIp[INET_ADDRSTRLEN];
+    socklen_t   addrLen = sizeof(addr);
+    if(getsockname(this->clientSocket, (struct sockaddr*) &addr, &addrLen) == -1)
+    {
+        string errStr = strerror(errno);
+        FileOperations fo;
+        string str;
+        str = "Unable to extract IP address of socket";
+        str += " Error : " + errStr;
+        fo.printError(str);
+        return RETURN_FAILURE;
+    }
+
+    if(inet_ntop(AF_INET, &addr.sin_addr, bufferIp, INET_ADDRSTRLEN) == NULL)
+    {
+        string errStr = strerror(errno);
+        FileOperations fo;
+        string str;
+        str = "Unable to convert extracted IP address from binary to char* in Ethernet::getInterfaceDetails.";
+        str += " Error : " + errStr;
+        fo.printError(str);
+        return RETURN_FAILURE;
+    }
+    this->ip = string(bufferIp);
+    return RETURN_SUCCESS;
+}
+
+bool Ethernet::getMac(void)
+{
+    int fd;
+    struct ifreq ifr;
+//    char *iface = "eth0";
+    unsigned char *mac;
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ifr.ifr_addr.sa_family = AF_INET;
+    strncpy(ifr.ifr_name , this->interfaceName.c_str(), IFNAMSIZ-1);
+    ioctl(fd, SIOCGIFHWADDR, &ifr);
+    close(fd);
+    mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+
+    //display mac address
+    printf("Mac : %.2x:%.2x:%.2x:%.2x:%.2x:%.2x\n" , mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return RETURN_SUCCESS;
+
+}
+
+bool Ethernet::getInterfaceDetails(void)
+{
+    struct ifaddrs *ifaddr, *ifa;
+    int s;
+    char host[NI_MAXHOST];
+    string tempAddr;
+    char   buffer[INET_ADDRSTRLEN];
+    if (getifaddrs(&ifaddr) == -1) 
+    {
+        string errStr = strerror(errno);
+        FileOperations fo;
+        string str;
+        str = "System call 'getifaddrs' failed in Ethernet::getInterfaceDetails.";
+        str += " Error : " + errStr;
+        fo.printError(str);
+        return RETURN_FAILURE;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        this->interfaceName = string(ifa->ifa_name);
+        if(this->interfaceName == string("lo"))
+            continue;
+
+         s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST,
+                           NULL, 0, NI_NUMERICHOST);
+
+        if(s != 0)
+        {
+            string errStr = gai_strerror(s);
+            cout << "Error : " << errStr << endl;
+            FileOperations fo;
+            string str;
+            str = "Unable to convert extracted IP address address from binary to char* in Ethernet::getInterfaceDetails.";
+            str += " Error : " + errStr;
+            fo.printError(str);
+            return RETURN_FAILURE;
+        }
+        tempAddr = string(host);      
+        if(tempAddr == this->ip)
+        {
+            freeifaddrs(ifaddr);
+            return RETURN_SUCCESS;
+        }
+    }
+    return RETURN_FAILURE;
+}I see one strange thing regarding your call to getnameinfo: You are assuming that a non-null ifa_addr equals sockaddr_in type, but I could imagine you could get other types, e.g. sockaddr_in6. So you should check ifa_addr->sa_family field to make sure it's AF_INET. Perhaps you should handle IPv6 as well?
+My theory here is that calling getnameinfo with a struct size that does not match what would be expected for the address family might be the reason for your error.
+Also look at MAC address with getifaddrs for a related discussion.The getifaddrs manual says
+
+The  ifa_addr field points to a structure containing the interface address.  (The sa_family subfield should be consulted to determine the format of the address structure.)  This field may contain a null pointer.
+
+Thus
+
+check that the field is not a null pointer (if it is, then it is not the IP you're looking for)
+the length parameter must match the length of the addresses in sa_family / or filter just AF_INET.
+
+
+But wouldn't it be easier to just create a datagram socket to the server then ask what's its address, or actually do the http connection and ask what mac address that socket is using?
+
+If this is embedded Linux and the interface is always named the same, just read from /sys/class/net/eth0/address - much easier.@Antti Haapala, @Mats;
+Thanks for the help.
+The problem was as you mentioned that other types/families of addresses where present in the interfaces and where causing problems to getnameinfo() system call.
+Now I am filtering out other addresses and only allowing AF_INET.
+I have added the following validation :
+if(ifa->ifa_addr->sa_family != AF_INET)
+      continue;delay function in for PIC18F4550Is there any delay function can be used to PIC18F4550 in C programming, similar to delay() and delayMicroseconds() in Arduino? 
+The delay functions that can find are Delay10KTCYx(), Delay10TCYx() and etc which is very difficult to generate the delay that we desired, and the lowest delay is not even in milliseconds.
+Kindly seek your assists, please. Thank youWhen doing microcontroller programming, you should always use the on-chip hardware timers if possible. There are typically several of those and perhaps a real-time clock as well. Rather than looking for some busy-delay function, you should look for a driver or HAL around those hardware timers present in your MCU.
+In addition, if you need better than 1ms resolution then note that "delay" functions tend to be inaccurate.
+Busy-delay() functions/loops are mostly a quick & dirty amateur solution. They are bad because:
+
+They consume 100% CPU and thereby 100% power.
+They have a tight coupling against the compiler and its settings. Different optimization levels might break such delays.
+They have a tight coupling to the system clock, whereas on-chip timer drivers usually specify which clock to use as a parameter and adjust pre-scaling accordingly.
+They are typically not very accurate.
+Overall they do not necessarily have deterministic behavior.The pointer, the postincrement operator and the sequence pointWhen I run this toy program,
+#include<stdio.h>
+
+int main(void)
+{
+    int arr[] = {11, 22, 33};
+    int *ptr = arr;
+    printf("ptr at: %p\n", (void *)ptr);
+    printf("Result of expression: %d\n", *ptr++);  // line 8
+    printf("ptr at: %p\n", (void *)ptr);
+}
+
+the output I get is:
+ptr at: 0x7fffffffdbf0
+Result of expression: 11
+ptr at: 0x7fffffffdbf4
+
+My understanding on what happens on line 8 is that, per precedence rules (the post increment ++ has higher precedence than the dereference *) the expression *ptr++ is equivalent to *(ptr++). Here is a nice explanation which I went through. But, in that explanation there is no mention of sequence points. 
+Throwing sequence points in the mix, I assume that 11 is printed because ptr is incremented only after the sequence point (which happens to be after all the arguments to printf are evaluated) is reached. And, the post increment operator actually does it's job (of increasing and writing) after the sequence point. Is my understanding correct?I assume that 11 is printed because ptr is incremented only after the sequence point (which happens to be after all the arguments to printf are evaluated)
+
+Nope. It's nothing to do with sequence points. A post increment expression increments its argument but the value of the expression is the value of the argument before the increment. 
+For an int* the post increment looks a lot like this function:
+int* postInc(int** p)
+{
+    int* tmp = *p;
+    *p = *p + 1;
+    return tmp;
+}
+
+And *p++ would look like this:
+*postInc(&p);My understanding on what happens on line 8 is that, per precedence rules (the post increment ++ has higher precedence than the dereference *) the expression *ptr++ is equivalent to *(ptr++)
+
+This is correct.
+
+Throwing sequence points in the mix...
+
+This doesn't really have anything to do with sequence points as such, but rather with the behavior of postfix ++, which is specified as (6.5.2.4):
+
+The result of the postfix ++ operator is the value of the operand. As a side effect, the
+  value of the operand object is incremented.
+  /--/
+  The value computation of the result is sequenced before the side
+  effect of updating the stored value of the operand.
+
+In plain English this means that an expression ptr++ will first "return" the value of ptr, which will be used as the result of the expression, and then afterwards increment ptr by 1.
+As for the whole expression printf("Result of expression: %d\n", *ptr++);, there is a sequence point after the evaluation of all function parameters, but before the function is called. Plus a few more after that.
+The program flow is like this:
+
+Evaluate the two expressions "Result of expression: %d\n" and *ptr++. This can be done in any order.
+For the sub-expression *ptr++, evaluate its sub-expressions. Operator precedence dictates that ptr++ makes one sub-expression. So evaluate this expression to the value of ptr and store the result. 
+a) Evaluate the * operator with the stored result as operand. Store the evaluated result, to be passed to the function.
+b) Increase ptr by 1.
+3a) and 3b) can be sequenced in any order in relation to each other.
+evaluate all function parameters passed to printf.
+Sequence point.
+Execute printf.
+Sequence point just before printf returns.
+Sequence point at ;.
+
+As you can see, the sequence points are mostly irrelevant to the evaluation of the *ptr++ expression. The only time the sequence point comes into play,  is that C dictates that the ++ must have happened before it. But the ++ can happen anywhere between 2) and 5).No.The value of 11 is used because the value of the expression ptr++ is the value of ptr before it is incremented. Full stop. No sequence point here!
+A sequence point does happen before the function is entered in the function call and the relevance of sequence points is that the increment of ptr must have taken place before the function is entered.
+Here's code that shows that happening:
+#include <stdio.h>
+
+int arr[] = {11, 22, 33};
+int *ptr = arr;
+
+int indirect(const char *fmt,int val){
+    printf("peek: %p (%d)\n",ptr,*ptr);
+    return printf(fmt,val);
+}   
+
+int main(void)
+{
+    printf("ptr at: %p\n", (void *)ptr);
+    indirect("Result of expression: %d\n", *ptr++);  // line 8
+    printf("ptr at: %p\n", (void *)ptr);
+}
+
+Typical output:
+ptr at: 0x2ac98105b030
+peek: 0x2ac98105b034 (22)
+Result of expression: 11
+ptr at: 0x2ac98105b034
+
+The rules about sequence points are telling you that the second must show ptr incremented and must have (22) on the end.
+It would violate the function call sequence point rule if we saw peek: 0x2ac98105b030 (11) but ptr at: 0x2ac98105b034 in the last line.
+That would mean the side-effect (i.e. increment of ptr) had taken place after the entry to indirect().
+Precedence defines the order of evaluation but sequence points specify points before which side-effects must have taken place.
+A good way to reason about them is to separate the concerns of evaluation and side-effect. Go through evaluating expressions and write down all the side-effects and then look at sequence point rules that tell you when they must have taken place before. 
+If you do that here (key steps in line 8):
+
+Take the value of ptr.
+Note: Also increment ptr by 1 (int).
+Determine the value stored at the value of ptr taken in step 1.
+Call printf(). 
+
+Step 4 is a sequence point so we must make sure step 2 happens before 4.
+But it could happen before 3. 
+it's easy to get confused in C because the pre- and post-increment operators seen to have sequencing in their definition.
+Think of p++ as "take the value of p and side-effect increment p".
+Think of ++p as "take the value of p+1 and side-effect increment p" not as "increment p and take its value". 
+That second phrasing for ++p implies a sequencing that the standard doesn't guarantee and while may take place is definitely not guaranteed.Tor built from sources don't work (windows 10)I downloaded sources from last stable version (tor-0.3.0.10)
+Via MinGW build tor.exe (it wasn't easy but I did it :) )
+Launched it.
+
+Problem is that sites don't work. I even don't know where to search for bug:
+
+Port 9050 is opened (I can go there by telnet).
+"tor-resolve yandex.ru" works too.
+Tor logs: 
+code https://pastebin.com/8NHB5HMd
+Firewall is off.
+I have another copy of tor (classic bundle). And it works fine.
+What can it be?Storing and accessing elements to array of nested structureI am a newbie to C programming,below is my piece of code where there is an issue while accessing the elements of the structure. 
+The matrix1 is an array of structure to struct matrix. I want to store elements for each matrix1 like matrix1[0], matrix1[1], ...  which is again an array of structures inside other structure. Is there a better way to store the elements to structure. Can someone help me figure out where I am going wrong.
+Why can't I access the elements like matrix1[1].One[0].ChannelPin?
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char ChannelNo[2];        // "P1"
+    unsigned int ChannelPin;  // 23
+    char State;               // 'o'
+} test;
+
+typedef struct {
+    test One[2];
+    test two[2];
+    test three[2];
+    test four[2];
+    test five;
+    test six[1];
+} matrix;
+
+
+matrix matrix1[] = {{   {{{"P4",2,'O'},{"P4",1,'O'},{"Z",0,'Z'}},
+                        {{"P4",4,'O'},{"P4",3,'O'},{"P4",5,'O'}},
+                        {{"0",0,'0'},{"0",0,'0'},{"0",0,'0'}},
+                        {{"0",0,'0'},{"0",0,'0'},{"0",0,'0'}},
+                        {{"0",0,'0'}},
+                        {{"P1",49,'S'},{"P1",1,'G'}} },
+
+                         { {{"P4",2,'O'},{"P4",1,'O'},{"Z",0,'Z'}},
+                        {{"P4",4,'O'},{"P4",3,'O'},{"P4",5,'O'}},
+                        {{"0",0,'0'},{"0",0,'0'},{"0",0,'0'}},
+                        {{"0",0,'0'},{"0",0,'0'},{"0",0,'0'}},
+                        {{"0",0,'0'}},
+                        {{"P1",49,'S'},{"P1",1,'G'}} } }
+
+
+int main() {  
+    printf("%d\n",matrix1[1].One[0].ChannelPin);
+    return 0;
+}for the sake of readability I would init it this way. And it works.
+typedef struct {
+
+    char ChannelNo[3];              //"P1"
+    unsigned int ChannelPin;        //23
+    char State;                     //'o'
+}test;
+
+typedef struct {
+
+    test One[3];
+    test two[3];
+    test three[3];
+    test four[3];
+    test five;
+    test six[3];
+
+}matrix;
+
+matrix x[] =
+    {
+    // [0]
+        {
+            .One = {
+                     {.ChannelNo = "P4", .ChannelPin = 23, .State = 'o'},
+                     {.ChannelNo = "P1", .ChannelPin = 98, .State = 'o'},
+                     {.ChannelNo = "P0", .ChannelPin = 23, .State = 'o'},
+            },
+            .two = {
+                    {.ChannelNo = "P5", .ChannelPin = 79, .State = 'd'},
+                    {.ChannelNo = "P4", .ChannelPin = 79, .State = 'e'},
+                    {.ChannelNo = "P5", .ChannelPin = 79, .State = 'r'},
+            },
+            // ......
+            .five = {.ChannelNo = "P5", .ChannelPin = 79, .State = 'r'},
+        },
+    // [1]
+        {
+            .One = {
+                     {.ChannelNo = "P4", .ChannelPin = 23, .State = 'o'},
+                     {.ChannelNo = "P1", .ChannelPin = 98, .State = 'o'},
+                     {.ChannelNo = "P0", .ChannelPin = 23, .State = 'o'},
+            },
+            .two = {
+                    {.ChannelNo = "P5", .ChannelPin = 79, .State = 'd'},
+                    {.ChannelNo = "P4", .ChannelPin = 79, .State = 'e'},
+                    {.ChannelNo = "P5", .ChannelPin = 79, .State = 'r'},
+            },
+            // ......
+            .five = {.ChannelNo = "P5", .ChannelPin = 79, .State = 'r'},
+        },
+    // ......
+    };
+
+it is faster to write than to find the missing pair of brackets or voalues :)Decision making in C - the ? : Operator exampleI know how the operator works, but I dont understand how the second case in the code below gives a 1 as a result. 
+#define MIN(a,b) a<b ? a:b  
+int x = MIN(1,2);  //case 1, output is 1
+int x = MIN(1,1+1); // case 2
+
+Shouldnt the compiler see this (case 2) as "is 1<1+1?", which I think should be "is 1<1? No it is not", expression 3 is executed and we get: "b" = 1+1 = 2. This is because there are no parentheses around a and b in the macro above, or maybe because I am following my own rules and feel lost? Help please....
+Also, how do you explain this case:  
+int x = MIN(1,2) + 1;  //should we consider the "1" on the right?Your second case
+ MIN(1,1+1); 
+
+expands to
+ 1<1+1 ? 1:1+1;
+
+Since 1<1+1 is evaluated to true the expression above results in 1. 
+
+The statement 
+int x = MIN(1,2) + 1; 
+
+results after expansion in
+int x = 1<2 ? 1:2 + 1;
+
+the operator + has higher precedence than the ternary operator :?, so the expression below is actually equivalent to
+1<2 ? 1:(2 + 1);Shouldnt the compiler see this(case 2) as "is 1<1+1?", which I think should be "is 1<1? No it is not"
+
+No. + has higher precendence than < (and both have higher precendence than ?:). The statement
+1 < 1 + 1 ? 1 : 1 + 1
+
+Is the same as
+(1 < (1 + 1)) ? 1 : (1 + 1)how to free the dynamically allocated memory for a local variable?Sample program:    
+#include <stdio.h>
+#include <malloc.h>
+
+void f(int n) {
+     char *val = (char *) malloc(12*sizeof(char));
+     val = "feels....";
+
+     printf("%s", val);
+
+ //  free val;     // if enable, compile time error: expected ';' before 'val'   free val;   
+ }
+
+ int main()
+ {
+      f(1);
+
+      return 0;
+ }
+
+Is it required to free the memory which is dynamically allocated ? if yes, how to.Yes, you need to free the memory. But when you allocate memory for a string, the way to populate the string is not to assign a string to it as that replaces the memory you've allocated. Instead you're meant to use the function strcpy like this...
+char *val = malloc(12*sizeof(char));
+strcpy(val,"feels....");
+
+printf("%s", val);
+free(val);Instead of this:
+ char *val = (char *) malloc(12*sizeof(char));
+ val = "feels....";  // val points now to the string literal ""feels...."
+                     // discarding the value returned by malloc
+ ...
+ free(val);          // attempt to free the string literal which will
+                     // result in undefined behaviour (most likely a crash)
+
+you probably want this:
+ char *val = malloc(12*sizeof(char));  // in C you don't cast the return value of malloc
+ strcpy(val, "feels....");  // the string "feels...." will be copied into
+                            // the allocated buffer
+ ...
+ free(val);          // free memory returned previously by mallocThe compilation problem is because free is a function, you need to put its argument in parentheses.
+free(val);
+
+The other problem is a memory leak.
+Strings in C are really just pointers to (hopefully) blocks of memory containing char data. The end of the string is denoted by a char with value 0. The thing to remember is that your variable is simply a pointer like any other pointer. So...
+ char *val = (char *) malloc(12*sizeof(char));
+
+The above line dynamically allocates a block of memory and assigns a pointer to it to val. 
+ val = "feels....";
+
+The above line assigns a pointer to a string literal to val overwriting the previous pointer that was in val. It has not touched, in any way, the block of memory that was malloced in the first line. Furthermore, you have lost any reference you had to the malloced block so it has leaked. There's no way to free it. 
+String literals are usually created at compile time and the memory they occupy will be part of the program. This means they haven't come from the heap (where malloc gets its memory from. This means, in turn, when you try to free a string literal, bad things happen. On modern architectures, the program text is protected from writes at the OS level so trying to free part of it will almost certainly crash your program. 
+As long as you do not want to change the content of the string, you do not need to malloc space to it. You can omit the malloc line (and the corresponding free) and your program will still work.
+f you do want to change the string, the easiest way to get a mutable copy of a string literal is to use strdup:
+char *val = strdup("feels....");
+
+// Do stuff with the string
+
+free(val); // strdup strings need to be freed
+
+strdup is a Posix function but not a C standard function so your platform might not have it. It's pretty simple to implement your own, though.
+char* myStrDup(const char* thingToDup)
+{
+    char* ret = malloc(strlen(thingToDup) + 1); // strlen returns the length without the terminating nul. Hence add 1 to it to allocate
+    strcpy(ret, thingToDup); // Copies the entire string including the terminating nul.
+    return ret;
+}What is the meaning of count in timer class for embedded programming in C and C++?I am studying embedded programming using the book Programming Embedded Systems in C and C++
+I have two questions about some description in the book. Could you please take few minutes to give an explanation?
+
+page 102, "This value represents the number of ticks that will be remaining in the software timer once all previous timers in the list have expired."
+Q:I do not understand what the count is used for and why there is a condition: once all previous timers in the list have expired...
+
+page 103, "The second and third timers in the list both happen to expire at the same time, though the third timer will have been running for 10 times longer."
+Q: I do not understand why the second and third timer in the list both happen to expire at the same time.
+
+
+Your feedback will be very helpful and appreciated!1) the count is number of milliseconds that are remaining for the timer to expire. This time seems to be relative to the previous timer and gets decremented every millisecond only for the topmost timer. Other timers' count value remains untouched in the ISR.
+2) because when second timer expires (its count goes down to zero) then also next timers in linked list are checked and every timer with count equal to zero is considered as expired.What is the difference between a , &a and *a?I am trying to understand the difference between a and &a when a is a pointer.
+in the following example code :
+int main()
+{
+    int b = 100;
+    int *a;
+    a = &b;
+    printf("%d %d %d", a , &a , *a);
+    return 0;
+}
+
+According to my understanding, a is a name given to the address of a. That is :
+
+Therefore I am expecting a and &a to be same when a is a pointer. But in the output, I am getting the first two values ( a and &a ) as different.
+Where am I going wrong ?First of all, use %p and cast the argument to void * for printing a pointer. Passing an incompatible (mismatched) type of argument for any conversion specification is undefined behavior.
+That said, even a pointer variable, is a variable, and has to be "stored" in an address. So, it's the address of a pointer type variable.
+In other words,
+
+b is a variable (of type int) and it has an address.
+a is a variable (of type int *) and it also has an address.
+
+
+To add some reference, quoting C11, chapter §6.5.3.2,
+
+The operand of the unary & operator shall be either a function designator, the result of a
+  [] or unary * operator, or an lvalue that designates an object that is not a bit-field and is
+  not declared with the register storage-class specifier.
+
+and, from §6.3.2.1,
+
+An lvalue is an expression (with an object type other than void) that potentially
+  designates an object. [...]Its probably more easily explained by the following simple code example:
+
+printf("%d %d %d %d %d", &a , a , *a, &b, b);
+
+which returns for example:
+290289632 290289644 100 290289644 100
+
+
+The address of a: &a is something allocated at start up (output item
+1). 
+a points to the address of b hence output item 2 and 4 are the
+same.
+The value at the address *a = b: hence output item 3 and 5 are
+the same.Here basically *a stores the value of b which is 100,&a is the address of the pointer a itself since it is also a variable and thus must have an address, and a refers to the address of the variable is pointing to(b's address in this case)c programming optimize packet forwarderI have written UDP packet forwarder which opens UDP port and it continuously listen on perticolar socket and when data comes to it, it forwards data to another end point.
+Problem I am facing is while running process for longer duration its process eats up almost 50% of system memory and other process suffers from it.
+I have use PCRE library for some regex checking but it seems like main cause of problem how can i optimize my code that can run for infinite without any memory issue.
+below is my code i have use of PCRE regex and socket forwarder.
+    int parse(char *str){
+
+    pcre *reCompiled;
+    pcre_extra *pcreExtra;
+    int pcreExecRet;
+    int subStrVec[30];
+    const char *pcreErrorStr;
+    int pcreErrorOffset;
+    int returnval;
+    char *aStrRegex;
+    char **aLineToMatch;
+    const char *psubStrMatchStr;
+    int j;
+
+    //*aLineToMatch = str;
+
+    aStrRegex = "(.*)(\"ABC\":)(\\d+)+";  
+    //printf("Regex to use: %s\n", aStrRegex);
+
+    // First, the regex string must be compiled.
+    reCompiled = pcre_compile(aStrRegex, 0, &pcreErrorStr, &pcreErrorOffset, NULL);
+
+    /* OPTIONS (second argument) (||'ed together) can be:
+       PCRE_ANCHORED       -- Like adding ^ at start of pattern.
+       PCRE_CASELESS       -- Like m//i
+       PCRE_DOLLAR_ENDONLY -- Make $ match end of string regardless of \n's
+                              No Perl equivalent.
+       PCRE_DOTALL         -- Makes . match newlins too.  Like m//s
+       PCRE_EXTENDED       -- Like m//x
+       PCRE_EXTRA          -- 
+       PCRE_MULTILINE      -- Like m//m
+       PCRE_UNGREEDY       -- Set quantifiers to be ungreedy.  Individual quantifiers
+                              may be set to be greedy if they are followed by "?".
+       PCRE_UTF8           -- Work with UTF8 strings.
+    */
+
+    // pcre_compile returns NULL on error, and sets pcreErrorOffset & pcreErrorStr
+    if(reCompiled == NULL) {
+        printf("ERROR: Could not compile '%s': %s\n", aStrRegex, pcreErrorStr);
+        exit(1);
+    } /* end if */
+
+    // Optimize the regex
+    pcreExtra = pcre_study(reCompiled, 0, &pcreErrorStr);
+
+    /* pcre_study() returns NULL for both errors and when it can not optimize the regex.  The last argument is how one checks for
+        errors (it is NULL if everything works, and points to an error string otherwise. */
+    if(pcreErrorStr != NULL) {
+        printf("ERROR: Could not study '%s': %s\n", aStrRegex, pcreErrorStr);
+        exit(1);
+    }
+
+    /* Try to find the regex in aLineToMatch, and report results. */
+    pcreExecRet = pcre_exec(reCompiled,
+                            pcreExtra,
+                            str, 
+                            strlen(str),  // length of string
+                            0,                      // Start looking at this point
+                            0,                      // OPTIONS
+                            subStrVec,
+                            30);                    // Length of subStrVec
+    /* pcre_exec OPTIONS (||'ed together) can be:
+        PCRE_ANCHORED -- can be turned on at this time.
+        PCRE_NOTBOL
+        PCRE_NOTEOL
+        PCRE_NOTEMPTY */
+
+    // Report what happened in the pcre_exec call..
+    //printf("pcre_exec return: %d\n", pcreExecRet);
+    if(pcreExecRet < 0) { // Something bad happened..
+        returnval = -1;
+        switch(pcreExecRet) {
+        case PCRE_ERROR_NOMATCH      : log_message("String did not match the pattern");        break;
+        case PCRE_ERROR_NULL         : log_message("Something was null");                      break;
+        case PCRE_ERROR_BADOPTION    : log_message("A bad option was passed");                 break;
+        case PCRE_ERROR_BADMAGIC     : log_message("Magic number bad (compiled re corrupt?)"); break;
+        case PCRE_ERROR_UNKNOWN_NODE : log_message("Something kooky in the compiled re");      break;
+        case PCRE_ERROR_NOMEMORY     : log_message("Ran out of memory");                       break;
+        default                      : log_message("Unknown error");                           break;
+        } /* end switch */
+
+    } else {
+        //printf("Result: We have a match!\n");
+
+        // At this point, rc contains the number of substring matches found...
+        if(pcreExecRet == 0) {
+
+            pcreExecRet = 30 / 3;
+        } /* end if */
+
+        // PCRE contains a handy function to do the above for you:
+        for(j=0; j<pcreExecRet; j++) {
+            pcre_get_substring(str, subStrVec, pcreExecRet, j, &(psubStrMatchStr));
+        } /* end for */
+        returnval = atoi(psubStrMatchStr);
+
+        // Free up the substring
+        pcre_free_substring(psubStrMatchStr);
+    }  /* end if/else */
+
+        // Free up the regular expression.
+        pcre_free(reCompiled);
+
+        // Free up the EXTRA PCRE value (may be NULL at this point)
+        if(pcreExtra != NULL) {
+            #ifdef PCRE_CONFIG_JIT
+            pcre_free_study(pcreExtra);
+        #else
+            pcre_free(pcreExtra);
+        #endif
+        }
+
+        return returnval;
+}
+
+-------------------Udp Listener---------------
+
+
+
+while (1) {
+
+   n = recvfrom(sock_receiver,buf,2048,0,(struct sockaddr *)&from,&sender_length);
+   if (n < 0) error("recvfrom");
+   //write(1,"Received a datagram: ",21);
+   // printf("n = %d\n", n);
+   // printf("length of buffer = %lu\n", strlen(buf));
+   // write(1,buf,n);
+   strncpy(str, buf, n);
+   str[n] = '\0'; // IMPORTANT!
+
+   value = parse(str);
+
+   if(curTime != get_hour()){
+        //sprintf(temp_str,"Counter",minute,get_minute());
+        log_message("Counter reset");
+        reset_component_hits(components);
+        //reset_component_hits(dropped_msg);
+        curTime = get_hour();
+    }
+    if(value >=0 && components[value] < component_limit  && value  < max_component){
+
+        n = sendto(sock_forwarder,buf,n,0,(const struct sockaddr *)&sender,sender_length);
+        if (n  < 0){
+            error("sendto");    
+        } 
+        components[value] = components[value]+1;
+    }else{
+        if(value < 0 ) {
+            error_msg = "Unable to parse component";
+
+        }else if(value >= max_component){
+            error_msg = "value not found in valid component list";
+        }else if(components[value] >= component_limit) {
+            error_msg = "Rate limit exceeded";
+
+        }else {
+            error_msg = "Message dropped for Unknown reason";
+        }
+
+        sprintf(temp_str,"[Component:%d] %s",value,error_msg);
+        log_message(temp_str);
+        bzero(temp_str,100);
+        bzero(error_msg,100);
+
+    }
+
+    // print_array(components);
+    // print_array(dropped_msg);
+
+    bzero(buf,2048);
+    bzero(str,2048);
+ }Frequent read/write operation from socket in CI want to write a script for the server (socket programming) in C which will be there in listening mode and read the HTTP requests from client and do some action on that request.
+For Example:
+Suppose the request I got is as below :
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><line2:connectionClearedEvent><cause>normalClearing</cause></line2:connectionClearedEvent></SOAP-ENV:Body></SOAP-ENV:Envelope>
+
+I want to check, if the request has "connectionClearedEvent" string then increment the counter by one.
+Problem: 
+1st Idea 
+Assuming there is load on the server, if the implementation is done to write all the requests from socket to a file then due to frequent write operations, it is skipping some requests.
+Second Idea
+Assuming there is load on the server, if the implementation is to just read the incoming request and search for that keyword, then also due to frequent read operation it is skipping some request.
+Can anyone suggest a way out for the same to do the above action while there is loads of request coming to server.
+Edit: Code for the same
+connection_handler() will handle connection for each client but the issue I am facing now is with handling file.
+
+
+#include<stdio.h>
+#include<string.h>    //strlen
+#include<stdlib.h>    //strlen
+#include<sys/socket.h>
+#include<arpa/inet.h> //inet_addr
+#include<unistd.h>    //write
+#include<pthread.h> //for threading , link with lpthread
+
+//the thread function
+void *connection_handler(void *);
+
+int main(int argc , char *argv[])
+{
+	printf("Program name %s\n", argv[0]);
+	if( argc == 2 )
+	{
+		printf("The argument supplied is %s\n", argv[1]);
+	}
+	else if( argc > 2 )
+	{
+		printf("Too many arguments supplied.\n");
+	}
+	else 
+	{
+		printf("Server Port not provided..exiting \n");
+		// scanf("%s",&argv[1]);
+		return 1;  
+	}
+	
+    int socket_desc , client_sock , c , *new_sock;
+    struct sockaddr_in server , client;
+	
+    //Create socket
+    socket_desc = socket(AF_INET , SOCK_STREAM , 0);
+    if (socket_desc == -1)
+    {
+        printf("Could not create socket");
+	}
+    puts("Socket created");
+	
+    //Prepare the sockaddr_in structure
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_port = htons(atoi(argv[1]));
+	
+    //Bind
+    if( bind(socket_desc,(struct sockaddr *)&server , sizeof(server)) < 0)
+    {
+        //print the error message
+        perror("bind failed. Error");
+        return 1;
+	}
+    puts("bind done");
+	
+    //Listen
+    listen(socket_desc , 3);
+	
+    //Accept and incoming connection
+    puts("Waiting for incoming connections...");
+    c = sizeof(struct sockaddr_in);
+	
+	
+    //Accept and incoming connection
+    puts("Waiting for incoming connections...");
+    c = sizeof(struct sockaddr_in);
+    while( (client_sock = accept(socket_desc, (struct sockaddr *)&client, (socklen_t*)&c)) )
+    {
+        puts("Connection accepted");
+		
+        pthread_t sniffer_thread;
+        new_sock = malloc(1);
+        *new_sock = client_sock;
+		
+        if( pthread_create( &sniffer_thread , NULL ,  connection_handler , (void*) new_sock) < 0)
+        {
+            perror("could not create thread");
+            return 1;
+		}
+		
+        //Now join the thread , so that we dont terminate before the thread
+        //pthread_join( sniffer_thread , NULL);
+        puts("Handler assigned");
+	}
+	
+    if (client_sock < 0)
+    {
+        perror("accept failed");
+        return 1;
+	}
+	
+    return 0;
+}
+
+/*
+	* This will handle connection for each client
+* */
+void *connection_handler(void *socket_desc)
+{
+    //Get the socket descriptor
+    int sock = *(int*)socket_desc;
+    int read_size;
+    char *message , client_message[2000];
+	
+	static char* ok_response =
+	"HTTP/1.1 200 OK\r\n"
+	"Content-Length: 101\r\n"
+	"Content-type: text/xml; charset=utf-8\r\n"
+	"\r\n"
+	"<html>\n"
+	" <body>\n"
+	"  <h1>Bad Request</h1>\n"
+	"  <p>This server understand your request.</p>\n"
+	" </body>\n"
+	"</html>\n";
+	
+	static char* body =
+	"<html>\n"
+	" <body>\n"
+	"  <h1>Bad Request</h1>\n"
+	"  <p>This server understand your request.</p>\n"
+	" </body>\n"
+	"</html>\n";
+	
+	printf("content length : %d\n",strlen(body));
+    
+   //Receive a message from client
+    while( (read_size = recv(sock , client_message , 2000 , 0)) > 0 )
+    {
+        //Send the message back to client
+		puts(client_message);
+        write(sock , ok_response , strlen(ok_response));
+		memset (client_message,'\0',2000);
+	}
+	
+    if(read_size == 0)
+    {
+        puts("Client disconnected");
+        fflush(stdout);
+	}
+    else if(read_size == -1)
+    {
+        perror("recv failed");
+	}
+	
+    //Free the socket pointer
+    free(socket_desc);
+	
+    return 0;
+}There are three main things to do here (Can be combined):
+
+Increase the listening queue (listen(socket, <number of pending requests>)) - This will help dealing with bursts of requests, but if your're not handling requests fast enough, this too will eventually fail
+Distribute your workload on many workers to take advantage of modern multi-threaded and multi-processing environments. This can be done either by threads or processes where for each request, after accepting the incoming connection, the new connection socket is given to a worker thread/process to handle.
+This way, you don't block the listening socket while processing the requests. This too, can only scale so much as you'll eventually run out of workers if your server is overloaded.
+Clustering - Eventually, it's possible that a single server/machine is incapable of handling the incoming load. You'll need to create a load balancing mechanism and divert requests to different machines to process.C pass array of structs by reference or by value to a functionI have a function in C which takes an array of structs as an argument:
+int load_ini_parms(char * ini_file,
+                   struct test_object s[],
+                   int num,
+                   struct lwm2m_object * l)
+
+My question is, would it be better programming practice to pass a pointer to an array of structs? What would be the advantages or disadvantages?It doesn't make any difference because passing an array as a function argument decays into a pointer.
+The function
+int load_ini_parms(char *ini_file, struct test_object s[], int num, struct lwm2m_object *l)
+
+is equivalent to
+int load_ini_parms(char *ini_file, struct test_object *s, int num, struct lwm2m_object *l)
+
+The information regarding to the size of the array is lost in both cases.Contrary to what others here say, I say it does make a difference as to what may be a "better programming practice":
+Declaring the parameter as an array indicates to the user of the function that you expect, well, an array.
+If you only declare a pointer this does not tell anyone if you expect a single element or possibly multiple.
+Hence, I'd prefer the pointer for single-element parameters (e.g. "output" parameters) and the array for (potentially) multiple elements.libccv - how to read image from bytes in memoryI'm trying to use libccv with Python (I've created wrapper using SWIG). My scenario is the following:
+
+I have in-memory image
+I want to pass this image (bytes) to C function, wrapped for Python with SWIG.
+C code will process the image with libccv functions
+
+Python code:
+bytes = open("input.jpg","rb").read()
+result = ccvwrapper.use_ccv(bytes, 800, 600)
+
+C code:
+int use_ccv(char *bytes, int width, int height){
+    int status = 0;
+    ccv_enable_default_cache();
+    ccv_dense_matrix_t* image = 0;
+    ccv_read(bytes, &image, CCV_IO_ANY_RAW, width, height, width * 3);
+
+    if (image != 0)
+    {
+        //process the image
+        ccv_matrix_free(image);
+        status = 1;
+    }
+    ccv_drain_cache();
+
+    return status;
+}
+
+I've tried a few combinations of type, rows, cols, scanline parameters of ccv_read but every time I got either SIGSEV or the image variable was 0.
+I don't want to use ccv_read function overload, which takes file path, because I don't want to introduce overhead of writing the image to disk.
+What is the proper way of reading the image from memory using libccv?I've figured it out, the trick was to use fmemopen() function, to open memory as stream, which further can be read by APIs, which accept FILE* pointers.
+Full code:
+int* swt(char *bytes, int array_length, int width, int height){
+    ccv_dense_matrix_t* image = 0;
+
+    FILE *stream;
+    stream = fmemopen(bytes, array_length, "r");
+    if(stream != NULL){
+        int type = CCV_IO_JPEG_FILE | CCV_IO_GRAY;
+        int ctype = (type & 0xF00) ? CCV_8U | ((type & 0xF00) >> 8) : 0;
+        _ccv_read_jpeg_fd(stream, &image, ctype);
+    }
+    if (image != 0){
+       // here we have access to image in libccv format, so any processing can be done
+    }
+}
+
+Usage from Python (after building the C code with SWIG):
+import ccvwrapper
+bytes = open("test_input.jpg", "rb").read()
+results = ccvwrapper.swt(bytes, len(bytes), 1024, 1360) # width:1024, height:1360
+
+I've explained all of the details in a blog post: http://zablo.net/blog/post/stroke-width-transform-swt-pythonDeclare two variables split by comma equals to?long i, b = get();
+equals to
+long i;
+long b = get();
+or
+long b = get();
+ long i = b;
+
+?
+I'm totally new to cIt is first option
+long i;
+long b = get();
+
+You would find it out faster by trying then asking on SO.
+It's called operator ,.
+In this case both expressions are evaluated, but only second's value is returned.
+int x = 5;
+
+while (--x, x > 0)
+{
+    printf("%d,", x);
+}
+
+has output
+4,3,2,1,
+
+This code is same as
+--x;
+while (x > 0)
+{
+    printf("%d,", x);
+    --x;
+}atoi() for int128_t typeHow can I use argv values with int128_t support? I know about atoi() and family of functions exposed by <cstdlib> but somehow I cannot find one for int128_t fixed width integer. This might be because of the fact that this type isn't backed by either c or c++ standard, but is there any way for me to make this code work?
+#include <iostream>
+
+int main(int argc, char **argv) {
+    __int128_t value = atoint128_t(argv[1]);
+}
+
+
+Almost all answers posted are good enough for me but I'm selecting the one that is a drop by solution for my current code, so do look at other ones too.Adding here a "not-so-naive" implementation in pure C, it's  still kind of simple:
+#include <stdio.h>
+#include <inttypes.h>
+
+__int128 atoi128(const char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '+') ++s;
+    int sign = 1;
+    if (*s == '-')
+    {
+        ++s;
+        sign = -1;
+    }
+    size_t digits = 0;
+    while (s[digits] >= '0' && s[digits] <= '9') ++digits;
+    char scratch[digits];
+    for (size_t i = 0; i < digits; ++i) scratch[i] = s[i] - '0';
+    size_t scanstart = 0;
+
+    __int128 result = 0;
+    __int128 mask = 1;
+    while (scanstart < digits)
+    {
+        if (scratch[digits-1] & 1) result |= mask;
+        mask <<= 1;
+        for (size_t i = digits-1; i > scanstart; --i)
+        {
+            scratch[i] >>= 1;
+            if (scratch[i-1] & 1) scratch[i] |= 8;
+        }
+        scratch[scanstart] >>= 1;
+        while (scanstart < digits && !scratch[scanstart]) ++scanstart;
+        for (size_t i = scanstart; i < digits; ++i)
+        {
+            if (scratch[i] > 7) scratch[i] -= 3;
+        }
+    }
+
+    return result * sign;
+}
+
+
+int main(int argc, char **argv)
+{
+    if (argc > 1)
+    {
+        __int128 x = atoi128(argv[1]);
+        printf("%" PRIi64 "\n", (int64_t)x); // just for demo with smaller numbers
+    }
+}
+
+It reads the number bit by bit, using a shifted BCD scratch space, see Double dabble for the algorithm (it's reversed here). This is a lot more efficient than doing many multiplications by 10 in general. *)
+This relies on VLAs, without them, you can replace
+char scratch[digits];
+
+with
+char *scratch = malloc(digits);
+if (!scratch) return 0;
+
+and add a
+free(scratch);
+
+at the end of the function.
+Of course, the code above has the same limitations as the original atoi() (e.g. it will produce "random" garbage on overflow and has no way to check for that) .. if you need strtol()-style guarantees and error checking, extend it yourself (not a big problem, just work to do).
+
+*)  Of course, implementing double dabble in C always suffers from the fact you can't use "hardware carries", so there are extra bit masking and testing operations necessary. On the other hand, "naively" multiplying by 10 can be very efficient, as long as the platform provides multiplication instructions with a width "close" to your target type. Therefore, on your typical x86_64 platform (which has instructions for multiplying 64bit integers), this code is probably a lot slower than the naive decimal method. But it scales much better to really huge integers (which you would implement e.g. using arrays of uintmax_t).Here's a simple way of implementing this:
+__int128_t atoint128_t(const char *s)
+{
+    const char *p = s;
+    __int128_t val = 0;
+
+    if (*p == '-' || *p == '+') {
+        p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+        val = (10 * val) + (*p - '0');
+        p++;
+    }
+    if (*s == '-') val = val * -1;
+    return val;
+}
+
+This code checks each character to see if it's a digit (with an optional leading + or -), and if so it multiplies the current result by 10 and adds the value associated with that digit.  It then inverts the sign if need be.
+Note that this implementation does not check for overflow, which is consistent with the behavior of atoi.
+EDIT:
+Revised implementation that covers int128_MIN case by either adding or subtracting the value of each digit based on the sign, and skipping leading whitespace.
+int myatoi(const char *s)
+{
+    const char *p = s;
+    int neg = 0, val = 0;
+
+    while ((*p == '\n') || (*p == '\t') || (*p == ' ') ||
+           (*p == '\f') || (*p == '\r') || (*p == '\v')) {
+        p++;
+    }
+    if ((*p == '-') || (*p == '+')) {
+        if (*p == '-') {
+            neg = 1;
+        }
+        p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+        if (neg) {
+            val = (10 * val) - (*p - '0');
+        } else {
+            val = (10 * val) + (*p - '0');
+        }
+        p++;
+    }
+    return val;
+}is there any way for me to make this code work?
+
+"What about implementing your own atoint128_t ?" @Marian
+
+It is not to hard to roll your own atoint128_t().  
+Points to consider.
+
+There is 0 or 1 more representable negative value than positive values.  Accumulating the value using negative numbers provides more range.
+Overflow is not defined for atoi(). Perhaps provide a capped value and set errno?  Detecting potential OF prevents UB.
+__int128_t constants need careful code to form correctly.
+How to handle unusual input?  atoi() is fairly loose and made sense years ago for speed/size, yet less UB is usually desired these days.  Candidate cases: "", " ", "-", "z", "+123", "999..many...999", "the min int128", "locale_specific_space" + " 123" or even non-string NULL.
+Code to do atoi() and atoint128_t() need only vary on the type, range, and names.  The algorithm is the same.
+#if 1
+  #define int_t __int128_t
+  #define int_MAX (((__int128_t)0x7FFFFFFFFFFFFFFF << 64) + 0xFFFFFFFFFFFFFFFF)
+  #define int_MIN (-1 - int_MAX)
+  #define int_atoi atoint128_t
+#else
+  #define int_t int
+  #define int_MAX INT_MAX
+  #define int_MIN INT_MIN
+  #define int_atoi int_atoi
+#endif
+
+
+Sample code:  Tailor as needed.  Relies on C99 or later negative/positive and % functionality.
+int_t int_atoi(const char *s) {
+  if (s == NULL) {  // could omit this test
+    errno = EINVAL;
+    return 0;
+  }
+  while (isspace((unsigned char ) *s)) {  // skip same leading white space like atoi()
+    s++;
+  }
+  char sign = *s;  // remember if the sign was `-` for later
+  if (sign == '-' || sign == '+') {
+    s++;
+  }
+
+  int_t sum = 0;
+  while (isdigit((unsigned char)*s)) {
+    int digit = *s - '0';
+    if ((sum > int_MIN/10) || (sum == int_MIN/10 && digit <= -(int_MIN%10))) {
+      sum = sum * 10 - digit;  // accumulate on the - side
+    } else {
+      sum = int_MIN;
+      errno = ERANGE;
+      break; // overflow
+    }
+    s++;
+  }
+
+  if (sign != '-') {
+    if (sum < -int_MAX) {
+      sum = int_MAX;
+      errno = ERANGE;
+    } else {
+      sum = -sum;  // Make positive
+    }
+  }
+
+  return sum;
+}
+
+
+As @Lundin commented about the lack of overflow detection, etc.  Modeling the string-->int128 after strtol() is a better idea.  
+For simplicity, consider __128_t strto__128_base10(const char *s, char *endptr);
+This answer all ready handles overflow and flags errno like strtol().  Just need a few changes:
+  bool digit_found = false;
+  while (isdigit((unsigned char)*s)) { 
+    digit_found = true;  
+
+      // delete the `break` 
+      // On overflow, continue looping to get to the end of the digits.
+      // break;
+
+
+  // after the `while()` loop:
+  if (!digit_found) {  // optional test
+    errno = EINVAL;
+  }
+  if (endptr) {
+    *endptr = digit_found ? s : original_s;
+  }
+
+A full long int strtol(const char *nptr, char **endptr, int base); like functionality would also handle other bases with special code when base is 0 or 16.  @chqrlieHere is a C++ implementation:
+#include <string>
+#include <stdexcept>
+
+__int128_t atoint128_t(std::string const & in)
+{
+    __int128_t res = 0;
+    size_t i = 0;
+    bool sign = false;
+
+    if (in[i] == '-')
+    {
+        ++i;
+        sign = true;
+    }
+
+    if (in[i] == '+')
+    {
+        ++i;
+    }
+
+    for (; i < in.size(); ++i)
+    {
+        const char c = in[i];
+        if (not std::isdigit(c)) 
+            throw std::runtime_error(std::string("Non-numeric character: ") + c)
+        res *= 10;
+        res += c - '0';
+    }
+
+    if (sign)
+    {
+        res *= -1;
+    }
+
+    return res;
+}
+
+int main()
+{
+  __int128_t a = atoint128_t("170141183460469231731687303715884105727");
+}
+
+If you want to test it then there is a stream operator here.
+Performance
+I ran a few performance test. I generate 100,000 random numbers uniformly distributed in the entire support of __int128_t. Then I converted each of them 2000 times. All of these (200,000,000) conversions where completed within ~12 seconds.
+Using this code: 
+#include <iostream>
+#include <string>
+#include <random>
+#include <vector>
+#include <chrono>
+
+int main()
+{
+    std::mt19937 gen(0);
+    std::uniform_int_distribution<> num(0, 9);
+    std::uniform_int_distribution<> len(1, 38);
+    std::uniform_int_distribution<> sign(0, 1);
+
+    std::vector<std::string> str;
+
+    for (int i = 0; i < 100000; ++i)
+    {
+        std::string s;
+        int l = len(gen);
+        if (sign(gen))
+            s += '-';
+        for (int u = 0; u < l; ++u)
+            s += std::to_string(num(gen));
+        str.emplace_back(s);
+    }
+
+    namespace sc = std::chrono;
+    auto start =  sc::duration_cast<sc::microseconds>(sc::high_resolution_clock::now().time_since_epoch()).count();
+    __int128_t b = 0;
+    for (int u = 0; u < 200; ++u)
+    {
+        for (int i = 0; i < str.size(); ++i)
+        {
+            __int128_t a = atoint128_t(str[i]);
+            b += a;
+        }
+    }
+    auto time =  sc::duration_cast<sc::microseconds>(sc::high_resolution_clock::now().time_since_epoch()).count() - start;
+    std::cout << time / 1000000. << 's' << std::endl;
+}The C Standard does not mandate support for 128-bit integers.
+Yet they are commonly supported by modern compilers: both gcc and clang support the types __int128_t and __uint128_t, but surprisingly still keep intmax_t and uintmax_t limited to 64 bits.
+Beyond the basic arithmetic operators, there is not much support for these large integers, especially in the C library: no scanf() or printf() conversion specifiers, etc.
+Here is an implementation of strtoi128(), strtou128() and atoi128() that is consistent with the C Standard's atoi(), strtol() and strtoul() specifications.
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Change these typedefs for your local flavor of 128-bit integer types */
+typedef __int128_t i128;
+typedef __uint128_t u128;
+
+static int strdigit__(char c) {
+    /* This is ASCII / UTF-8 specific, would not work for EBCDIC */
+    return (c >= '0' && c <= '9') ? c - '0'
+        :  (c >= 'a' && c <= 'z') ? c - 'a' + 10
+        :  (c >= 'A' && c <= 'Z') ? c - 'A' + 10
+        :  255;
+}
+
+static u128 strtou128__(const char *p, char **endp, int base) {
+    u128 v = 0;
+    int digit;
+
+    if (base == 0) {    /* handle octal and hexadecimal syntax */
+        base = 10;
+        if (*p == '0') {
+            base = 8;
+            if ((p[1] == 'x' || p[1] == 'X') && strdigit__(p[2]) < 16) {
+                p += 2;
+                base = 16;
+            }
+        }
+    }
+    if (base < 2 || base > 36) {
+        errno = EINVAL;
+    } else
+    if ((digit = strdigit__(*p)) < base) {
+        v = digit;
+        /* convert to unsigned 128 bit with overflow control */
+        while ((digit = strdigit__(*++p)) < base) {
+            u128 v0 = v;
+            v = v * base + digit;
+            if (v < v0) {
+                v = ~(u128)0;
+                errno = ERANGE;
+            }
+        }
+        if (endp) {
+            *endp = (char *)p;
+        }
+    }
+    return v;
+}
+
+u128 strtou128(const char *p, char **endp, int base) {
+    if (endp) {
+        *endp = (char *)p;
+    }
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (*p == '-') {
+        p++;
+        return -strtou128__(p, endp, base);
+    } else {
+        if (*p == '+')
+            p++;
+        return strtou128__(p, endp, base);
+    }
+}
+
+i128 strtoi128(const char *p, char **endp, int base) {
+    u128 v;
+
+    if (endp) {
+        *endp = (char *)p;
+    }
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (*p == '-') {
+        p++;
+        v = strtou128__(p, endp, base);
+        if (v >= (u128)1 << 127) {
+            if (v > (u128)1 << 127)
+                errno = ERANGE;
+            return -(i128)(((u128)1 << 127) - 1) - 1;
+        }
+        return -(i128)v;
+    } else {
+        if (*p == '+')
+            p++;
+        v = strtou128__(p, endp, base);
+        if (v >= (u128)1 << 127) {
+            errno = ERANGE;
+            return (i128)(((u128)1 << 127) - 1);
+        }
+        return (i128)v;
+    }
+}
+
+i128 atoi128(const char *p) {
+    return strtoi128(p, (char**)NULL, 10);
+}
+
+char *utoa128(char *dest, u128 v, int base) {
+    char buf[129];
+    char *p = buf + 128;
+    const char *digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    *p = '\0';
+    if (base >= 2 && base <= 36) {
+        while (v > (unsigned)base - 1) {
+            *--p = digits[v % base];
+            v /= base;
+        }
+        *--p = digits[v];
+    }
+    return strcpy(dest, p);
+}
+
+char *itoa128(char *buf, i128 v, int base) {
+    char *p = buf;
+    u128 uv = (u128)v;
+    if (v < 0) {
+        *p++ = '-';
+        uv = -uv;
+    }
+    if (base == 10)
+        utoa128(p, uv, 10);
+    else
+    if (base == 16)
+        utoa128(p, uv, 16);
+    else
+        utoa128(p, uv, base);
+    return buf;
+}
+
+static char *perrno(char *buf, int err) {
+    switch (err) {
+    case EINVAL:
+        return strcpy(buf, "EINVAL");
+    case ERANGE:
+        return strcpy(buf, "ERANGE");
+    default:
+        sprintf(buf, "%d", err);
+        return buf;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    char buf[130];
+    char xbuf[130];
+    char ebuf[20];
+    char *p1, *p2;
+    i128 v, v1;
+    u128 v2;
+    int i;
+
+    for (i = 1; i < argc; i++) {
+        printf("%s:\n", argv[i]);
+        errno = 0;
+        v = atoi128(argv[i]);
+        perrno(ebuf, errno);
+        printf("  atoi128():   %s  0x%s  errno=%s\n",
+               itoa128(buf, v, 10), utoa128(xbuf, v, 16), ebuf);
+        errno = 0;
+        v1 = strtoi128(argv[i], &p1, 0);
+        perrno(ebuf, errno);
+        printf("  strtoi128(): %s  0x%s  endptr:\"%s\"  errno=%s\n",
+               itoa128(buf, v1, 10), utoa128(xbuf, v1, 16), p1, ebuf);
+        errno = 0;
+        v2 = strtou128(argv[i], &p2, 0);
+        perrno(ebuf, errno);
+        printf("  strtou128(): %s  0x%s  endptr:\"%s\"  errno=%s\n",
+               utoa128(buf, v2, 10), utoa128(xbuf, v2, 16), p2, ebuf);
+    }
+    return 0;
+}why do I get unexpected results when swapping two variables using pointers?These are two functions I used for swapping variables using pointers while performing selection sort using the function selectionSort(int *,int). But after sorting, some elements of the array become zero.
+void selectionSort(int *x,int len){
+    int i,j,max;
+    for(i=len-1;i>=0;i--){
+        max = 0;
+        for(j=1;j<=i;j++){
+            if(x[j]>x[max]){
+                max = j;
+            }
+        }
+        swap(x+max,x+i);
+    }
+}
+
+void swap(int *a,int *b){
+    //This one works perfectly
+    int temp;
+    temp=*b;
+    *b=*a;
+    *a=temp;
+}
+
+
+void swap(int *a,int *b){
+    //This one gives unexpected results
+    *a=*a+*b;
+    *b=*a-*b;
+    *a=*a-*b;
+}Swapping two integers using arithmetic operators can result in integer overflow. Better to stick with the traditional approach.
+BTW, you can use old school bitwise XOR operator for swapping (used to swap values in registers) but it would not give you any benefit over the method that uses a temporary variable. These days compiler are smart enough to optimize the code.  
+if (*a == *b) // If both integers are same then do not perform swap operation
+    return;
+
+*a ^= *b;
+*b ^= *a;
+*a ^= *b;The second swap algorithm does not work if both pointers point to the same variable which happens here if max == i:
+swap(x+max,x+i);
+
+Demonstration:
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+void swap(int *a, int *b) {
+  //This one works perfectly
+  int temp;
+  temp = *b;
+  *b = *a;
+  *a = temp;
+}
+
+void swap_KO(int *a, int *b) {
+  //This one gives unexpected results
+  *a = *a + *b;
+  *b = *a - *b;
+  *a = *a - *b;
+}
+
+int main()
+{
+  int a = 22, b = 33;
+
+  swap(&a, &b);
+  assert(a == 33 && b == 22);   // OK
+
+  swap_KO(&a, &b);
+  assert(a == 22 && b == 33);   // OK
+
+  swap(&a, &a);                 // OK
+  assert(a == 22);
+
+  swap_KO(&a, &a);              // won't work
+  assert(a == 22);
+}Establishing Data ConsistencyI have a fixed size FIFO type array to store newly added datas. In my main function this array keeps updating itself continuously and one thread working on this data. I want my thread to work on latest passed data to itself meanwhile main function keeps updating it. In the code below, I tried to demonstrate what I am trying to explain. Thread 1 includes a while(1) function itself as well. The reason I am updating Queue on main thread, because Thread 1 has a sleep duration. It may has a simple answer, however my brain currently stopped working.
+int main(){
+pthread_create(Thread1);
+while(1) {
+QueuePut(Some_Value);
+arguments_of_Thread1.input = Queue;
+...
+}
+return 0;How to apply DSCP fields on SYNC-ACK packets using setsocketopt functionI have a TCP client and server running on Linux platform. Basically using setsocketopt I am able to mark SYNC packets. But I don't know how to apply DSCP priority to SYNC-ACK packet. I can set correct DSCP once socket is accepted on server but SYNC-ACK packet goes before application receives connected socket.
+FYI, I also tried to apply DSCP on server listener socket. But Linux doesn't use that value for SYNC-ACK packets.
